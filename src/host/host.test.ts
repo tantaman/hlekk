@@ -417,4 +417,36 @@ describe("onDelete", () => {
     ok(b.apply({ kind: "delete", id: far })); // already gone: a no-op, not an error
     assert.equal(a.pending().length, 0);
   });
+
+  // Two types that each cascade to the other. Legal in the catalog, and the first thing a generated
+  // schema with two cascades finds. Across hosts the outbox terminates it, because the op arrives
+  // after the first object's row is already gone; on one host the cascade runs inline, and an
+  // object's own row is not deleted until its cascade returns, so nothing else can stop it.
+  it("terminates a cascade cycle between two vshards that share a host", () => {
+    const CYCLE = plan({
+      pair: {
+        objects: { "pair.a": { fields: {} }, "pair.b": { fields: {} } },
+        edges: {
+          "pair.a_b": { from: "pair.a", to: "pair.b", onDelete: "cascade" },
+          "pair.b_a": { from: "pair.b", to: "pair.a", onDelete: "cascade" },
+        },
+      },
+    });
+    const cat = Catalog.compile(CYCLE);
+    const h = Host.open(nodeSql(), cat);
+    h.adopt("1");
+    h.adopt("2");
+    const A = cat.objectNamed("pair.a")!.otype;
+    const B = cat.objectNamed("pair.b")!.otype;
+    const AB = cat.edgeNamed("pair.a_b")!.atype!;
+    const BA = cat.edgeNamed("pair.b_a")!.atype!;
+
+    const a = ok(h.create({ otype: A, data: {}, vshard: "1", epoch: 0 }));
+    const b = ok(h.create({ otype: B, data: {}, vshard: "2", epoch: 0 }));
+    ok(h.assocAdd({ atype: AB, id1: a, id2: b, time: 1, epoch: 0 }));
+    ok(h.assocAdd({ atype: BA, id1: b, id2: a, time: 1, epoch: 0 }));
+
+    ok(h.delete({ id: a, epoch: 0 }));
+    assert.equal(h.sql.all<{ n: number }>("SELECT COUNT(*) AS n FROM objects")[0].n, 0, "the pair went together");
+  });
 });

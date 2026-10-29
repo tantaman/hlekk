@@ -9,33 +9,36 @@ import { deterministic, seeded } from "../runtime/runtime.ts";
 import type { Random } from "../runtime/runtime.ts";
 import { Query } from "../schema/query.ts";
 import { generateGraph, generateQuery, replay } from "./generate.ts";
-import type { Script, TypeName } from "./generate.ts";
-import { Comment, Issue, LOCK, Label, User, types } from "./schema.ts";
+import type { Script } from "./generate.ts";
+import { FIXED } from "./schema.ts";
+import { generateSchema } from "./schemas.ts";
+import type { Shape } from "./shape.ts";
 
 /** The oracle's contract, from the design: a query across many hosts must equal the same query
- *  against one host that holds every vshard. */
-async function cluster(seed: number): Promise<LocalCluster> {
+ *  against one host that holds every vshard.
+ *
+ *  `hosts` is how many the database starts spread over, which decides where the script's own writes
+ *  go. A database on one host writes every inverse edge inline and routes nothing, so a workload laid
+ *  down there and only afterwards moved apart has never crossed a host while writing. */
+async function cluster(seed: number, shape: Shape, hosts = 1): Promise<LocalCluster> {
   const c = new LocalCluster({ batch: 64, runtime: deterministic(seed) });
-  c.directory.applyLock(LOCK);
+  c.directory.applyLock(shape.lock);
+  if (hosts > 1) c.scatter(hosts);
   c.spreadCatalog();
   await c.publish();
   return c;
 }
 
-const starters: Record<TypeName, (id: Id) => Query<never, unknown>> = {
-  Issue: (id) => Issue.gen(id) as unknown as Query<never, unknown>,
-  Comment: (id) => Comment.gen(id) as unknown as Query<never, unknown>,
-  User: (id) => User.gen(id) as unknown as Query<never, unknown>,
-  Label: (id) => Label.gen(id) as unknown as Query<never, unknown>,
-};
-
-/** Spreads a script's vshards over `hosts` hosts by moving them, which is how a real database gets
- *  there. The ids do not change, so the answers must not either. */
+/** Spreads a script's vshards further by moving them, which is how a real database gets there. The
+ *  ids do not change, so the answers must not either. */
 async function spread(c: LocalCluster, script: Script, r: Random, hosts: number): Promise<number> {
   for (const vshard of script.vshards) {
-    const to = 1 + r.int(hosts - 1); // never host 0, so every listed vshard actually moves
-    c.mover.begin(BigInt(vshard), to);
-    await c.mover.run(BigInt(vshard));
+    const v = BigInt(vshard);
+    const from = c.directory.resolve(v)!.host;
+    let to = r.int(hosts);
+    if (to === from) to = (from + 1) % hosts; // so every listed vshard actually moves
+    c.mover.begin(v, to);
+    await c.mover.run(v);
   }
   c.spreadCatalog();
   await c.publish();
@@ -46,46 +49,75 @@ async function spread(c: LocalCluster, script: Script, r: Random, hosts: number)
 
 interface Case {
   script: Script;
+  shape: Shape;
   root: Id;
-  rootType: TypeName;
+  rootType: string;
   query: () => Query<never, unknown>;
+  /** Hosts that accepted one of the script's creates. */
+  wrote: number;
+  /** Inverse edges that travelled through the outbox rather than being written inline. */
+  carried: number;
 }
 
-/** Builds one case: a graph, and a query over a root the graph actually made. */
-async function fuzzCase(seed: number): Promise<{ one: LocalCluster; many: LocalCluster; hosts: number; c: Case } | null> {
+interface Built {
+  one: LocalCluster;
+  many: LocalCluster;
+  hosts: number;
+  c: Case;
+}
+
+/** Builds one case: a graph laid down twice, once on a single host and once over several, and a query
+ *  over a root the graph actually made. */
+async function fuzzCase(seed: number, shape: Shape = FIXED): Promise<Built | null> {
   const r = seeded(seed);
-  const script = generateGraph(r, { objects: 20 + r.int(12), vshards: 3 + r.int(5), edges: 24 + r.int(16) });
+  const script = generateGraph(r, shape, {
+    objects: 20 + r.int(12),
+    vshards: 3 + r.int(5),
+    edges: 24 + r.int(16),
+    updates: 4 + r.int(6),
+    removes: 2 + r.int(6),
+    deletes: 1 + r.int(4),
+  });
 
-  const one = await cluster(seed);
-  const laid = await replay(one.client(), script);
-  await one.deliverAll();
+  const one = await cluster(seed, shape);
+  const laid = await replay(one.client(), shape, script, () => one.deliverAll());
 
-  // Pick a root whose type has somewhere to go.
-  const candidates = laid.types.map((t, i) => ({ t, i })).filter(({ t }) => t !== "Label");
+  // A root whose type has somewhere to go, or the query would be a point read.
+  const candidates = laid.types.map((t, i) => ({ t, i })).filter(({ t }) => shape.outgoing[t].length > 0);
   if (candidates.length === 0) return null;
   const pick = r.pick(candidates);
   const root = laid.ids[pick.i];
 
-  const many = await cluster(seed);
-  const again = await replay(many.client(), script);
+  const many = await cluster(seed, shape, 3);
+  let carried = 0;
+  const again = await replay(many.client(), shape, script, async () => {
+    carried += await many.deliverAll();
+  });
   assert.deepEqual(again.ids, laid.ids, `seed ${seed}: replaying one script twice must hand out the same ids`);
-  await many.deliverAll();
-  const hosts = await spread(many, script, seeded(seed ^ 0x5bf0), 4);
+  assert.deepEqual(
+    again.outcomes,
+    laid.outcomes,
+    `seed ${seed}: an operation was refused on one layout and accepted on the other`,
+  );
+  const wrote = new Set(laid.ids.map((id) => many.directory.resolve(vshardOf(id))!.host)).size;
+  const hosts = await spread(many, script, seeded(seed ^ 0x5bf0), 6);
 
-  // The query is generated from its own stream, so it does not depend on how the graph consumed r.
-  const qr = seeded(seed ^ 0x9e37);
-  const query = () => generateQuery(seeded(seed ^ 0x9e37), pick.t, starters[pick.t](root), { depth: 3, width: 2 });
-  void qr;
-  return { one, many, hosts, c: { script, root, rootType: pick.t, query } };
+  const query = () => generateQuery(seeded(seed ^ 0x9e37), shape, pick.t, starter(shape, pick.t, root), { depth: 3, width: 2 });
+  return { one, many, hosts, c: { script, shape, root, rootType: pick.t, query, wrote, carried } };
 }
+
+const starter = (shape: Shape, type: string, id: Id) => shape.types[type].gen(id) as unknown as Query<never, unknown>;
 
 const answer = async (c: LocalCluster, q: Query<never, unknown>, driver: "async" | "rounds") =>
   canonical((await q.run(c.client(), { driver })) as unknown as Json);
 
 describe("the differential oracle, fuzzed", () => {
-  it("gives the same answer across four hosts as on one, over 40 random graphs and queries", async () => {
+  it("gives the same answer across six hosts as on one, over 40 random graphs and queries", async () => {
     let checked = 0;
     let spreadOver = 1;
+    let wroteAcross = 1;
+    let carried = 0;
+    let answered = 0;
     for (let seed = 1; seed <= 60; seed++) {
       const built = await fuzzCase(seed);
       if (!built) continue;
@@ -98,10 +130,16 @@ describe("the differential oracle, fuzzed", () => {
         `seed ${seed}: a query from ${c.rootType} ${c.root} answered differently once its vshards moved apart`,
       );
       spreadOver = Math.max(spreadOver, hosts);
+      wroteAcross = Math.max(wroteAcross, c.wrote);
+      carried += c.carried;
+      if (expected !== "[]" && expected !== '[null]') answered++;
       checked++;
     }
     assert.ok(checked >= 50, `expected most seeds to produce a case, got ${checked}`);
     assert.ok(spreadOver >= 3, `the graphs have to actually span hosts, saw at most ${spreadOver}`);
+    assert.ok(wroteAcross >= 3, `the writes have to span hosts too, saw at most ${wroteAcross}`);
+    assert.ok(carried > 0, "and some inverse edge has to have crossed one, or the outbox is untested");
+    assert.ok(answered > checked / 2, `most answers should hold rows, got ${answered} of ${checked}`);
   });
 
   it("gives the same answer under both drivers, over 25 random graphs and queries", async () => {
@@ -126,7 +164,9 @@ describe("the differential oracle, fuzzed", () => {
 
       // Fence every vshard the root's data could be in. Reads continue through a fence: a move stops
       // writes for the length of the copy, not reads.
-      for (const vshard of many.directory.vshardsOn(0)) many.host(0).setState(vshard.toString(), "fenced");
+      for (const [index, host] of many.hosts) {
+        for (const vshard of many.directory.vshardsOn(index)) host.setState(vshard.toString(), "fenced");
+      }
       assert.equal(await answer(many, c.query(), "async"), expected, `seed ${seed}: a fence changed a read`);
     }
   });
@@ -153,18 +193,64 @@ describe("the differential oracle, fuzzed", () => {
   });
 });
 
+describe("the differential oracle over generated schemas", () => {
+  it("gives the same answer across hosts as on one, over 30 schemas it has never seen", async () => {
+    let checked = 0;
+    let carried = 0;
+    const shapes = new Set<string>();
+    for (let seed = 1001; seed <= 1030; seed++) {
+      const shape = generateSchema(seeded(seed ^ 0x1234));
+      shapes.add(canonical(shape.lock));
+      const built = await fuzzCase(seed, shape);
+      if (!built) continue;
+      const { one, many, c } = built;
+      assert.equal(
+        await answer(many, c.query(), "async"),
+        await answer(one, c.query(), "async"),
+        `seed ${seed}: a query over a generated schema answered differently once its vshards moved apart`,
+      );
+      carried += c.carried;
+      checked++;
+    }
+    assert.ok(checked >= 25, `expected most seeds to produce a case, got ${checked}`);
+    assert.equal(shapes.size, 30, "every seed should produce its own schema");
+    assert.ok(carried > 0, "and inverse edges have to have crossed a host somewhere in them");
+  });
+
+  it("produces schemas with every edge kind the catalog allows", () => {
+    const seen = { inverse: 0, cascade: 0, detach: 0, unique: 0, field: 0, namespaces: 0, self: 0 };
+    for (let seed = 1; seed <= 80; seed++) {
+      const { lock } = generateSchema(seeded(seed));
+      const spaces = new Set(Object.keys(lock.objects).map((n) => n.split(".")[0]));
+      if (spaces.size > 1) seen.namespaces++;
+      for (const e of Object.values(lock.edges)) {
+        if (e.inverse !== undefined) seen.inverse++;
+        if (e.onDelete === "cascade") seen.cascade++;
+        if ((e.onDelete ?? "detach") === "detach") seen.detach++;
+        if (e.unique) seen.unique++;
+        if (e.field !== undefined) seen.field++;
+        if (e.from === e.to) seen.self++;
+      }
+    }
+    for (const [what, n] of Object.entries(seen)) assert.ok(n > 0, `no generated schema had ${what}`);
+  });
+});
+
 describe("the generators", () => {
   it("replay the same script to the same ids, which is what makes the oracle comparable", async () => {
-    const script = generateGraph(seeded(9), { objects: 12, vshards: 4, edges: 10 });
-    const a = await cluster(9);
-    const b = await cluster(9);
-    assert.deepEqual((await replay(a.client(), script)).ids, (await replay(b.client(), script)).ids);
+    const script = generateGraph(seeded(9), FIXED, { objects: 12, vshards: 4, edges: 10, deletes: 3, updates: 3 });
+    const a = await cluster(9, FIXED);
+    const b = await cluster(9, FIXED, 4);
+    const first = await replay(a.client(), FIXED, script, () => a.deliverAll());
+    const second = await replay(b.client(), FIXED, script, () => b.deliverAll());
+    assert.deepEqual(second.ids, first.ids);
+    assert.deepEqual(second.outcomes, first.outcomes);
   });
 
   it("produce graphs that actually span vshards, or the oracle would prove nothing", async () => {
-    const script = generateGraph(seeded(11), { objects: 24, vshards: 6, edges: 30 });
-    const c = await cluster(11);
-    const laid = await replay(c.client(), script);
+    const script = generateGraph(seeded(11), FIXED, { objects: 24, vshards: 6, edges: 30 });
+    const c = await cluster(11, FIXED);
+    const laid = await replay(c.client(), FIXED, script);
     const spread = new Set(laid.ids.map((id) => vshardOf(id).toString()));
     assert.ok(spread.size >= 3, `expected several vshards, got ${spread.size}`);
   });
@@ -172,7 +258,7 @@ describe("the generators", () => {
   it("produce queries with depth, filters and counts", () => {
     const seen = { related: 0, counts: 0, where: 0, paged: 0 };
     for (let seed = 1; seed <= 60; seed++) {
-      const q = generateQuery(seeded(seed), "Issue", Issue.gen("1") as unknown as Query<never, unknown>);
+      const q = generateQuery(seeded(seed), FIXED, "Issue", starter(FIXED, "Issue", "1"));
       const { plan } = q.compile();
       if (plan.frames.length > 1) seen.related++;
       if (plan.frames.some((f) => f.counts.length > 0)) seen.counts++;
@@ -185,12 +271,24 @@ describe("the generators", () => {
     assert.ok(seen.paged > 10, `expected deep trees, got ${seen.paged}`);
   });
 
-  it("covers every object type as a root", () => {
+  it("covers every object type as a root, and every mutation as an operation", () => {
     const roots = new Set<string>();
+    const kinds = new Set<string>();
     for (let seed = 1; seed <= 80; seed++) {
-      const script = generateGraph(seeded(seed), { objects: 20, vshards: 4, edges: 20 });
-      for (const op of script.ops) if (op.kind !== "assoc") roots.add(op.type);
+      const script = generateGraph(seeded(seed), FIXED, {
+        objects: 20,
+        vshards: 4,
+        edges: 20,
+        updates: 4,
+        removes: 4,
+        deletes: 2,
+      });
+      for (const op of script.ops) {
+        kinds.add(op.kind);
+        if (op.kind === "create" || op.kind === "with") roots.add(op.type);
+      }
     }
-    assert.deepEqual([...roots].sort(), Object.keys(types).sort());
+    assert.deepEqual([...roots].sort(), Object.keys(FIXED.types).sort());
+    assert.deepEqual([...kinds].sort(), ["assoc", "create", "erase", "unassoc", "update", "with"]);
   });
 });
