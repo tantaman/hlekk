@@ -192,8 +192,17 @@ export class Hlekk {
     }
   }
 
-  create(otype: number, data: Record<string, Json>, at: { with: Id } | { vshard: string }): Promise<Id> {
-    return this.write<Id>({ kind: "create", otype, data, ...at });
+  /** Creates an object. `with` colocates it hard, in the parent's vshard, so the two can transact.
+   *  `affinity` is a placement hint: a tenant, an owning user, or the request's own root. Given
+   *  neither, the allocator places it. A caller never names a vshard. */
+  async create(
+    otype: number,
+    data: Record<string, Json>,
+    at: { with: Id } | { vshard: string } | { affinity?: string } = {},
+  ): Promise<Id> {
+    if ("with" in at) return this.write<Id>({ kind: "create", otype, data, with: at.with });
+    const vshard = "vshard" in at ? at.vshard : await this.#transport.place(at.affinity);
+    return this.write<Id>({ kind: "create", otype, data, vshard });
   }
 
   update(id: Id, data: Record<string, Json>): Promise<number> {

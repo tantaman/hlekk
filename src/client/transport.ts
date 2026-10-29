@@ -42,4 +42,6 @@ export interface Transport {
   resolve(vshards: readonly bigint[]): Promise<Map<bigint, Route>>;
   /** The catalog, which a client carries the version of on every request. */
   catalog(): Promise<Catalog>;
+  /** Where a new root should go. The allocator decides; the caller never sizes or picks a vshard. */
+  place(affinity?: string): Promise<string>;
 }

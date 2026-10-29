@@ -7,8 +7,11 @@
 import { Directory } from "../directory/directory.ts";
 import { chunkKey } from "../directory/map.ts";
 import type { Route } from "../directory/map.ts";
+import { Allocator } from "../directory/allocator.ts";
 import { Mover } from "../directory/move.ts";
+import { Placement } from "../directory/placement.ts";
 import type { MoveHosts } from "../directory/move.ts";
+import type { Shed, Thresholds } from "../directory/placement.ts";
 import { Host } from "../host/host.ts";
 import { Deliverer } from "../host/outbox.ts";
 import type { ExecReply, Reply, Routed, Snapshot } from "../host/host.ts";
@@ -45,6 +48,9 @@ export class MemoryMapStore implements MapStore {
 export interface LocalOptions {
   database?: string;
   batch?: number;
+  /** A vshard's soft byte cap, lowered in tests so growth and rebalancing are reachable. */
+  cap?: number;
+  thresholds?: Thresholds;
 }
 
 /** A database running in this process. */
@@ -58,6 +64,8 @@ export class LocalCluster {
   readonly database: string;
 
   readonly mover: Mover;
+  readonly allocator: Allocator;
+  readonly placement: Placement;
   /** Hosts a chaos test has knocked over. Every move operation against one throws. */
   readonly down = new Set<number>();
 
@@ -68,6 +76,25 @@ export class LocalCluster {
     this.adoptAll();
     this.transport = this.#transport();
     this.mover = new Mover(this.directory, this.#moveHosts());
+    this.allocator = new Allocator(this.directory, {
+      cap: opts.cap,
+      open: (vshard, host, epoch) => this.host(host).adopt(vshard.toString(), epoch),
+    });
+    this.placement = new Placement(this.directory, this.allocator, this.mover, opts.thresholds ?? {});
+  }
+
+  /** One turn of the controller's alarm: read what the hosts hold, then move what is over threshold
+   *  and publish the map once. */
+  async rebalance(): Promise<Shed[]> {
+    this.collect();
+    const sheds = await this.placement.rebalance(() => this.publish());
+    this.spreadCatalog();
+    return sheds;
+  }
+
+  /** Pulls each host's per-vshard size and request rate into the directory. */
+  collect(): void {
+    for (const host of this.hosts.values()) this.allocator.observe(host.stats());
   }
 
   /** Move operations a chaos test has made fail, by name. */
@@ -222,6 +249,9 @@ export class LocalCluster {
       },
       async catalog(): Promise<Catalog> {
         return cluster.directory.catalog();
+      },
+      async place(affinity?: string): Promise<string> {
+        return cluster.allocator.place(affinity).toString();
       },
     };
   }
