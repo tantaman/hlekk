@@ -63,10 +63,7 @@ export class Directory {
     const d = new Directory(sql, opts);
     if (d.#count() === 0) {
       d.addHost(0);
-      d.sql.txn(() => {
-        for (let v = 0; v < d.batch; v++) d.#assign(BigInt(v), 0, 0);
-        d.#bumpMap();
-      });
+      d.assignMany([...Array(d.batch)].map((_, v) => ({ vshard: BigInt(v), host: 0, epoch: 0 })));
     }
     return d;
   }
@@ -106,6 +103,17 @@ export class Directory {
     return row?.next ?? 0;
   }
 
+  /** Hosts in increasing order of what they hold, which is the order a new batch fills them in. */
+  hostsByLoad(): number[] {
+    return this.sql
+      .all<{ host: number }>(
+        "SELECT h.host AS host, COALESCE(SUM(u.bytes), 0) AS bytes FROM hosts h" +
+          " LEFT JOIN assignments a ON a.host = h.host LEFT JOIN usage u ON u.vshard = a.vshard" +
+          " GROUP BY h.host ORDER BY bytes ASC, h.host ASC",
+      )
+      .map((r) => r.host);
+  }
+
   vshardsOn(host: number): bigint[] {
     return this.sql
       .all<{ vshard: number }>("SELECT vshard FROM assignments WHERE host = ? ORDER BY vshard", host)
@@ -114,8 +122,15 @@ export class Directory {
 
   /** Points a vshard at a host at a given epoch. The move protocol compare-and-sets through this. */
   assign(vshard: bigint, host: number, epoch: number): void {
+    this.assignMany([{ vshard, host, epoch }]);
+  }
+
+  /** Points many vshards at hosts in one transaction, bumping the map version once. Opening a batch
+   *  one row at a time costs a map bump per row, which for a batch is most of the work. */
+  assignMany(entries: readonly { vshard: bigint; host: number; epoch: number }[]): void {
+    if (entries.length === 0) return;
     this.sql.txn(() => {
-      this.#assign(vshard, host, epoch);
+      for (const e of entries) this.#assign(e.vshard, e.host, e.epoch);
       this.#bumpMap();
     });
   }
