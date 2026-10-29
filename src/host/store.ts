@@ -72,21 +72,34 @@ export class SqlStore implements Store {
     return this.#served;
   }
 
-  /** A read is served while this host still holds the vshard, fenced included: a move stops writes for
-   *  the length of the copy, not reads. A retired vshard, or one at another epoch than the caller
-   *  routed with, is refused so the caller re-resolves. */
+  /** Whether this host serves a vshard at the epoch the caller routed with. A read is served while the
+   *  host still holds it, fenced included: a move stops writes for the length of the copy, not reads.
+   *  A retired vshard, or one at another epoch, is not served. Pure: recording a refusal is a separate
+   *  decision, because a read the host made on its own may legitimately fall outside it. */
+  serves(vshard: bigint): true | Refusal {
+    const row = this.#rows().get(vshard);
+    const v = vshard.toString();
+    if (!row) return { vshard: v, state: "absent", epoch: -1 };
+    if (row.state === "moved") return { vshard: v, state: row.state, epoch: row.epoch };
+    const expected = this.routed?.get(vshard);
+    if (expected !== undefined && expected !== row.epoch) return { vshard: v, state: row.state, epoch: row.epoch };
+    return true;
+  }
+
+  /** Records that this host would not serve a vshard, so the caller re-resolves instead of reading an
+   *  empty answer as an answer. */
+  refuse(refusal: Refusal): void {
+    this.refused.set(refusal.vshard, refusal);
+  }
+
   owns(id: Id): boolean {
     const vshard = vshardOf(id);
-    const row = this.#rows().get(vshard);
-    const refuse = (state: State | "absent", epoch: number) => {
-      this.refused.set(vshard.toString(), { vshard: vshard.toString(), state, epoch });
-      return false;
-    };
-    if (!row) return this.routed?.has(vshard) ? refuse("absent", -1) : false;
-    if (row.state === "moved") return refuse(row.state, row.epoch);
-    const expected = this.routed?.get(vshard);
-    if (expected !== undefined && expected !== row.epoch) return refuse(row.state, row.epoch);
-    return true;
+    const verdict = this.serves(vshard);
+    if (verdict === true) return true;
+    // Only when the caller said it was routing here. A read the host made while prefetching below a
+    // row is the frontier, not a bad route.
+    if (this.routed?.has(vshard)) this.refuse(verdict);
+    return false;
   }
 
   object(id: Id): Promise<Maybe<Obj | null>> {
