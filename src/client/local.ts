@@ -16,6 +16,8 @@ import { Host } from "../host/host.ts";
 import { Deliverer } from "../host/outbox.ts";
 import type { ExecReply, Reply, Routed, Snapshot } from "../host/host.ts";
 import { nodeSql } from "../host/sql.node.ts";
+import { systemRuntime } from "../runtime/runtime.ts";
+import type { Runtime } from "../runtime/runtime.ts";
 import type { Catalog } from "../catalog/catalog.ts";
 import type { Miss, Plan } from "../query/types.ts";
 import { Hlekk } from "./client.ts";
@@ -48,6 +50,8 @@ export class MemoryMapStore implements MapStore {
 export interface LocalOptions {
   database?: string;
   batch?: number;
+  /** Time and chance. Pass a deterministic one and the whole cluster replays from a seed. */
+  runtime?: Runtime;
   /** A vshard's soft byte cap, lowered in tests so growth and rebalancing are reachable. */
   cap?: number;
   thresholds?: Thresholds;
@@ -69,7 +73,10 @@ export class LocalCluster {
   /** Hosts a chaos test has knocked over. Every move operation against one throws. */
   readonly down = new Set<number>();
 
+  readonly runtime: Runtime;
+
   constructor(opts: LocalOptions = {}) {
+    this.runtime = opts.runtime ?? systemRuntime;
     this.database = opts.database ?? "db";
     this.directory = Directory.open(nodeSql(), { database: this.database, batch: opts.batch });
     for (const h of this.directory.hostIndexes()) this.host(h);
@@ -78,6 +85,7 @@ export class LocalCluster {
     this.mover = new Mover(this.directory, this.#moveHosts());
     this.allocator = new Allocator(this.directory, {
       cap: opts.cap,
+      random: this.runtime.random,
       open: (vshard, host, epoch) => this.host(host).adopt(vshard.toString(), epoch),
     });
     this.placement = new Placement(this.directory, this.allocator, this.mover, opts.thresholds ?? {});
@@ -154,7 +162,7 @@ export class LocalCluster {
   host(index: number): Host {
     let host = this.hosts.get(index);
     if (!host) {
-      this.hosts.set(index, (host = Host.open(nodeSql(), this.directory.catalog())));
+      this.hosts.set(index, (host = Host.open(nodeSql(), this.directory.catalog(), this.runtime.clock)));
       this.directory.addHost(index);
     }
     return host;
@@ -186,7 +194,7 @@ export class LocalCluster {
   }
 
   client(): Hlekk {
-    return Hlekk.from(this.transport);
+    return Hlekk.from(this.transport, this.runtime.clock);
   }
 
   /** Runs every host's alarm until the outbox is quiet, as a cluster at rest would reach. */
@@ -213,7 +221,7 @@ export class LocalCluster {
   }
 
   /** Reclaims expired reservations on every index vshard, as an alarm would. */
-  sweepIndexes(now = Date.now(), ttlMs = 30_000): number {
+  sweepIndexes(now = this.runtime.clock.now(), ttlMs = 30_000): number {
     let n = 0;
     for (const v of this.directory.indexVshards()) {
       const route = this.directory.resolve(v);

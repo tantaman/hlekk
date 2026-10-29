@@ -19,6 +19,8 @@ import { missOwner } from "../query/types.ts";
 import type { Id, Json, Miss, Plan } from "../query/types.ts";
 import { Query } from "../schema/query.ts";
 import type { FieldMap } from "../schema/define.ts";
+import { systemClock } from "../runtime/runtime.ts";
+import type { Clock } from "../runtime/runtime.ts";
 import { Routes } from "./routes.ts";
 import { anchorOf } from "./transport.ts";
 import type { Mutation, Transport } from "./transport.ts";
@@ -72,20 +74,22 @@ export interface QueryOptions {
 
 export class Hlekk {
   readonly routes: Routes;
+  readonly clock: Clock;
   readonly #transport: Transport;
   readonly #clients = new Map<number, HostClient>();
 
-  private constructor(transport: Transport) {
+  private constructor(transport: Transport, clock: Clock) {
     this.#transport = transport;
+    this.clock = clock;
     this.routes = new Routes(transport);
   }
 
   /** Memoized per transport: the same client for the life of the isolate. Its shard-map chunks are
    *  what keep the directory and the published map off the request path, and a client built fresh per
    *  request reuses none of them. */
-  static from(transport: Transport): Hlekk {
+  static from(transport: Transport, clock: Clock = systemClock): Hlekk {
     let client = pool.get(transport);
-    if (!client) pool.set(transport, (client = new Hlekk(transport)));
+    if (!client) pool.set(transport, (client = new Hlekk(transport, clock)));
     return client;
   }
 
@@ -129,8 +133,11 @@ export class Hlekk {
    *  turns it into a result that holds each object once. */
   async answer(plan: Plan, rootIds: Id[], opts: QueryOptions = {}): Promise<Answer> {
     const route = await this.#router(rootIds.map(vshardOf));
-    const driver = opts.driver === "rounds" ? runRounds : runAsync;
-    return driver(plan, rootIds, route, opts.stats);
+    // The async driver's batching window is a deferred turn, so it goes through the clock too: a
+    // virtual one closes the window without waiting, and closes it at a repeatable point.
+    return opts.driver === "rounds"
+      ? runRounds(plan, rootIds, route, opts.stats)
+      : runAsync(plan, rootIds, route, opts.stats, (f) => this.clock.defer(f));
   }
 
   /** One client per host, so a driver batching by client identity sends one request per host. */
@@ -203,8 +210,8 @@ export class Hlekk {
     const anchor = anchorOf(m);
     const vshard = anchor.kind === "id" ? vshardOf(anchor.id) : BigInt(anchor.vshard);
     const budget = opts.deadlineMs ?? WRITE_DEADLINE_MS;
-    const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-    const until = Date.now() + budget;
+    const sleep = opts.sleep ?? ((ms: number) => this.clock.sleep(ms));
+    const until = this.clock.now() + budget;
     let reroutes = 0;
     let wait = 1;
     for (;;) {
@@ -219,7 +226,7 @@ export class Hlekk {
       if (reply.refused.state === "fenced") {
         // Mid-move. The route is not wrong, so re-resolving would find the same host; the write waits
         // for the copy and the flip, which is what "writes pause for the duration" means.
-        if (Date.now() >= until) throw new StillFenced(vshard, budget);
+        if (this.clock.now() >= until) throw new StillFenced(vshard, budget);
         await sleep(wait);
         wait = Math.min(wait * 2, 50);
         await this.routes.reroute([vshard]); // in case the flip landed while we waited
@@ -301,7 +308,7 @@ export class Hlekk {
     const key = normalize(value);
     const vshard = await this.#transport.indexVshardFor(key);
     const ttlMs = opts.ttlMs ?? RESERVATION_TTL_MS;
-    const now = opts.now ?? Date.now();
+    const now = opts.now ?? this.clock.now();
 
     await this.write({ kind: "indexReserve", vshard, idx, key, now, ttlMs });
     let id: Id;

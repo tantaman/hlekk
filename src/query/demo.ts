@@ -4,6 +4,7 @@
 
 import { hostExec, runAsync, runRounds } from "./driver.ts";
 import type { HostClient, Stats } from "./driver.ts";
+import { VirtualClock } from "../runtime/runtime.ts";
 import { HostData, HostStore } from "./stores.ts";
 import type { Edge, Id, Json, Miss, Obj, Plan } from "./types.ts";
 
@@ -91,59 +92,11 @@ const FOUR_HOSTS: Placement = {
 };
 const LATENCY: Record<string, number> = { one: 10, issues: 10, comments: 10, users: 10, labels: 50 };
 
-/** Virtual time for the simulated network. Timers fire in time order, and only once everything that
- *  can run without waiting has run (a real setTimeout(0) marks that point), so timelines are exact. */
-class Clock {
-  now = 0;
-  #timers: { at: number; fire: () => void }[] = [];
-  #idle: (() => void)[] = [];
-  #ticking = false;
-
-  sleep(ms: number): Promise<void> {
-    return new Promise((fire) => this.#add(this.now + ms, () => fire()));
-  }
-
-  /** Runs f at the current time, once everything already runnable has run: the loader's batch send. */
-  defer(f: () => void): void {
-    this.#add(this.now, f);
-  }
-
-  /** Resolves once no timer is left. */
-  idle(): Promise<void> {
-    return new Promise((done) => {
-      if (this.#ticking) this.#idle.push(done);
-      else done();
-    });
-  }
-
-  #add(at: number, fire: () => void): void {
-    this.#timers.push({ at, fire });
-    if (!this.#ticking) {
-      this.#ticking = true;
-      setTimeout(() => this.#tick(), 0);
-    }
-  }
-
-  #tick(): void {
-    if (this.#timers.length === 0) {
-      this.#ticking = false;
-      for (const done of this.#idle.splice(0)) done();
-      return;
-    }
-    const at = Math.min(...this.#timers.map((t) => t.at));
-    const due = this.#timers.filter((t) => t.at === at);
-    this.#timers = this.#timers.filter((t) => t.at !== at);
-    this.now = at;
-    for (const t of due) t.fire();
-    setTimeout(() => this.#tick(), 0); // after the microtasks those timers set off
-  }
-}
-
 const describe = (t: Miss) =>
   t.kind === "object" ? t.id : t.kind === "edges" ? `edges(${t.id1} after ${t.after?.id2 ?? "head"}, ${t.n})` : `count(${t.id1})`;
 
 async function run(label: string, placement: Placement, driver: "rounds" | "async"): Promise<Json[]> {
-  const clock = new Clock();
+  const clock = new VirtualClock();
   const log: { start: number; end: number; host: string; tasks: Miss[] }[] = [];
   const owner = new Map(Object.entries(placement).flatMap(([host, ids]) => ids.map((id) => [id, host] as const)));
   const hosts = new Map<string, HostClient>();
@@ -153,10 +106,10 @@ async function run(label: string, placement: Placement, driver: "rounds" | "asyn
     for (const e of edges) if (data.owns(e.id1)) data.putEdge(e);
     hosts.set(name, {
       async exec(plan, tasks) {
-        const start = clock.now;
+        const start = clock.now();
         const reply = await hostExec(new HostStore(data), plan, tasks);
         await clock.sleep(LATENCY[name]);
-        log.push({ start, end: clock.now, host: name, tasks });
+        log.push({ start, end: clock.now(), host: name, tasks });
         return reply;
       },
     });
@@ -167,7 +120,7 @@ async function run(label: string, placement: Placement, driver: "rounds" | "asyn
     driver === "rounds"
       ? (await runRounds(plan, ["i1"], route, stats)).rows
       : (await runAsync(plan, ["i1"], route, stats, (f) => clock.defer(f))).rows;
-  const answeredAt = clock.now;
+  const answeredAt = clock.now();
   await clock.idle(); // let any speculative request finish, so the log shows it
 
   console.log(label);
