@@ -51,14 +51,17 @@ export class Allocator {
     for (const stmt of USAGE_DDL) directory.sql.run(stmt);
   }
 
-  /** Vshards still taking new roots: assigned, and below half the byte cap. */
+  /** Vshards still taking new roots: assigned, below half the byte cap, and not an index vshard.
+   *  Index vshards are their own, so placing a root in one would tie a hot index to unrelated data and
+   *  make either impossible to move without the other. */
   active(): bigint[] {
     const rows = this.directory.sql.all<{ vshard: number }>(
       "SELECT a.vshard AS vshard FROM assignments a LEFT JOIN usage u ON u.vshard = a.vshard" +
         " WHERE COALESCE(u.bytes, 0) < ? ORDER BY a.vshard",
       Math.floor(this.cap / 2),
     );
-    return rows.map((r) => BigInt(r.vshard));
+    const reserved = new Set(this.directory.indexVshards().map(String));
+    return rows.map((r) => BigInt(r.vshard)).filter((v) => !reserved.has(v.toString()));
   }
 
   /** Where a new root goes. The affinity key is whatever groups objects that get read together: a
