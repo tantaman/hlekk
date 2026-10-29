@@ -418,7 +418,11 @@ const vshardRange = (v: bigint) => [
 
 ### vshards
 
-A vshard is the unit of placement, movement and transactions. Each has a soft size cap, proposed at about 1 GB, well under the 10 GB DO limit. The cap is set by move time, not storage: a stop-the-world move pauses the vshard's writes for the whole copy. One host DO holds many vshards.
+A vshard is the unit of placement, movement and transactions. Each has a soft size cap, proposed at about 1 GB, well under the 10 GB DO limit. One host DO holds many vshards.
+
+**The cap is set by move time, not storage.** A stop-the-world move pauses the vshard's writes for the whole copy, so the cap is the largest unit that can be relocated in a tolerable pause, not the largest unit that fits. Sizing a vshard at the DO limit instead would leave a full one with no legal destination: a move relocates a vshard without shrinking it, splits are ruled out below, and a host could hold at most one full vshard, leaving the placement controller nothing to shed and no headroom for the growth from inside described below.
+
+A second pressure runs the other way. A smaller cap means more vshards for the same data — roughly one per gigabyte of live data, as Growing the vshard count sets out — and the vshard count is what sizes the shard map and how far the 24-bit ceiling reaches. The cap sits between the two. Only the move pause is an artifact of the storage engine, and paged storage over object storage (see Later) is what removes it: a move's pause there scales with dirty bytes rather than total bytes, leaving only the pressure toward a larger cap. The vshard stays the unit of ownership and ID allocation either way.
 
 - **Allocation.** A new root object goes to a vshard in the active set, homed near the creating request. `with: parentId` forces the parent's vshard. A vshard leaves the active set at about half its byte cap, keeping the rest for colocated children of objects already in it. It stops taking any object once it is full, by bytes or by exhausted sequence.
 - **Region is metadata.** Each vshard records its home region and jurisdiction in the directory, not in the ID. DOs don't relocate after creation, so changing region means moving the vshard to a new host DO created with a `locationHint` or `jurisdiction`.
@@ -916,22 +920,22 @@ CREATE INDEX obj_issue_status
 
 ### Design limits
 
-- **vshard size:** soft cap proposed at about 1 GB.
+- **vshard size:** soft cap proposed at about 1 GB, set by move time under host-owned storage; see Later.
 - **Colocation group size:** a documented limit, value to be set.
 - **One object's write rate:** bounded by one DO. Commutative ops can help counts; otherwise it is a hard ceiling.
 
 ### Deferred
 
 - `changes` log, snapshot-and-tail moves.
-- Regional read followers and read-your-writes session tokens.
+- Regional read followers and read-your-writes session tokens. These need the `changes` log only while hosts own their storage; over paged object storage they fall out of shared immutable pages (see Later).
 - IVM and change subscriptions; see Later.
-- R2 tiering for cold tails of large edge lists.
+- R2 tiering for cold tails of large edge lists, and the larger idea it is a subset of: paged storage over object storage (see Later).
 - Transactions across vshards.
 
 ### Open questions
 
 - [ ] Exact ID bit split between vshard and sequence (24/40 proposed; IDs are unsigned and use all 64 bits, with no reserved bit). The vshard bits also cap the shard map.
-- [ ] vshard size cap and the placement controller's move thresholds. The mechanism is built, with a 1 GB cap and per-host byte and request thresholds; the values are guesses until step 1's throughput measurement. The cap trades a move's write pause against the size of the shard map.
+- [ ] vshard size cap and the placement controller's move thresholds. The mechanism is built, with a 1 GB cap and per-host byte and request thresholds; the values are guesses until step 1's throughput measurement. The cap trades a move's write pause against the size of the shard map — the pause wants a small cap, the map a large one. Only the pause is an artifact of the storage engine: under paged storage over object storage (see Later) it scales with dirty bytes rather than total bytes, which removes the pressure toward a small cap and leaves only the pressure toward a large one.
 - [ ] Initial vshard count `N` (64 proposed), and whether it is fixed or a creation-time parameter.
 - [x] The placement controller sheds a contiguous **prefix** of one of a host's runs, so the vshards left behind stay contiguous and the map gains no entry beyond the one the move itself costs. Among the prefixes that bring the host back under threshold it takes the fewest vshards, since each is a stop-the-world pause, and then the least excess. Never the whole host. A single heavy vshard therefore beats three light ones adding to the same weight, which is the opposite of what "prefer a run" first suggested.
 - [ ] Whether to adopt Workers KV Instant for the published snapshot once it is generally available, and whether a namespace per database is workable against 1,000 namespaces per account.
@@ -959,7 +963,7 @@ Build the riskiest parts first: per-host performance, then moves under load. Eve
 
 1. **One host DO.** Schema, ID helpers, object and edge ops, the write transaction, and `exec()`. Add a fake second host so the frontier path runs from day one. Measure per-DO throughput, since it sets vshard density and cost. — *built, except the throughput measurement, which needs real DOs*
 2. **Directory, schema catalog and many hosts.** Epoch checks, `moved` replies, catalog migrations and projection codegen, Worker route caching, and the async coordinator end to end. — *built*
-3. **Stop-the-world vshard moves.** Driven by the directory, run under write load with a chaos harness that kills hosts mid-move. This is the part most likely to be subtly wrong. — *built*
+3. **Stop-the-world vshard moves.** Driven by the directory, run under write load with a chaos harness that kills hosts mid-move. This is the part most likely to be subtly wrong. — *built*. Paged storage over object storage (see Later) would replace the copy with a lease handoff: the fence, the epoch and the directory's state machine survive that change, the copy and the catch-up do not.
 4. **Inverse edges through the outbox.** Same-host inline writes, ordered idempotent delivery, retries across moves. — *built*
 5. **Allocator and placement controller.** Initial sharding, batch growth of the active set, automatic moves on storage and request pressure, and colocation with `with`. — *built*
 6. **Global unique index.** User by email, with reserve → create → confirm. — *built*
@@ -993,11 +997,11 @@ Four oracles, because each catches what the others cannot.
 
 The simulation found both outbox-ordering bugs recorded above: the inline apply that overtook a queued op, now fixed, and the two-writer hole in paired edge types, now an open question. The generated schemas found a cascade cycle between two vshards on one host that recursed until the stack blew, also fixed, and are why `restrict` is left out of them by default — a cascade that meets one across a vshard strands an op that can be neither applied nor dropped, which is the third open question above.
 
-After v1: the `changes` log and snapshot-and-tail moves, then regional followers with session tokens.
+After v1: the `changes` log and snapshot-and-tail moves, then regional followers with session tokens. Paged storage over object storage (see Later) reaches both of those destinations by another route — moves by lease handoff, followers by shared immutable pages — so weigh it before building either.
 
-## Later: planning, services and incremental updates
+## Later: planning, services, incremental updates and storage
 
-These are ideas for after v1, recorded so that v1 leaves room for them; none is committed. All three need the `changes` log, so it stops being optional once any of them starts. Rindle's incremental machinery is the main source material.
+These are ideas for after v1, recorded so that v1 leaves room for them; none is committed. The first three need the `changes` log, so it stops being optional once any of them starts; the fourth, paged storage, does not. Rindle's incremental machinery is the main source material for the first three, and its paged storage for the fourth.
 
 ### Index service
 
@@ -1025,3 +1029,16 @@ Operators move to the data. The host that owns an edge list runs the operator th
 - **The view lives in a DO.** A Worker can't receive pushes, so a live query's coordinator is a DO, which holds the subscriber's connection. By principle 10 that subscriber is the application's own layer, never an end user, so hlekk pushes to few long-lived trusted subscribers and that layer fans out to its own clients.
 - **Open: consistency across hosts.** Changes from different hosts arrive in any order, so a view can briefly show combinations that never existed together. Tracking a write position per vshard and holding changes back would fix it, at a latency cost.
 - **Rindle material:** push paths, boundary windows, the scope directory (who watches what), query families, and how `exists` and flipped joins handle pushes.
+
+### Paged storage over object storage
+
+The intended destination: back a host's trees with rindle's paged storage over object storage (R2), with the DO holding a durable write log and a hot page cache rather than the whole dataset. This is a larger idea than the R2 tiering under Deferred, which only moves the cold tails of long edge lists.
+
+- **A move becomes a lease handoff.** Fence, flush dirty pages, compare-and-set the manifest, grant the lease at epoch + 1. The pause scales with dirty bytes, not total bytes, so it is roughly constant in vshard size. This is what lifts the vshard size cap, and it obsoletes most of the stop-the-world protocol above.
+- **Read placement becomes unbounded.** Immutable pages plus a manifest version give snapshot reads from any compute in any region, with no replication protocol and no follower lag. Regional followers would not need the `changes` log; read-your-writes still needs a session token, now carrying a manifest version per vshard.
+- **Write placement becomes dynamic, not free.** Object storage shares storage, not writers. Exactly one lease holder per vshard still serializes mutations, so the directory, epochs, `moved` replies and fencing all survive unchanged. What changes is that re-homing the writer gets cheap enough to do continuously, following load or the user.
+- **The correctness primitive moves.** Principle 5 becomes one lease-fenced manifest CAS instead of one local `transactionSync()`. A fenced but still live old owner holding dirty pages could otherwise flush them after the handoff and corrupt a tree the new owner is also writing; today such a zombie can only damage its own local copy, which is about to be dropped. The manifest write has to be conditional on the generation the lease was granted at.
+- **Splits lose their cost argument, not their logic.** A sub-slab-aligned split becomes a manifest operation over shared pages rather than a data copy. A split by ID range would still cut colocation groups apart by age, so "move, never split" stands on its own terms.
+- **The planner's cost model inverts.** "The query rides" rests on hops inside a host being in-process reads costing microseconds, which makes cross-host the only expensive axis and batching per host the win. With pages in object storage a cold tree descent is several dependent fetches at tens of milliseconds, and it is serial in a way a cross-host fan-out is not. The expensive axis becomes the cold page and the win becomes prefetching per level. This is the part of the current design that does not survive the swap unchanged.
+- **What v1 should preserve.** `Store` is row-shaped over an opaque backing, and `UNKNOWN` already means "not known here", distinct from empty. "Page not resident" is the same answer to an operator as "not my vshard", so the incomplete-answer fault model generalizes with no protocol change — a reason not to simplify it away. The round-counting test double should count rounds per page level as well as per host, and rindle's miss collection, round caps and growing windows become load-bearing rather than borrowed.
+- **Open:** page size and prefetch batching are a cost decision as much as a latency one, since a copy-on-write tree rewrites the root path on every leaf write and each flush is a billed operation. Per-DO request limits and single-threaded execution are untouched, so one object's write rate stays bounded by one DO.
