@@ -6,7 +6,7 @@ import type { Json } from "../query/types.ts";
 import { seeded } from "../runtime/runtime.ts";
 import { assertSound } from "./invariants.ts";
 import { FIXED } from "./schema.ts";
-import { generateSchema } from "./schemas.ts";
+import { generateSchema, generateSchemas } from "./schemas.ts";
 import type { Shape } from "./shape.ts";
 import { EVENTS, collapse, probes, simulate } from "./sim.ts";
 
@@ -86,7 +86,7 @@ describe("the simulation", () => {
   it("answers a read the same once every vshard is on one host, over 10 schedules", async () => {
     for (let seed = 101; seed <= 110; seed++) {
       const sim = await simulate({ shape: FIXED, seed, hosts: 3, steps: 160 });
-      const before = await answers(sim, FIXED, seed);
+      const before = await answers(sim, sim.shape, seed);
       assert.ok(before.length > 0, `seed ${seed}: nothing left to read`);
       const spread = new Set(
         sim.cluster.directory.hostIndexes().filter((h) => sim.cluster.directory.vshardsOn(h).length > 0),
@@ -97,7 +97,7 @@ describe("the simulation", () => {
       assertSound(sim.cluster, { quiesced: true });
       assert.equal(sim.cluster.directory.vshardsOn(onto).length, totalVshards(sim.cluster), "everything moved");
 
-      const after = await answers(sim, FIXED, seed);
+      const after = await answers(sim, sim.shape, seed);
       for (let i = 0; i < before.length; i++) {
         assert.equal(after[i], before[i], `seed ${seed}: query ${i} answered differently once collapsed onto one host`);
       }
@@ -123,6 +123,39 @@ describe("the simulation", () => {
       tally(errors, sim.report.errors);
     }
     assert.ok(errors.Dropped > 0, `the faults have to actually bite, saw ${JSON.stringify(errors)}`);
+  });
+
+  it("leaves a sound cluster when the catalog changes under the workload", async () => {
+    let migrated = 0;
+    let newTypes = 0;
+    for (let seed = 401; seed <= 412; seed++) {
+      const versions = generateSchemas(seeded(seed ^ 0x3c3c), 3, { onDelete: ["detach", "cascade"] });
+      const sim = await simulate({
+        shape: versions[0],
+        migrations: versions.slice(1),
+        seed,
+        hosts: 3,
+        steps: 160,
+      });
+      assert.equal(sim.cluster.queued(), 0, `seed ${seed}: the outbox never drained`);
+      try {
+        assertSound(sim.cluster, { quiesced: true });
+      } catch (e) {
+        assert.fail(`seed ${seed}: ${(e as Error).message}`);
+      }
+      assert.equal(sim.report.catalog, 3, `seed ${seed}: the migrations were not all applied`);
+      migrated += sim.report.events.migrate ?? 0;
+      // Objects of a type that did not exist when the run started: the migration has to have been
+      // mid-workload for this to be non-zero.
+      newTypes += sim.roots.filter((o) => !(o.type in versions[0].types)).length;
+
+      // And a read still does not depend on placement, over a schema that grew while it was running.
+      const before = await answers(sim, sim.shape, seed);
+      await collapse(sim.cluster);
+      assert.deepEqual(await answers(sim, sim.shape, seed), before, `seed ${seed}: collapsing changed a read`);
+    }
+    assert.ok(migrated > 0, "the schedule should have applied a migration mid-run");
+    assert.ok(newTypes > 0, `objects of the new types should exist, got ${newTypes}`);
   });
 
   it("leaves a sound cluster under 12 schemas it has never seen", async () => {

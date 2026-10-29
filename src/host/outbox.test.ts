@@ -221,3 +221,66 @@ describe("delivery across a move", () => {
     assert.equal(await c.host(1).store().object(far), null, "the cascade reached the other vshard");
   });
 });
+
+// A cascade that runs into a restrict. Within one vshard the restrict refuses the whole delete and
+// leaves no trace. Across one, the cascade has already left as an outbox op, and the refusal arrives
+// at a point where the first delete is committed and cannot be taken back — so the same schema and
+// the same call give two different outcomes depending only on where the data sits, and the op cannot
+// be delivered or dropped. Concrete evidence for the design's open question on cross-vshard
+// cascades; the schema generator leaves restrict out by default because of it.
+describe("a cascade that meets a restrict", () => {
+  const CHAIN = plan({
+    app: {
+      objects: { "app.x": { fields: {} }, "app.y": { fields: {} }, "app.z": { fields: {} } },
+      edges: {
+        "app.x_y": { from: "app.x", to: "app.y", onDelete: "cascade" },
+        "app.y_z": { from: "app.y", to: "app.z", onDelete: "restrict" },
+      },
+    },
+  });
+  const CC = Catalog.compile(CHAIN);
+  const X = CC.objectNamed("app.x")!.otype;
+  const Y = CC.objectNamed("app.y")!.otype;
+  const Z = CC.objectNamed("app.z")!.otype;
+  const XY = CC.edgeNamed("app.x_y")!.atype!;
+  const YZ = CC.edgeNamed("app.y_z")!.atype!;
+
+  /** x on vshard 5, y and z on vshard 40, on another host when `apart`. */
+  async function chain(apart: boolean) {
+    const c = new LocalCluster();
+    c.directory.applyLock(CHAIN);
+    c.spreadCatalog();
+    if (apart) {
+      c.mover.begin(40n, 1);
+      await c.mover.run(40n);
+      c.spreadCatalog();
+    }
+    await c.publish();
+    const db = c.client();
+    const x = await db.create(X, {}, { vshard: "5" });
+    const y = await db.create(Y, {}, { vshard: "40" });
+    const z = await db.create(Z, {}, { vshard: "40" });
+    await db.assocAdd(XY, x, y, 1);
+    await db.assocAdd(YZ, y, z, 1);
+    await c.deliverAll();
+    return { c, db, x, y };
+  }
+
+  it("refuses the whole delete within one vshard, leaving no trace", async () => {
+    const { c, db, x } = await chain(false);
+    await assert.rejects(() => db.delete(x), /still has app\.y_z edges/);
+    assert.notEqual(await c.host(0).store().object(x), null, "x is still there");
+    assert.equal(c.queued(), 0);
+  });
+
+  it("commits the first delete and strands the cascade when it crosses one", async () => {
+    const { c, db, x, y } = await chain(true);
+    await db.delete(x); // accepted: the restrict is on another host and is not consulted
+    assert.equal(await c.host(0).store().object(x), null, "x went, which the colocated case refused");
+
+    assert.deepEqual(c.host(0).pending().map((r) => r.op.kind), ["delete"]);
+    assert.equal(await c.deliverAll(), 0, "the target refuses it, every time");
+    assert.equal(c.queued(), 1, "so it cannot be delivered, and is not dropped either");
+    assert.notEqual(await c.host(1).store().object(y), null, "y survives a cascade that was meant to take it");
+  });
+});

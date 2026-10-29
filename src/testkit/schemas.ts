@@ -10,7 +10,7 @@
 // oracle runs against is a lock that a real database would accept.
 
 import { plan } from "../catalog/catalog.ts";
-import type { FieldSpec, OnDelete } from "../catalog/catalog.ts";
+import type { FieldSpec, Lock, OnDelete } from "../catalog/catalog.ts";
 import type { Fields, Json } from "../query/types.ts";
 import type { Random } from "../runtime/runtime.ts";
 import { defineObject, edge, fieldRel, id, num, oneOf, str } from "../schema/define.ts";
@@ -63,120 +63,151 @@ function scalar(r: Random, index: number): Planned {
   }
 }
 
-export function generateSchema(r: Random, opts: SchemaOptions = {}): Shape {
-  const count = opts.types ?? 3 + r.int(3);
-  const attempts = opts.edges ?? 4 + r.int(5);
-  const spaces = Math.min(opts.namespaces ?? 1 + r.int(3), count);
-  const rules = opts.onDelete ?? (["detach", "cascade"] as const);
+/** The schema before it is turned into a lock: names, fields and edges, with no integers in it. Kept
+ *  as a value so a later version can be grown from it, which is what a migration is. */
+export interface Blueprint {
+  /** The short name a query reads a type under. */
+  short: string[];
+  /** The namespace that owns each type. */
+  space: string[];
+  /** Its name in the lock, which carries the namespace. */
+  full: string[];
+  fields: Planned[][];
+  edges: PlannedEdge[];
+  rels: PlannedRel[];
+}
 
-  // A type's short name is what a query names it under; its lock name carries the namespace that owns
-  // it, which is what `plan` checks.
-  const short = [...Array(count)].map((_, i) => `T${i}`);
-  const space = short.map((_, i) => `d${i % spaces}`);
-  const full = short.map((_, i) => `${space[i]}.t${i}`);
-  const fields: Planned[][] = short.map(() => []);
+interface PlannedEdge {
+  /** Index into `short` of the type it runs from. */
+  from: number;
+  to: number;
+  name: string;
+  alias: string;
+  onDelete: OnDelete;
+  unique: boolean;
+  inverse?: string;
+}
 
-  for (let i = 0; i < count; i++) {
-    for (let f = 0; f < 1 + r.int(3); f++) fields[i].push(scalar(r, f));
+interface PlannedRel {
+  from: number;
+  name: string;
+  alias: string;
+  field: string;
+  to: string;
+}
+
+/** Adds `types` object types and attempts `edges` edge types, on top of whatever is there already. */
+function grow(r: Random, bp: Blueprint, opts: { types: number; edges: number; spaces: number; rules: readonly OnDelete[] }): void {
+  const first = bp.short.length;
+  for (let i = first; i < first + opts.types; i++) {
+    bp.short.push(`T${i}`);
+    bp.space.push(`d${i % opts.spaces}`);
+    bp.full.push(`d${i % opts.spaces}.t${i}`);
+    bp.fields.push([]);
+    for (let f = 0; f < 1 + r.int(3); f++) bp.fields[i].push(scalar(r, f));
   }
-  // An id field is what a field relationship follows. Added before the edges, so one can be declared
-  // over it.
-  for (let i = 0; i < count; i++) {
+  const count = bp.short.length;
+  // An id field is what a field relationship follows, so it goes in before the edges.
+  for (let i = first; i < count; i++) {
     if (!r.chance(0.5)) continue;
     const target = r.int(count);
-    fields[i].push({ name: "ref", spec: { id: full[target] }, field: id(full[target]), target: short[target] });
+    bp.fields[i].push({ name: "ref", spec: { id: bp.full[target] }, field: id(bp.full[target]), target: bp.short[target] });
   }
 
-  interface PlannedEdge {
-    /** Index into `short` of the type it runs from. */
-    from: number;
-    to: number;
-    name: string;
-    alias: string;
-    onDelete: OnDelete;
-    unique: boolean;
-    inverse?: string;
-  }
-  const edges: PlannedEdge[] = [];
-  const declare = (from: number, to: number, onDelete: OnDelete, unique: boolean): PlannedEdge => {
-    const n = edges.length;
-    const e: PlannedEdge = { from, to, name: `${space[from]}.e${n}`, alias: `r${n}`, onDelete, unique };
-    edges.push(e);
+  const declare = (from: number, to: number): PlannedEdge => {
+    const n = bp.edges.length;
+    const e: PlannedEdge = {
+      from,
+      to,
+      name: `${bp.space[from]}.e${n}`,
+      alias: `r${n}`,
+      onDelete: r.pick(opts.rules),
+      unique: r.chance(0.25),
+    };
+    bp.edges.push(e);
     return e;
   };
-
-  for (let i = 0; i < attempts; i++) {
-    const from = r.int(count);
+  for (let i = 0; i < opts.edges; i++) {
+    // At least one end in the types just added, so a migration's edges reach the new data.
+    const from = first === 0 ? r.int(count) : first + r.int(count - first);
     const to = r.int(count);
-    const forward = declare(from, to, r.pick(rules), r.chance(0.25));
+    const forward = declare(from, to);
     // A pair, so the outbox has an inverse to carry. Its mirror runs the other way and names it back,
     // which is the only form the catalog accepts.
     if (r.chance(0.5)) {
-      const back = declare(to, from, r.pick(rules), r.chance(0.25));
+      const back = declare(to, from);
       forward.inverse = back.name;
       back.inverse = forward.name;
     }
   }
+  for (let i = first; i < count; i++) {
+    const ref = bp.fields[i].find((f) => f.target !== undefined);
+    if (!ref || !r.chance(0.7)) continue;
+    bp.rels.push({ from: i, name: `${bp.space[i]}.fr${i}`, alias: `fr${i}`, field: ref.name, to: ref.target! });
+  }
+}
 
-  // Lock, by namespace. A domain owns every name that starts with it, so each entry goes to the
-  // namespace of the type it is declared from.
+/** Plans the blueprint into a lock and the runtime values a query is built from. `previous` keeps
+ *  every integer already assigned, which is what makes the result a migration rather than a new
+ *  database. */
+export function compileSchema(bp: Blueprint, previous?: Lock): Shape {
+  // By namespace: a domain owns every name that starts with it, so each entry goes to the namespace
+  // of the type it is declared from.
   const domains: Record<string, { objects: Record<string, { fields: Record<string, FieldSpec> }>; edges: Record<string, unknown> }> = {};
   const domain = (name: string) => (domains[name] ??= { objects: {}, edges: {} });
-  for (let i = 0; i < count; i++) {
-    domain(space[i]).objects[full[i]] = { fields: Object.fromEntries(fields[i].map((f) => [f.name, f.spec])) };
+  for (let i = 0; i < bp.short.length; i++) {
+    domain(bp.space[i]).objects[bp.full[i]] = { fields: Object.fromEntries(bp.fields[i].map((f) => [f.name, f.spec])) };
   }
-  for (const e of edges) {
-    domain(space[e.from]).edges[e.name] = {
-      from: full[e.from],
-      to: full[e.to],
+  for (const e of bp.edges) {
+    domain(bp.space[e.from]).edges[e.name] = {
+      from: bp.full[e.from],
+      to: bp.full[e.to],
       onDelete: e.onDelete,
       ...(e.unique ? { unique: true } : {}),
       ...(e.inverse ? { inverse: e.inverse } : {}),
     };
   }
-  // A field relationship over each id field, named in the namespace that declared the field.
-  const rels: { from: number; name: string; alias: string; field: string; to: string }[] = [];
-  for (let i = 0; i < count; i++) {
-    const ref = fields[i].find((f) => f.target !== undefined);
-    if (!ref || !r.chance(0.7)) continue;
-    const name = `${space[i]}.fr${i}`;
-    domain(space[i]).edges[name] = { from: full[i], to: full[short.indexOf(ref.target!)], field: ref.name };
-    rels.push({ from: i, name, alias: `fr${i}`, field: ref.name, to: ref.target! });
+  for (const rel of bp.rels) {
+    domain(bp.space[rel.from]).edges[rel.name] = {
+      from: bp.full[rel.from],
+      to: bp.full[bp.short.indexOf(rel.to)],
+      field: rel.field,
+    };
   }
 
-  const lock = plan(domains as Parameters<typeof plan>[0]);
+  const lock = plan(domains as Parameters<typeof plan>[0], previous);
 
   // Runtime values, carrying the integers the lock just assigned.
   const types: Record<string, ObjectType<FieldMap>> = {};
-  for (let i = 0; i < count; i++) {
-    const map: FieldMap = Object.fromEntries(fields[i].map((f) => [f.name, f.field]));
-    types[short[i]] = defineObject(full[i], lock.objects[full[i]].otype, map);
+  for (let i = 0; i < bp.short.length; i++) {
+    const map: FieldMap = Object.fromEntries(bp.fields[i].map((f) => [f.name, f.field]));
+    types[bp.short[i]] = defineObject(bp.full[i], lock.objects[bp.full[i]].otype, map);
   }
 
-  const outgoing: Record<string, Outgoing[]> = Object.fromEntries(short.map((s) => [s, [] as Outgoing[]]));
-  for (const e of edges) {
+  const outgoing: Record<string, Outgoing[]> = Object.fromEntries(bp.short.map((s) => [s, [] as Outgoing[]]));
+  for (const e of bp.edges) {
     const atype = lock.edges[e.name].atype!;
-    const rel = edge(e.name, atype, types[short[e.from]], types[short[e.to]], e.unique ? { unique: true } : undefined);
+    const rel = edge(e.name, atype, types[bp.short[e.from]], types[bp.short[e.to]], e.unique ? { unique: true } : undefined);
     const inverse = e.inverse === undefined ? undefined : lock.edges[e.inverse].atype;
-    outgoing[short[e.from]].push({ name: e.alias, rel, to: short[e.to], atype, inverse });
+    outgoing[bp.short[e.from]].push({ name: e.alias, rel, to: bp.short[e.to], atype, inverse });
   }
-  for (const rel of rels) {
-    outgoing[short[rel.from]].push({
+  for (const rel of bp.rels) {
+    outgoing[bp.short[rel.from]].push({
       name: rel.alias,
-      rel: fieldRel(rel.name, types[short[rel.from]], types[rel.to], rel.field),
+      rel: fieldRel(rel.name, types[bp.short[rel.from]], types[rel.to], rel.field),
       to: rel.to,
     });
   }
 
   const comparable: Record<string, Comparable[]> = Object.fromEntries(
-    short.map((s, i) => [s, fields[i].filter((f) => f.values).map((f) => ({ field: f.name, values: f.values! }))]),
+    bp.short.map((s, i) => [s, bp.fields[i].filter((f) => f.values).map((f) => ({ field: f.name, values: f.values! }))]),
   );
 
   const payload = (rand: Random, type: string, ref: (target: string) => number | undefined): Payload => {
-    const i = short.indexOf(type);
+    const i = bp.short.indexOf(type);
     const data: Fields = {};
     const refs: Record<string, number> = {};
-    for (const f of fields[i]) {
+    for (const f of bp.fields[i]) {
       if (f.target === undefined) {
         data[f.name] = rand.pick(f.values!);
         continue;
@@ -191,4 +222,38 @@ export function generateSchema(r: Random, opts: SchemaOptions = {}): Shape {
   };
 
   return { lock, types, outgoing, comparable, payload };
+}
+
+function blueprint(r: Random, opts: SchemaOptions): Blueprint {
+  const bp: Blueprint = { short: [], space: [], full: [], fields: [], edges: [], rels: [] };
+  const types = opts.types ?? 3 + r.int(3);
+  grow(r, bp, {
+    types,
+    edges: opts.edges ?? 4 + r.int(5),
+    spaces: Math.min(opts.namespaces ?? 1 + r.int(3), types),
+    rules: opts.onDelete ?? ["detach", "cascade"],
+  });
+  return bp;
+}
+
+export function generateSchema(r: Random, opts: SchemaOptions = {}): Shape {
+  return compileSchema(blueprint(r, opts));
+}
+
+/** A schema and the versions it is migrated to, each planned on top of the last so every integer
+ *  already assigned is kept. Each adds object types and edge types; what it does not do is remove
+ *  one, which tombstones its name and is its own question. */
+export function generateSchemas(r: Random, versions: number, opts: SchemaOptions = {}): Shape[] {
+  const bp = blueprint(r, opts);
+  const out = [compileSchema(bp)];
+  for (let v = 1; v < versions; v++) {
+    grow(r, bp, {
+      types: 1 + r.int(2),
+      edges: 1 + r.int(3),
+      spaces: Math.max(...bp.space.map((s) => Number(s.slice(1)))) + 1,
+      rules: opts.onDelete ?? ["detach", "cascade"],
+    });
+    out.push(compileSchema(bp, out[out.length - 1].lock));
+  }
+  return out;
 }

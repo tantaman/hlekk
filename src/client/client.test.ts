@@ -28,6 +28,7 @@ const LOCK = plan({
 const CATALOG = Catalog.compile(LOCK);
 const ISSUE = CATALOG.objectNamed("issues.issue")!.otype;
 const COMMENT = CATALOG.objectNamed("issues.comment")!.otype;
+const USER = CATALOG.objectNamed("core.user")!.otype;
 const ISSUE_COMMENT = CATALOG.edgeNamed("issues.issue_comment")!.atype!;
 
 /** A cluster with the catalog applied and the map published. */
@@ -248,6 +249,56 @@ describe("the catalog reaches the hosts", () => {
     await db.assocAdd(ISSUE_COMMENT, issue2, comment2, 1);
     await db.delete(issue2);
     assert.equal(await c.host(0).store().object(comment2), null, "with it, the cascade runs");
+  });
+
+  // What version skew costs, with a real lag rather than an empty catalog. A host maintains an
+  // inverse because its catalog says the edge type has one; a host a version behind does not know
+  // that, writes the forward edge alone, and nothing ever goes back for it. Reported here rather
+  // than fixed: how far a host may lag the newest catalog is an open question, and the answer
+  // decides whether this needs a backfill, a refusal, or a version on every request.
+  it("leaves a new edge type's inverse behind on a host still a version behind", async () => {
+    const V2 = plan(
+      {
+        core: { objects: { "core.user": { fields: { name: "string" } } } },
+        issues: {
+          objects: {
+            "issues.issue": { fields: { title: "string" } },
+            "issues.comment": { fields: { body: "string", authorId: { id: "core.user" } } },
+          },
+          edges: {
+            "issues.issue_comment": {
+              from: "issues.issue",
+              to: "issues.comment",
+              inverse: "issues.comment_issue",
+              onDelete: "cascade",
+            },
+            "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment" },
+            // New in v2, and paired, so writing one half is meant to maintain the other.
+            "issues.issue_owner": { from: "issues.issue", to: "core.user", inverse: "issues.user_owned", unique: true },
+            "issues.user_owned": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner" },
+          },
+        },
+      },
+      LOCK,
+    );
+    const v2 = Catalog.compile(V2);
+    const OWNER = v2.edgeNamed("issues.issue_owner")!.atype!;
+    const OWNED = v2.edgeNamed("issues.user_owned")!.atype!;
+
+    const c = await cluster();
+    const db = c.client();
+    c.directory.applyLock(V2); // the directory has it; the host has not fetched it yet
+    const issue = await db.create(ISSUE, { title: "i" }, { vshard: "5" });
+    const user = await db.create(USER, { name: "alice" }, { vshard: "5" });
+    await db.assocAdd(OWNER, issue, user, 1);
+
+    assert.equal(await c.host(0).store().count(issue, OWNER), 1, "the forward edge lands either way");
+    assert.equal(await c.host(0).store().count(user, OWNED), 0, "the inverse does not, because v1 says there is none");
+
+    // The catalog arrives. Nothing goes back for the half that was never written.
+    c.spreadCatalog();
+    await c.deliverAll();
+    assert.equal(await c.host(0).store().count(user, OWNED), 0, "and it stays missing");
   });
 });
 
