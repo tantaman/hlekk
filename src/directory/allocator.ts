@@ -7,6 +7,8 @@
 // vshard, which is the only capacity limit developers see, and only if they opt in.
 
 import { MAX_VSHARD } from "../host/ids.ts";
+import { systemRandom } from "../runtime/runtime.ts";
+import type { Random } from "../runtime/runtime.ts";
 import type { VshardStats } from "../host/host.ts";
 import type { Directory } from "./directory.ts";
 
@@ -30,6 +32,9 @@ export interface AllocatorOptions {
   /** Installs a newly opened vshard on its host. A host receives vshards and never mints them, so a
    *  vshard the directory has assigned does not exist until its host has been told. */
   open?: (vshard: bigint, host: number, epoch: number) => void;
+  /** Where placement without an affinity key gets its chance. Seeded in tests, so a placement that
+   *  went wrong can be replayed. */
+  random?: Random;
 }
 
 export class NoRoom extends Error {
@@ -43,11 +48,13 @@ export class Allocator {
   readonly directory: Directory;
   readonly cap: number;
   readonly #open: (vshard: bigint, host: number, epoch: number) => void;
+  readonly #random: Random;
 
   constructor(directory: Directory, opts: AllocatorOptions = {}) {
     this.directory = directory;
     this.cap = opts.cap ?? VSHARD_CAP;
     this.#open = opts.open ?? (() => {});
+    this.#random = opts.random ?? systemRandom;
     for (const stmt of USAGE_DDL) directory.sql.run(stmt);
   }
 
@@ -71,7 +78,7 @@ export class Allocator {
     let set = this.active();
     if (set.length === 0) set = this.grow();
     if (set.length === 0) throw new NoRoom("every vshard is full and the vshard space is exhausted");
-    const i = affinity === undefined ? Math.floor(Math.random() * set.length) : hash(affinity) % set.length;
+    const i = affinity === undefined ? this.#random.int(set.length) : hash(affinity) % set.length;
     return set[i];
   }
 

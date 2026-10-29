@@ -5,6 +5,8 @@
 // its own vshards row and refuses the write if it no longer owns that vshard, having written nothing.
 
 import { Catalog } from "../catalog/catalog.ts";
+import { systemClock } from "../runtime/runtime.ts";
+import type { Clock } from "../runtime/runtime.ts";
 import { hostExec } from "../query/driver.ts";
 import type { HostReply } from "../query/driver.ts";
 import { missOwner } from "../query/types.ts";
@@ -196,18 +198,20 @@ interface VshardRow {
 
 export class Host {
   readonly sql: Sql;
+  readonly clock: Clock;
   #catalog: Catalog;
   /** Requests per vshard since the controller last looked. */
   readonly #requests = new Map<string, number>();
 
-  private constructor(sql: Sql, catalog: Catalog) {
+  private constructor(sql: Sql, catalog: Catalog, clock: Clock) {
     this.sql = sql;
     this.#catalog = catalog;
+    this.clock = clock;
   }
 
-  static open(sql: Sql, catalog: Catalog = Catalog.empty()): Host {
+  static open(sql: Sql, catalog: Catalog = Catalog.empty(), clock: Clock = systemClock): Host {
     migrate(sql);
-    return new Host(sql, catalog);
+    return new Host(sql, catalog, clock);
   }
 
   catalog(): Catalog {
@@ -308,7 +312,7 @@ export class Host {
   }
 
   assocAdd(op: AssocAddOp): Reply<void> {
-    const time = op.time ?? Date.now();
+    const time = op.time ?? this.clock.now();
     const data = op.data ?? null;
     return this.#write(() => {
       this.#claim(vshardOf(op.id1), op.epoch);
