@@ -533,7 +533,8 @@ Inside the transaction:
 
 An alarm on the host delivers outbox rows and deletes each one when acknowledged. A crash after commit loses nothing: the row is still there on the next alarm.
 
-- **In order, one at a time, per (source vshard, target vshard).** Each inverse edge has exactly one writer, the vshard of its forward edge, so per-source ordering is enough.
+- **In order, one at a time, per (source vshard, target vshard).** Each inverse edge has exactly one writer, the vshard of its forward edge, so per-source ordering is enough — provided a caller writes one side of a paired edge type and lets the other be maintained. Writing both between the same two objects gives the pair two writers, and ordering each source against itself does not order them against each other; see the open question below.
+- **Nothing jumps the queue.** An op whose target vshard is on this host is applied inline, in the same transaction, which is what makes a colocated pair atomic. Only while nothing for that pair is already queued: a move that brings two vshards onto one host with a row still in flight would otherwise apply the new op ahead of the old one.
 - **Idempotent apply.** Add is an upsert and remove is delete-if-present, so redelivering an op after a lost ack is a no-op.
 - **Moves are retries.** Delivery routes through the host's own shard-map cache, filled a chunk at a time from the directory. A `moved` reply from the target updates that cache, and the row is retried against the new owner. Outbox rows belong to their source vshard and move with it.
 
@@ -936,6 +937,7 @@ CREATE INDEX obj_issue_status
 - [ ] Colocation group limit, and what `with` does when the parent's vshard is full. As built it still takes the parent's vshard, since the alternative is to break the guarantee the caller asked for: error or spill is undecided.
 - [x] Deletes: an edge type that declares no onDelete detaches, dropping its own edges and leaving the targets alone, since cascading by default would let another team's edge delete your objects. Edges to missing objects are dropped at read time, which is also what covers the window before a cross-vshard inverse is withdrawn, and the hole the ent section names where an edge type has no inverse. A maintained count still counts them, so a count can exceed what a read of the same list yields.
 - [ ] Whether a cascade that crosses a vshard should travel as an outbox op, as built, or wait for cross-vshard transactions.
+- [ ] Who may write a paired edge type. Both halves carry an atype and both are writable, so an application can write either direction. Write both between the same two objects and two vshards maintain the same two rows: `assocAdd(A, x, y)` maintains the B half from x's vshard, `assocAdd(B, y, x)` maintains the A half from y's, and the outbox orders each source against itself and not against the other. A remove through one side and an add through the other then land in whichever order delivery takes, and the pair is left holding one half — permanently, since neither side knows it is in a race. The simulation found it; `outbox.test.ts` pins the behaviour. Three ways out, none chosen: name one side of each pair in the catalog as the maintained one and refuse direct writes to it; translate a write of the maintained side into a write of the other, which moves where the mutation routes and so what a fence pauses; or version each edge row so a late add loses to an earlier remove. The first is the smallest and costs an application the ability to write the direction it finds convenient.
 - [ ] Heuristic for choosing coordinator placement per query, and whether the choice is exposed to the caller or decided for it.
 - [ ] Whether a query returns the normalized `QueryResult` or an already-nested shape, and whether both are offered.
 - [ ] Read-after-write guarantees to promise for cross-host inverse edges.
@@ -959,6 +961,17 @@ Build the riskiest parts first: per-host performance, then moves under load. Eve
 6. **Global unique index.** User by email, with reserve → create → confirm. — *built*
 
 What is not built, and is not the deferred work below: a Workers deployment. `npm run smoke` runs a host on real Durable Object SQLite through the DO adapter, which is what says the adapter is right — blobs arrive as `ArrayBuffer` and are normalized, `transactionSync` commits and rolls back, and an 8-byte big-endian key really does sort in unsigned numeric order up to 2^64−1 in the engine the design rests on. What it does not cover is the directory, KV, routing between real DOs, alarms, eviction or request gates, and it is one host, so it still measures no throughput. Non-unique global index maintenance through the outbox is also not built.
+
+### What the suite tests
+
+Four oracles, because each catches what the others cannot.
+
+- **The differential oracle.** A query over a database spread across hosts equals the same query against one host holding every vshard. Fuzzed over random graphs, random queries and random schemas. It catches anything that depends on placement, and nothing that both layouts get wrong.
+- **A reference model.** The write path again in one process, with no vshards, epochs or outbox in it: every inverse edge and cascade lands the instant the operation that caused it does. A workload is replayed into both and every object, edge list and count is compared, which is the only oracle that can say a count drifted or a cascade stopped a hop short. Fair only at a quiesced point, which is what makes it an oracle for semantics and not for timing.
+- **Invariants over the whole cluster.** Exactly one host serves a vshard, and at the epoch the directory names; a host holds rows only for vshards it has; a count is the length of the list it counts; a vshard's sequence is past every id it holds; a paired edge type has both halves once the outbox is empty. Checked mid-flight and at rest, and known to fire, because three tests break a database by hand.
+- **A simulation.** One seeded schedule interleaving concurrent writes, reads, partial outbox delivery, moves, moves crashed at a chosen step, rebalances, batch growth, index writes and a network that drops and reorders. Nothing is replayed, so the oracles are the invariants and a collapse at the end: every vshard is moved onto one host that has never held anything, and no read may answer differently. A phase-ordered test cannot reach what this does — a route cache warmed before a move, a vshard rebalanced out from under a half-delivered outbox, two vshards brought onto one host with a row for that pair still in flight.
+
+The simulation found both outbox-ordering bugs recorded above: the inline apply that overtook a queued op, now fixed, and the two-writer hole in paired edge types, now an open question.
 
 After v1: the `changes` log and snapshot-and-tail moves, then regional followers with session tokens.
 

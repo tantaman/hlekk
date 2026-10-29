@@ -67,16 +67,16 @@ export const types: Record<string, ObjectType<FieldMap>> = { User, Issue, Commen
 
 export const outgoing: Record<string, Outgoing[]> = {
   Issue: [
-    { name: "comments", rel: issueComments, to: "Comment", atype: issueComments.atype },
+    { name: "comments", rel: issueComments, to: "Comment", atype: issueComments.atype, inverse: commentIssue.atype },
     { name: "labels", rel: issueLabels, to: "Label", atype: issueLabels.atype },
-    { name: "owner", rel: issueOwner, to: "User", atype: issueOwner.atype },
+    { name: "owner", rel: issueOwner, to: "User", atype: issueOwner.atype, inverse: userOwned.atype },
     { name: "related", rel: issueRelated, to: "Issue", atype: issueRelated.atype },
   ],
   Comment: [
-    { name: "issue", rel: commentIssue, to: "Issue", atype: commentIssue.atype },
+    { name: "issue", rel: commentIssue, to: "Issue", atype: commentIssue.atype, inverse: issueComments.atype },
     { name: "author", rel: commentAuthor, to: "User" },
   ],
-  User: [{ name: "owns", rel: userOwned, to: "Issue", atype: userOwned.atype }],
+  User: [{ name: "owns", rel: userOwned, to: "Issue", atype: userOwned.atype, inverse: issueOwner.atype }],
   Label: [],
 };
 

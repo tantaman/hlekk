@@ -157,7 +157,8 @@ export function generateSchema(r: Random, opts: SchemaOptions = {}): Shape {
   for (const e of edges) {
     const atype = lock.edges[e.name].atype!;
     const rel = edge(e.name, atype, types[short[e.from]], types[short[e.to]], e.unique ? { unique: true } : undefined);
-    outgoing[short[e.from]].push({ name: e.alias, rel, to: short[e.to], atype });
+    const inverse = e.inverse === undefined ? undefined : lock.edges[e.inverse].atype;
+    outgoing[short[e.from]].push({ name: e.alias, rel, to: short[e.to], atype, inverse });
   }
   for (const rel of rels) {
     outgoing[short[rel.from]].push({

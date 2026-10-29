@@ -252,6 +252,36 @@ describe("inverse edges", () => {
     assert.equal(a.pending().length, 0);
   });
 
+  // A move brings two vshards onto one host while a row for that pair is still waiting. The inline
+  // path is what makes a colocated pair atomic, and taking it here would put this op ahead of the one
+  // already queued — leaving, once the queue drains, an edge that was added after it was removed.
+  it("does not let an inline apply overtake an op already queued for the same pair", async () => {
+    const h = open("1");
+    const issue = ok(h.create({ otype: ISSUE, data: { title: "i" }, vshard: "1", epoch: 0 }));
+    const far = makeId(2n, 7n); // a comment on a vshard this host does not hold
+    ok(h.assocAdd({ atype: ISSUE_COMMENT, id1: issue, id2: far, time: 1, epoch: 0 }));
+    assert.deepEqual(
+      h.pending().map((r) => r.op.kind),
+      ["add"],
+      "the inverse is queued, since its vshard is elsewhere",
+    );
+
+    h.adopt("2", 0, 8); // the vshard arrives, as a move would bring it
+    ok(h.assocRemove({ atype: ISSUE_COMMENT, id1: issue, id2: far, epoch: 0 }));
+    assert.deepEqual(
+      h.pending().map((r) => r.op.kind),
+      ["add", "remove"],
+      "and so is the withdrawal, behind it",
+    );
+
+    for (const row of h.pending()) {
+      ok(h.apply(row.op));
+      h.ack(row.vshard, row.seq);
+    }
+    assert.equal(h.pending().length, 0);
+    assert.equal(await h.store().count(far, COMMENT_ISSUE), 0, "the add did not outlive the remove");
+  });
+
   it("queues removes in order behind adds, per source vshard", () => {
     const a = open("1");
     const issue = ok(a.create({ otype: ISSUE, data: {}, vshard: "1", epoch: 0 }));

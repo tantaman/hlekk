@@ -686,11 +686,17 @@ export class Host {
   /** Applies an op inline when its vshard is on this host, so a colocated pair is atomic for free, and
    *  queues it otherwise. Outbox rows belong to the source vshard and move with it.
    *
+   *  Inline only while nothing for this pair is already waiting. Delivery is ordered per (source
+   *  vshard, target vshard), and an op applied inline ahead of a queued one overtakes it: a move that
+   *  brings two vshards onto one host, with a row for that pair still in flight, is exactly when that
+   *  happens, and an add delivered after the remove that was meant to undo it leaves an edge nothing
+   *  asked for.
+   *
    *  `seen` is the cascade this op is part of, where it has one. A delete delivered from elsewhere
    *  starts its own, and terminates because the object that sent it is already gone. */
   #dispatch(source: bigint, op: OutboxOp, seen?: Set<Id>): void {
     const target = opTarget(op);
-    if (this.#state(target) === "owned") {
+    if (this.#state(target) === "owned" && !this.#waiting(source, target)) {
       if (op.kind === "add") this.#putEdge(op.atype, op.id1, op.id2, op.time, op.data);
       else if (op.kind === "remove") this.#dropEdge(op.atype, op.id1, op.id2);
       else this.#erase(op.id, seen ?? new Set());
@@ -706,6 +712,15 @@ export class Host {
       next?.seq ?? 1,
       Number(target),
       JSON.stringify(op),
+    );
+  }
+
+  /** Whether anything is already queued for this (source, target) pair, and so whether an inline
+   *  apply would arrive out of order. */
+  #waiting(source: bigint, target: bigint): boolean {
+    return (
+      this.sql.all("SELECT 1 AS one FROM outbox WHERE vshard = ? AND target_vshard = ? LIMIT 1", Number(source), Number(target))
+        .length > 0
     );
   }
 
