@@ -264,6 +264,81 @@ flowchart TB
 
 The directory is consulted only on a route-cache miss, and it drives vshard moves. When the data is far from the user, the coordinator loop can run on the root's host DO instead of the Worker.
 
+## Client API
+
+An app reaches a database from an ordinary Worker. Nothing about placement appears in the API: the caller holds IDs, and the client resolves hosts.
+
+### Bindings
+
+A database is three Cloudflare resources, so scoping a request to one takes a small config object rather than a single binding.
+
+```ts
+import { Hlekk } from 'hlekk';
+import { User, userAssignedIssues, issueOwner } from './schema.gen';
+
+const open = (env: Env) => Hlekk.from({
+  directory: env.HLEKK_DIRECTORY, // DO namespace: one directory DO per database
+  hosts:     env.HLEKK_HOSTS,     // DO namespace: idFromName(`issues/h-7`)
+  map:       env.HLEKK_MAP,       // KV namespace: m/issues/<chunk>
+  database:  'issues',            // names the directory DO; scopes host names and map keys
+});
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const db = open(env);
+    // …
+  },
+};
+```
+
+`database` is what scopes the other two, so many databases can share one pair of namespaces. A deployment that gives each database its own namespaces still works, and the names do not change.
+
+### The client is per isolate, not per request
+
+`Hlekk.from` is memoized per database and returns the same client for the life of the isolate, so calling it in a handler costs nothing after the first time. This is not a convenience. The isolate's shard-map chunks are what keep the directory and KV off the request path, and a client built fresh per request reuses none of them: every request would pay a route lookup. There is no exported constructor, so the cached path is the only path.
+
+Memoization rather than a module-scope constant is what makes this work at all, since `env` reaches a Worker per request. A Worker that has `env` at the top level can hold the client in a module constant instead, and it is the same client either way. Construction is lazy regardless, because Workers forbid I/O at module scope, so the first request through a cold isolate pays the chunk fetch. That is the cold start the published snapshot exists to absorb.
+
+### Queries
+
+A query starts from IDs the caller already holds and follows edges from there.
+
+```ts
+const r = await db.query(
+  User.gen(viewer)
+    .related('assigned', userAssignedIssues, q => q.related('owner', issueOwner).limit(50))
+    .countAs('assignedCount', userAssignedIssues)
+);
+```
+
+In production a query is named and validated, and the acting user comes from the server context rather than from arguments:
+
+```ts
+export const viewerInbox = defineQuery('viewerInbox',
+  v => ({ limit: v.int(1, 100) }),
+  (args, ctx) => User.gen(ctx.viewer).related('assigned', userAssignedIssues, q => q.limit(args.limit)));
+
+const r = await db.run(viewerInbox, { limit: 50 }, { viewer });
+```
+
+Point reads and writes route the same way: `db.get`, `db.assoc.*`, `db.create`, `db.update` and `db.txn(anchorId, …)` all resolve a vshard from an ID and go to the one host that owns it. Every request carries the catalog version and projection hash the client was generated against.
+
+### What a query costs from a Worker
+
+Starting from a viewer ID the caller already holds, on a warm isolate:
+
+1. **Decode the vshard** from the ID: a bit shift, no lookup. This is what the vshard in the high bits buys.
+2. **Resolve the host**: a binary search in the cached chunk, in process.
+3. **One `exec`** to that host, carrying the plan and the root as its only task.
+4. **The host runs the plan below the root** over its own data and ships back everything it read, plus what it missed.
+5. **The coordinator fills what is left**, one batched request per host per tick.
+
+So a root plus data colocated with it is one round trip, and a root whose related objects live elsewhere is two. A cold isolate adds one KV read in front of step 2. A stale route costs a `moved` reply and one more round, never a wrong answer.
+
+### Where the loop runs
+
+The coordinator is the same code in a Worker or a DO, so a Worker that lands far from the data can hand the loop to the root's host DO instead: one long round trip, then short hops inside the data's region. Whether that choice is automatic or exposed to the caller is an open question.
+
 ## IDs and sharding
 
 Every ID is an unsigned 64-bit integer whose high bits name its vshard. IDs are strings in the API and in JSON payloads, and 8-byte big-endian BLOBs in SQLite.
@@ -630,7 +705,7 @@ The directory's SQLite is the only place the whole map exists. Every other reade
 ```sql
 CREATE TABLE routes (             -- runs: maximal spans of vshards sharing a host and epoch
   start_vshard INTEGER PRIMARY KEY,
-  host         INTEGER NOT NULL,  -- host index; the DO name is `h-` plus the index
+  host         INTEGER NOT NULL,  -- host index; the DO name is `<database>/h-<index>`
   epoch        INTEGER NOT NULL
 );
 
@@ -643,7 +718,7 @@ CREATE TABLE hosts (              -- fixed at creation, since a DO never relocat
 
 A vshard's route is the `routes` row with the greatest `start_vshard` at or below it.
 
-- **Host DO names are derived, not stored.** The name is `h-` plus the host index, so no table of names travels with the map. At 20,000 hosts such a table would be most of a published chunk, and at the 24-bit ceiling it would dwarf the routes themselves.
+- **Host DO names are derived, not stored.** The name is `<database>/h-<host index>`, so no table of names travels with the map. At 20,000 hosts such a table would be most of a published chunk, and at the 24-bit ceiling it would dwarf the routes themselves. The database scopes the name so that several databases can share one DO namespace.
 - **A run shares a host and an epoch.** Two adjacent vshards on one host at different epochs cannot share a run, so shedding scattered vshards fragments the map twice over: once for the host change and once for the epoch. This is the second reason the placement controller should shed contiguous runs, which move together and therefore share an epoch.
 - **Region is per host**, looked up by host index in `hosts`, rather than carried per entry. A vshard's region is the region of the host that holds it, so moving a vshard is how its region changes.
 
@@ -691,7 +766,7 @@ A 64-vshard database is one chunk of one entry, about 40 bytes. 1 TB is one chun
 
 **Four decisions are expensive to revisit. The rest is not.** At 64 vshards and one entry the encoding is unmeasurable, so JSON would serve build plan step 2 as long as the format carries its version number.
 
-1. **Host DO names derive from the host index**, so the map never carries a name table.
+1. **Host DO names derive from the database and host index**, so the map never carries a name table and databases can share a DO namespace.
 2. **A run shares a host and an epoch**, which is what makes contiguous-run shedding a map-size decision and not only a load one.
 3. **Chunked from the first write**, span 4,096. The chunk is the unit every reader fetches and also the write-rate domain, since classic KV allows one write per second per key.
 4. **One namespace, keys prefixed by database.** Classic KV caps namespaces at 1,000 per account, and databases are scoped by binding, so a deployment has few; a hosted multi-tenant deployment would not. This is the one place the KV Instant path diverges.
@@ -793,7 +868,8 @@ CREATE INDEX obj_issue_status
 - [ ] Chunk span for KV shard-map snapshots.
 - [ ] Colocation group limit, and what `with` does when the parent's vshard is full: error or spill.
 - [ ] Deletes: the default onDelete when an edge type declares none, and whether edges to missing objects are dropped at read time.
-- [ ] Heuristic for choosing coordinator placement per query.
+- [ ] Heuristic for choosing coordinator placement per query, and whether the choice is exposed to the caller or decided for it.
+- [ ] Whether a query returns the normalized `QueryResult` or an already-nested shape, and whether both are offered.
 - [ ] Read-after-write guarantees to promise for cross-host inverse edges.
 - [ ] Directory DO load and failure: how long Worker route caches and KV snapshots may live.
 - [ ] Backfills for new inverses and global indexes: rate limits, and how progress is reported.
