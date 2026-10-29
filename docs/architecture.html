@@ -1,0 +1,632 @@
+<title>Hlekk Architecture</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=IBM+Plex+Mono:wght@400;500&family=Spectral:ital,wght@0,300;0,400;0,500;1,400&display=swap">
+<style>
+  /* Layout: one centred column. Carved, hatched slabs on a charcoal field;
+     bone ink throughout, with a single ember accent reserved for the one
+     eventually-consistent edge in the system. Committed dark, single theme. */
+  :root {
+    color-scheme: dark;
+    --ground:   #202524;
+    --ground-2: #262c2a;
+    --ink:      #ece7dc;
+    --ink-2:    #b8b4a8;
+    --ink-3:    #8d938f;
+    --ember:    #d8793f;
+    --ember-2:  #eda268;
+    --f-d: 'Cinzel', 'Trajan Pro', Georgia, serif;
+    --f-b: 'Spectral', Georgia, 'Times New Roman', serif;
+    --f-m: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-b);
+    font-size: 16px;
+    line-height: 1.62;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 48px 72px;
+  }
+  .wrap { max-width: 1140px; margin-inline: auto; }
+  .prose { max-width: 66ch; }
+  p { margin: 0 0 1em; color: var(--ink-2); font-weight: 300; }
+  strong { color: var(--ink); font-weight: 500; }
+  code, .mono { font-family: var(--f-m); font-size: .88em; color: var(--ink); }
+
+  .eyebrow {
+    font-family: var(--f-m); font-size: 10.5px; letter-spacing: .22em;
+    color: var(--ink-3); margin: 0 0 18px;
+  }
+  h1 {
+    font-family: var(--f-d); font-weight: 700; font-size: clamp(44px, 11vw, 82px);
+    letter-spacing: .14em; line-height: .96; margin: 0; color: var(--ink);
+    text-wrap: balance;
+  }
+  .gloss {
+    font-family: var(--f-b); font-style: italic; font-size: 15px;
+    color: var(--ink-3); margin: 10px 0 26px;
+  }
+  h2 {
+    font-family: var(--f-d); font-weight: 500; font-size: clamp(20px, 3.4vw, 26px);
+    letter-spacing: .07em; margin: 0 0 6px; color: var(--ink); text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--f-d); font-weight: 500; font-size: 17px; letter-spacing: .06em;
+    margin: 0 0 4px; color: var(--ink);
+  }
+  .sect { margin-block: 64px 0; }
+  .sect > .prose { margin-bottom: 26px; }
+
+  /* chain-link rule — hlekk is Old Norse for a chain link */
+  .rule { display: flex; align-items: center; gap: 16px; margin-block: 56px; }
+  .rule .hr { flex: 1 1 auto; height: 1px; background: var(--ink-3); opacity: .45; }
+  .rule .lk { flex: 0 0 auto; width: 104px; height: 22px; color: var(--ink-3); }
+
+  /* the three components, in words */
+  .cast { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--ink-3); border: 1px solid var(--ink-3); margin-block: 34px; }
+  .cast > div { background: var(--ground-2); padding: 20px 18px 22px; min-width: 0; }
+  .cast .k { font-family: var(--f-m); font-size: 9.5px; letter-spacing: .2em; color: var(--ink-3); }
+  .cast .nm { font-family: var(--f-d); font-size: 19px; letter-spacing: .05em; margin: 6px 0 12px; }
+  .cast dl { margin: 0; font-size: 13.5px; line-height: 1.5; }
+  .cast dt { font-family: var(--f-m); font-size: 9.5px; letter-spacing: .18em; color: var(--ink-3); margin-top: 10px; }
+  .cast dd { margin: 2px 0 0; color: var(--ink-2); font-weight: 300; }
+  @media (max-width: 700px) { .cast { grid-template-columns: 1fr; } }
+
+  /* figures */
+  figure { margin: 0; }
+  .fighead { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+  .fignum { font-family: var(--f-m); font-size: 10px; letter-spacing: .2em; color: var(--ink-3); }
+  .scroll { overflow-x: auto; overscroll-behavior-x: contain; }
+  .scroll svg { display: block; width: 100%; height: auto; min-width: var(--mw, 900px); color: var(--ink); }
+  figcaption { margin-top: 16px; max-width: 76ch; font-size: 14.5px; line-height: 1.6; color: var(--ink-2); font-weight: 300; }
+  .pan { display: none; font-family: var(--f-m); font-size: 9.5px; letter-spacing: .18em; color: var(--ink-3); margin-bottom: 8px; }
+  @media (max-width: 1140px) { .pan { display: block; } }
+
+  /* svg type + strokes */
+  .n   { font-family: var(--f-d); fill: var(--ink); letter-spacing: .05em; }
+  .b   { font-family: var(--f-b); fill: var(--ink-2); font-weight: 300; }
+  .bi  { font-family: var(--f-b); fill: var(--ink-3); font-style: italic; }
+  .m   { font-family: var(--f-m); fill: var(--ink-2); }
+  .mk  { font-family: var(--f-m); fill: var(--ink-3); letter-spacing: .18em; }
+  .dim { fill: var(--ink-3); }
+  .br  { fill: var(--ink); }
+  .em  { fill: var(--ember-2); }
+  .pg  { fill: var(--ground-2); }
+  .ph  { fill: none; stroke: var(--ink); stroke-width: .5; opacity: .2; }
+  .sl  { fill: url(#hx); stroke: var(--ink); stroke-width: 1.5; }
+  .sle { fill: url(#hx); stroke: var(--ember); stroke-width: 1.5; }
+  .sb  { fill: var(--ground); stroke: var(--ink-3); stroke-width: 1; }
+  .sbd { fill: var(--ground); stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 4 3; }
+  .fr  { fill: none; stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 8 6; opacity: .7; }
+  .hair{ stroke: var(--ink-3); stroke-width: 1; opacity: .55; }
+  .tick{ stroke: var(--ink-3); stroke-width: 1.4; }
+  .w1  { fill: none; stroke: var(--ink); stroke-width: 1.6; }
+  .w2  { fill: none; stroke: var(--ink-3); stroke-width: 1.2; stroke-dasharray: 6 4; }
+  .w3  { fill: none; stroke: var(--ink-3); stroke-width: 1.2; stroke-dasharray: 1 4; stroke-linecap: round; }
+  .we  { fill: none; stroke: var(--ember); stroke-width: 1.6; }
+  .af  { fill: currentColor; }
+  .ae  { fill: var(--ember); }
+  .patch { fill: var(--ground); }
+
+  /* legend */
+  .legend { display: grid; grid-template-columns: repeat(4, 1fr); gap: 22px; margin-top: 30px; padding-top: 22px; border-top: 1px solid var(--ink-3); }
+  .legend div { min-width: 0; }
+  .legend svg { display: block; width: 54px; height: 10px; margin-bottom: 8px; color: var(--ink); }
+  .legend p { margin: 0; font-size: 13px; line-height: 1.45; }
+  @media (max-width: 820px) { .legend { grid-template-columns: repeat(2, 1fr); } }
+
+  /* forces table */
+  .forces { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .forces th { text-align: left; font-family: var(--f-m); font-weight: 400; font-size: 9.5px; letter-spacing: .2em; color: var(--ink-3); padding: 0 16px 10px 0; border-bottom: 1px solid var(--ink-3); }
+  .forces td { padding: 13px 16px 13px 0; border-bottom: 1px solid rgba(141,147,143,.3); color: var(--ink-2); font-weight: 300; vertical-align: top; }
+  .forces td:first-child { color: var(--ink); font-family: var(--f-m); font-size: 12.5px; width: 34%; }
+  @media (max-width: 620px) { .forces td:first-child { width: 42%; } .forces { font-size: 13px; } }
+
+  footer { margin-top: 72px; padding-top: 24px; border-top: 1px solid var(--ink-3); display: flex; justify-content: space-between; align-items: flex-end; gap: 20px; flex-wrap: wrap; }
+  footer p { margin: 0; font-family: var(--f-m); font-size: 10.5px; letter-spacing: .14em; color: var(--ink-3); }
+  footer svg { width: 44px; height: 24px; color: var(--ink-3); flex: none; }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">DESIGN &middot; DOCS/DESIGN.MD &middot; 28 OCTOBER 2026</p>
+    <h1>Hlekk</h1>
+    <p class="gloss">Old Norse for a chain link &mdash; a TAO-style object&#8209;and&#8209;edge database built on actors.</p>
+    <div class="prose">
+      <p>The infrastructure, not the application, owns partitioning, placement and capacity. Developers create objects in a logical database and never size, pick or reshard a Durable Object. A database that fits in one DO runs in one DO; the same code runs when it is five hundred.</p>
+      <p>Three kinds of component, and only three: a <strong>Worker</strong> that coordinates, one <strong>directory DO</strong> per database, and many <strong>host DOs</strong> that own vshards. Reads and writes go from the Worker straight to the hosts.</p>
+    </div>
+  </header>
+
+  <div class="cast">
+    <div>
+      <p class="k">STATELESS</p>
+      <p class="nm">Worker</p>
+      <dl>
+        <dt>RUNS</dt><dd>the query loop, once, in one place</dd>
+        <dt>HOLDS</dt><dd>a cached route map, budgets, retries</dd>
+        <dt>NEVER</dt><dd>stores data, or forwards a query DO to DO</dd>
+      </dl>
+    </div>
+    <div>
+      <p class="k">ONE PER DATABASE</p>
+      <p class="nm">Directory DO</p>
+      <dl>
+        <dt>RUNS</dt><dd>the allocator, placement, every vshard move</dd>
+        <dt>HOLDS</dt><dd>vshard &rarr; host, and the schema catalog</dd>
+        <dt>NEVER</dt><dd>sits in the request path &mdash; only a cache miss wakes it</dd>
+      </dl>
+    </div>
+    <div>
+      <p class="k">MANY PER DATABASE</p>
+      <p class="nm">Host DOs</p>
+      <dl>
+        <dt>RUNS</dt><dd>the plan over local data; the outbox alarm</dd>
+        <dt>HOLDS</dt><dd>many vshards in one SQLite file</dd>
+        <dt>NEVER</dt><dd>splits a vshard, or trusts a caller's route</dd>
+      </dl>
+    </div>
+  </div>
+
+  <svg class="defs" aria-hidden="true" focusable="false" width="0" height="0" style="position:absolute;width:0;height:0;overflow:hidden">
+    <defs>
+      <pattern id="hx" width="6" height="6" patternUnits="userSpaceOnUse">
+        <rect width="6" height="6" class="pg"/>
+        <path d="M-1,1 L1,-1 M0,6 L6,0 M5,7 L7,5" class="ph"/>
+      </pattern>
+      <filter id="rg" x="-3%" y="-3%" width="106%" height="106%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.04" numOctaves="2" seed="11" result="n"/>
+        <feDisplacementMap in="SourceGraphic" in2="n" scale="1.5" xChannelSelector="R" yChannelSelector="G"/>
+      </filter>
+      <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0.5 L10,5 L0,9.5 Z" class="af"/>
+      </marker>
+      <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+        <path d="M0,0.5 L10,5 L0,9.5 Z" class="ae"/>
+      </marker>
+    </defs>
+  </svg>
+
+  <section class="sect" style="margin-top:56px">
+    <figure>
+      <div class="fighead">
+        <span class="fignum">FIGURE 1</span>
+        <h2>One worker, one directory, many hosts</h2>
+      </div>
+      <p class="pan">PAN THE DIAGRAM SIDEWAYS &rarr;</p>
+      <div class="scroll" style="--mw:1020px">
+        <svg viewBox="0 0 1180 760" role="img" aria-label="Hlekk architecture: app code calls a stateless Worker, which coordinates one query and sends one batched request per host DO. A directory DO, consulted only on a route-cache miss, maps vshards to host DOs with an epoch, holds the schema catalog, and drives vshard moves. Each host DO holds many vshards in SQLite with five tables, enforces the epoch, and delivers inverse edges to other hosts from an outbox.">
+
+          <!-- carved slabs -->
+          <g filter="url(#rg)">
+            <polygon class="sl" points="70,20 450,20 460,30 460,86 60,86 60,30"/>
+            <polygon class="sl" points="690,20 1110,20 1120,30 1120,86 680,86 680,30"/>
+            <polygon class="sl" points="70,118 550,118 560,128 560,304 60,304 60,128"/>
+            <polygon class="sl" points="690,118 1110,118 1120,128 1120,322 680,322 680,128"/>
+            <polygon class="sl" points="95,430 365,430 375,440 375,680 85,680 85,440"/>
+            <polygon class="sl" points="455,430 725,430 735,440 735,680 445,680 445,440"/>
+            <polygon class="sl" points="815,430 1085,430 1095,440 1095,680 805,680 805,440"/>
+            <rect class="sb" x="101" y="492" width="258" height="130"/>
+            <rect class="sb" x="461" y="492" width="258" height="130"/>
+            <rect class="sbd" x="821" y="492" width="258" height="130"/>
+          </g>
+
+          <!-- host grouping frame -->
+          <rect class="fr" x="60" y="404" width="1060" height="336"/>
+          <rect class="patch" x="74" y="394" width="356" height="20"/>
+
+          <!-- wires -->
+          <path class="w1" d="M180,90 L180,112" marker-end="url(#a1)"/>
+          <path class="w1" d="M680,48 L500,48 L500,112" marker-end="url(#a1)"/>
+          <path class="w2" d="M840,114 L840,82" marker-end="url(#a1)"/>
+          <path class="w2" d="M564,186 L676,186" marker-start="url(#a1)" marker-end="url(#a1)"/>
+          <path class="w1" d="M200,308 L200,428" marker-start="url(#a1)" marker-end="url(#a1)"/>
+          <path class="w1" d="M200,366 L590,366 L590,428" marker-end="url(#a1)"/>
+          <path class="w2" d="M900,326 L900,428" marker-end="url(#a1)"/>
+          <path class="w2" d="M900,384 L640,384 L640,428" marker-end="url(#a1)"/>
+          <path class="w3" d="M1050,428 L1050,326" marker-end="url(#a1)"/>
+          <path class="w1" d="M739,556 L799,556" marker-end="url(#a1)"/>
+          <path class="we" d="M359,584 L409,584 L409,706 L560,706 L560,684" marker-end="url(#a2)"/>
+
+          <!-- type -->
+          <text class="mk" x="74" y="42" font-size="9.5">APP CODE</text>
+          <text class="b" x="74" y="62" font-size="11">generated from the catalog, for one projection</text>
+          <text class="m" x="74" y="78" font-size="10">carries catalog v42 + the projection hash</text>
+          <text class="m" x="192" y="104" font-size="10">db.get &middot; db.txn &middot; Issue.gen(id).related(&hellip;)</text>
+
+          <text class="mk" x="694" y="42" font-size="9.5">WORKERS KV</text>
+          <text class="b" x="694" y="62" font-size="11">a versioned snapshot of the route map</text>
+          <text class="b" x="694" y="78" font-size="11">a cold isolate reads this, not the directory</text>
+          <text class="b" x="590" y="40" font-size="9.5" text-anchor="middle">cold start</text>
+          <text class="b" x="852" y="101" font-size="9.5">publishes</text>
+
+          <text class="mk" x="74" y="142" font-size="9.5">STATELESS &middot; ONE PER REQUEST</text>
+          <text class="n" x="74" y="170" font-size="20">Worker</text>
+          <text class="bi" x="74" y="190" font-size="12">API and query coordinator</text>
+          <line class="hair" x1="74" y1="198" x2="546" y2="198"/>
+          <g class="b" font-size="10.5">
+            <text x="88" y="216">runs the whole query once, in one place</text>
+            <text x="88" y="234">sends one request per host, per tick</text>
+            <text x="88" y="252">caches the route map in isolate memory</text>
+            <text x="88" y="270">holds the deadlines, retries, result caps and cancellation</text>
+            <text x="88" y="288">the same loop can run on the root&rsquo;s host DO when the data is far</text>
+          </g>
+          <g class="tick">
+            <line x1="74" y1="212" x2="82" y2="212"/><line x1="74" y1="230" x2="82" y2="230"/>
+            <line x1="74" y1="248" x2="82" y2="248"/><line x1="74" y1="266" x2="82" y2="266"/>
+            <line x1="74" y1="284" x2="82" y2="284"/>
+          </g>
+
+          <text class="mk" x="694" y="142" font-size="9.5">ONE PER DATABASE</text>
+          <text class="n" x="694" y="170" font-size="20">Directory DO</text>
+          <text class="bi" x="694" y="190" font-size="12">routing, catalog, placement</text>
+          <line class="hair" x1="694" y1="198" x2="1106" y2="198"/>
+          <text class="m" x="708" y="216" font-size="10">vshard &rarr; host DO, epoch, region, jurisdiction</text>
+          <g class="b" font-size="10.5">
+            <text x="708" y="234">stored as ranges &mdash; a small database is one range</text>
+            <text x="708" y="252">the schema catalog every database applies</text>
+            <text x="708" y="270">the allocator: a new object goes to a vshard with room</text>
+            <text x="708" y="288">placement watches storage bytes and request rate</text>
+            <text x="708" y="306">drives each move as a resumable alarm machine</text>
+          </g>
+          <g class="tick">
+            <line x1="694" y1="212" x2="702" y2="212"/><line x1="694" y1="230" x2="702" y2="230"/>
+            <line x1="694" y1="248" x2="702" y2="248"/><line x1="694" y1="266" x2="702" y2="266"/>
+            <line x1="694" y1="284" x2="702" y2="284"/><line x1="694" y1="302" x2="702" y2="302"/>
+          </g>
+
+          <text class="b" x="620" y="178" font-size="9.5" text-anchor="middle">route miss</text>
+          <text class="m" x="620" y="202" font-size="9" text-anchor="middle">ranges &middot; epochs</text>
+
+          <text class="b" x="214" y="322" font-size="10.5">one batch per host, per tick</text>
+          <text class="m" x="214" y="338" font-size="9.5">plan &middot; ids &middot; epochs &nbsp;&darr;</text>
+          <text class="m" x="214" y="354" font-size="9.5">rows &middot; counts &middot; misses &middot; moved &nbsp;&uarr;</text>
+
+          <text class="b" x="888" y="350" font-size="10.5" text-anchor="end">during a move</text>
+          <text class="m" x="888" y="366" font-size="9.5" text-anchor="end">fence &middot; install &middot; retire</text>
+          <text class="b dim" x="1062" y="386" font-size="9.5">by alarm</text>
+
+          <text class="mk" x="84" y="408" font-size="9.5">HOST DOs &mdash; MANY, EACH HOLDING MANY VSHARDS</text>
+
+          <!-- host A -->
+          <text class="n" x="101" y="458" font-size="16">Host DO A</text>
+          <text class="m" x="101" y="478" font-size="10">vshards 0&ndash;511 &middot; epoch 7</text>
+          <text class="mk" x="113" y="512" font-size="8.5">SQLITE &middot; CTX.STORAGE.SQL</text>
+          <g font-size="10"><g class="m br">
+            <text x="113" y="532">objects</text><text x="113" y="550">assocs</text>
+            <text x="113" y="568">assoc_counts</text><text x="113" y="586">outbox</text>
+            <text x="113" y="604">vshards</text></g>
+            <g class="b" font-size="8.5">
+            <text x="215" y="532">id, otype, version, data</text>
+            <text x="215" y="550">id1, atype, id2, time</text>
+            <text x="215" y="568">never a COUNT(*)</text>
+            <text x="215" y="586">inverses awaiting delivery</text>
+            <text x="215" y="604">epoch, state, next_seq</text></g>
+          </g>
+          <text class="m" x="113" y="646" font-size="10">exec(plan, tasks) &rarr; reads, misses</text>
+          <text class="b" x="113" y="664" font-size="10.5">runs the plan below every row it is asked for</text>
+
+          <!-- host B -->
+          <text class="n" x="461" y="458" font-size="16">Host DO B</text>
+          <text class="m" x="461" y="478" font-size="10">vshards 512&ndash;1023 &middot; epoch 3</text>
+          <text class="mk" x="473" y="512" font-size="8.5">THE SAME FIVE TABLES</text>
+          <g class="m br" font-size="10">
+            <text x="473" y="532">objects</text><text x="473" y="550">assocs</text>
+            <text x="473" y="568">assoc_counts</text><text x="473" y="586">outbox</text>
+            <text x="473" y="604">vshards</text>
+          </g>
+          <text class="bi" x="575" y="568" font-size="9.5">other vshards,</text>
+          <text class="bi" x="575" y="582" font-size="9.5">other epochs</text>
+          <text class="m" x="473" y="646" font-size="10">epoch mismatch &rarr; moved { to, epoch }</text>
+          <text class="b" x="473" y="664" font-size="10.5">upserts delivered inverses; redelivery is a no-op</text>
+
+          <!-- host C -->
+          <text class="n" x="821" y="458" font-size="16">Host DO C</text>
+          <text class="m" x="821" y="478" font-size="10">new &middot; locationHint / jurisdiction</text>
+          <text class="mk" x="833" y="512" font-size="8.5">FILLING FROM HOST B</text>
+          <g class="m dim" font-size="10">
+            <text x="833" y="532">objects</text><text x="833" y="550">assocs</text>
+            <text x="833" y="568">assoc_counts</text><text x="833" y="586">outbox</text>
+            <text x="833" y="604">vshards</text>
+          </g>
+          <text class="b" x="833" y="646" font-size="10.5">takes one whole vshard &mdash; never a split</text>
+          <text class="b" x="833" y="664" font-size="10.5">a DO&rsquo;s location is fixed once it exists</text>
+
+          <text class="m" x="769" y="546" font-size="9.5" text-anchor="middle">copy</text>
+          <text class="m" x="769" y="574" font-size="9.5" text-anchor="middle">epoch+1</text>
+
+          <text class="em" x="415" y="726" font-size="10" font-family="'IBM Plex Mono', monospace">inverse edges from the outbox &mdash; in order per (source, target) vshard, idempotent, retried across moves</text>
+        </svg>
+      </div>
+      <figcaption>Reads and writes go from the Worker straight to the host that owns the vshard; the directory is consulted only when the route cache misses. A cached route is a hint, never an authority &mdash; every request carries the epoch it was routed with, and the owning host answers <code>moved { to, epoch }</code> when it no longer owns that vshard. A stale route therefore costs one extra round and never a wrong write.</figcaption>
+    </figure>
+
+    <div class="legend">
+      <div>
+        <svg viewBox="0 0 54 10" aria-hidden="true"><path class="w1" d="M2,5 L48,5" marker-start="url(#a1)" marker-end="url(#a1)"/></svg>
+        <p>On the request path. One batched round per host, answered with everything that host read.</p>
+      </div>
+      <div>
+        <svg viewBox="0 0 54 10" aria-hidden="true"><path class="we" d="M2,5 L48,5" marker-end="url(#a2)"/></svg>
+        <p>Delivered later by an alarm. The only eventually consistent edge in the system.</p>
+      </div>
+      <div>
+        <svg viewBox="0 0 54 10" aria-hidden="true"><path class="w2" d="M2,5 L48,5" marker-end="url(#a1)"/></svg>
+        <p>Control plane. Off the request path, driven by the directory.</p>
+      </div>
+      <div>
+        <svg viewBox="0 0 54 10" aria-hidden="true"><path class="w3" d="M2,5 L48,5" marker-end="url(#a1)"/></svg>
+        <p>Reported by alarm: storage bytes and request rate, for placement.</p>
+      </div>
+    </div>
+  </section>
+
+  <div class="rule"><span class="hr"></span><svg class="lk" viewBox="0 0 104 22" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1" y="4" width="30" height="14" rx="7"/><rect x="26" y="2" width="12" height="18" rx="6"/><rect x="34" y="4" width="30" height="14" rx="7"/><rect x="59" y="2" width="12" height="18" rx="6"/><rect x="67" y="4" width="30" height="14" rx="7"/></g></svg><span class="hr"></span></div>
+
+  <section class="sect" style="margin-top:0">
+    <h2>The three mechanisms the picture rests on</h2>
+    <div class="prose">
+      <p>Identity, ownership, storage and read serving are separate concerns. An object&rsquo;s ID never changes; the DO that owns its writes can. These three figures are the machinery that makes that separation hold.</p>
+    </div>
+
+    <figure style="margin-top:44px">
+      <div class="fighead">
+        <span class="fignum">FIGURE 2</span>
+        <h3>The ID is the route</h3>
+      </div>
+      <p class="pan">PAN THE DIAGRAM SIDEWAYS &rarr;</p>
+      <div class="scroll" style="--mw:880px">
+        <svg viewBox="0 0 1000 270" role="img" aria-label="A 64-bit ID split into a 24-bit vshard field in the high bits and a 40-bit sequence in the low bits. The vshard field gives the route without a lookup; the sequence is allocated per vshard.">
+          <text class="m br" x="60" y="48" font-size="12.5">id "568447511589576" &nbsp;=&nbsp; vshard 517 &middot; sequence 29 384</text>
+          <g class="m dim" font-size="9">
+            <text x="60" y="84">63</text>
+            <text x="386" y="84" text-anchor="end">40</text>
+            <text x="394" y="84">39</text>
+            <text x="940" y="84" text-anchor="end">0</text>
+          </g>
+          <g filter="url(#rg)">
+            <rect class="sl" x="60" y="92" width="880" height="48"/>
+          </g>
+          <line class="w1" x1="390" y1="92" x2="390" y2="140"/>
+          <text class="n" x="225" y="116" font-size="15" text-anchor="middle">vshard</text>
+          <text class="m" x="225" y="132" font-size="9.5" text-anchor="middle">24 bits &middot; 16.7M per database</text>
+          <text class="n" x="665" y="116" font-size="15" text-anchor="middle">sequence</text>
+          <text class="m" x="665" y="132" font-size="9.5" text-anchor="middle">40 bits &middot; from vshards.next_seq</text>
+          <path class="hair" fill="none" d="M60,150 L60,160 L386,160 L386,150"/>
+          <path class="hair" fill="none" d="M394,150 L394,160 L940,160 L940,150"/>
+          <path class="w2" d="M223,160 L223,178" marker-end="url(#a1)"/>
+          <path class="w2" d="M667,160 L667,178" marker-end="url(#a1)"/>
+          <g class="b" font-size="10.5">
+            <text x="70" y="198">the route is a shift, not a lookup</text>
+            <text x="70" y="216">the directory maps a vshard range to a host and an epoch</text>
+            <text x="70" y="234">a host shifts an ID to know whether it holds it</text>
+            <text x="70" y="252">one vshard is one contiguous key range in every table</text>
+            <text x="404" y="198">IDs ascend inside a vshard, so inserts append</text>
+            <text x="404" y="216">no clock in the ID: time ordering lives on the edge</text>
+            <text x="404" y="234">2^40 is about 3,500 years at 10 new objects a second</text>
+            <text x="404" y="252">8 big-endian bytes in SQLite, a string on the wire</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption>The vshard sits in the ID&rsquo;s high bits, so a Worker routes with a shift and a host knows whether it owns an ID without consulting anything. Because the vshard leads the key, one vshard&rsquo;s rows in <code>objects</code>, <code>assocs</code> and <code>assoc_counts</code> are a single contiguous range &mdash; which is what makes a move a byte copy and needs no extra column or index. IDs are strings in the API and 8-byte BLOBs in SQLite: an integer string above 2<sup>63</sup>&minus;1 becomes a REAL in SQLite and two distinct IDs can then compare equal, and the DO SQL API hands integers back as JS numbers, which lose precision above 2<sup>53</sup>.</figcaption>
+    </figure>
+
+    <figure style="margin-top:64px">
+      <div class="fighead">
+        <span class="fignum">FIGURE 3</span>
+        <h3>One mutation, one local transaction</h3>
+      </div>
+      <p class="pan">PAN THE DIAGRAM SIDEWAYS &rarr;</p>
+      <div class="scroll" style="--mw:900px">
+        <svg viewBox="0 0 1000 500" role="img" aria-label="A mutation arrives at the host that owns the vshard and commits in one SQLite transaction: check the vshard row and epoch, write the object or edge, update the edge count, and place the inverse edge. An inverse on the same host is written inline in the same transaction; an inverse on another host becomes one outbox row, delivered later by an alarm.">
+          <text class="m br" x="60" y="36" font-size="11">db.assoc.add(issueComments, issueId, commentId)</text>
+          <text class="b dim" x="60" y="54" font-size="10">routed with the epoch the Worker held for id1&rsquo;s vshard</text>
+          <path class="w1" d="M180,62 L180,88" marker-end="url(#a1)"/>
+
+          <g filter="url(#rg)">
+            <polygon class="sl" points="70,90 590,90 600,100 600,466 60,466 60,100"/>
+            <rect class="sb" x="84" y="160" width="492" height="270"/>
+            <polygon class="sl" points="670,180 970,180 980,190 980,286 660,286 660,190"/>
+            <polygon class="sle" points="670,306 970,306 980,316 980,466 660,466 660,316"/>
+          </g>
+
+          <text class="mk" x="74" y="118" font-size="9.5">THE HOST THAT OWNS id1&rsquo;s VSHARD</text>
+          <text class="n" x="74" y="146" font-size="18">Host DO</text>
+          <text class="m" x="98" y="184" font-size="10">transactionSync() &mdash; all of it, or none of it</text>
+
+          <g class="n dim" font-size="15">
+            <text x="98" y="216">1</text><text x="98" y="278">2</text>
+            <text x="98" y="325">3</text><text x="98" y="372">4</text>
+          </g>
+          <g class="b br" font-size="11.5">
+            <text x="124" y="216">check this vshard&rsquo;s row</text>
+            <text x="124" y="278">write the object or the edge</text>
+            <text x="124" y="325">update assoc_counts</text>
+            <text x="124" y="372">place the inverse edge</text>
+          </g>
+          <g class="b" font-size="10">
+            <text x="124" y="232">state must be owned and the request&rsquo;s epoch must match</text>
+            <text x="124" y="247">otherwise reply moved { to, epoch } and write nothing</text>
+            <text x="124" y="294">a create takes the next sequence; an update bumps version</text>
+            <text x="124" y="341">the count commits with the edge that changed it</text>
+            <text x="124" y="388">inline when its vshard is on this host &mdash; atomic for free</text>
+            <text x="124" y="403">otherwise one outbox row, in this same commit</text>
+          </g>
+          <g class="hair">
+            <line x1="98" y1="259" x2="562" y2="259"/>
+            <line x1="98" y1="306" x2="562" y2="306"/>
+            <line x1="98" y1="353" x2="562" y2="353"/>
+          </g>
+          <text class="b" x="74" y="452" font-size="10.5">the DO sends its response only after this commit is durable</text>
+
+          <path class="w1" d="M576,374 L612,374 L612,232 L652,232" marker-end="url(#a1)"/>
+          <path class="we" d="M576,392 L628,392 L628,358 L652,358" marker-end="url(#a2)"/>
+
+          <text class="n" x="674" y="212" font-size="15">On this host</text>
+          <g class="b" font-size="10.5">
+            <text x="674" y="236">the inverse commits in the same transaction</text>
+            <text x="674" y="254">a colocated edge pair is atomic for free</text>
+          </g>
+          <text class="m" x="674" y="272" font-size="10">no outbox row</text>
+
+          <text class="n em" x="674" y="338" font-size="15">On another host</text>
+          <g class="b" font-size="10.5">
+            <text x="674" y="362">an alarm delivers the row, then deletes it on ack</text>
+            <text x="674" y="380">one writer per inverse, so per-source order is enough</text>
+            <text x="674" y="398">a crash loses nothing: the row waits for the next alarm</text>
+            <text x="674" y="416">a moved reply updates the route; the row is retried</text>
+          </g>
+          <text class="em" x="674" y="442" font-size="10.5" font-family="'Spectral', Georgia, serif" font-style="italic">eventually consistent &mdash; read the forward edge instead</text>
+        </svg>
+      </div>
+      <figcaption>Every mutation commits in one <code>transactionSync()</code> on one host: the ownership check, the data write, the edge count and the outbox row all land together or not at all. The only thing left over at commit is an inverse edge bound for a vshard on another host, which an alarm delivers in order per source-and-target pair, idempotently, retrying through a <code>moved</code> reply. A <code>db.txn(anchorId, …)</code> is the same shape: every ID it touches must share the anchor&rsquo;s vshard, and transactions across vshards are a non-goal for v1.</figcaption>
+    </figure>
+
+    <figure style="margin-top:64px">
+      <div class="fighead">
+        <span class="fignum">FIGURE 4</span>
+        <h3>Move, never split</h3>
+      </div>
+      <p class="pan">PAN THE DIAGRAM SIDEWAYS &rarr;</p>
+      <div class="scroll" style="--mw:960px">
+        <svg viewBox="0 0 1100 262" role="img" aria-label="The five steps of a stop-the-world vshard move: fence the source, copy the key range to the target, install it as owned at epoch plus one, flip the directory route, and retire the source. The source stays fenced across all five steps.">
+          <g filter="url(#rg)">
+            <polygon class="sl" points="80,64 230,64 240,74 240,186 70,186 70,74"/>
+            <polygon class="sl" points="280,64 430,64 440,74 440,186 270,186 270,74"/>
+            <polygon class="sl" points="480,64 630,64 640,74 640,186 470,186 470,74"/>
+            <polygon class="sl" points="680,64 830,64 840,74 840,186 670,186 670,74"/>
+            <polygon class="sl" points="880,64 1030,64 1040,74 1040,186 870,186 870,74"/>
+          </g>
+          <g class="w1">
+            <path d="M244,125 L264,125" marker-end="url(#a1)"/>
+            <path d="M444,125 L464,125" marker-end="url(#a1)"/>
+            <path d="M644,125 L664,125" marker-end="url(#a1)"/>
+            <path d="M844,125 L864,125" marker-end="url(#a1)"/>
+          </g>
+          <g class="n dim" font-size="22">
+            <text x="84" y="96">1</text><text x="284" y="96">2</text><text x="484" y="96">3</text>
+            <text x="684" y="96">4</text><text x="884" y="96">5</text>
+          </g>
+          <g class="n" font-size="13.5">
+            <text x="110" y="95">Fence</text><text x="310" y="95">Copy</text><text x="510" y="95">Install</text>
+            <text x="710" y="95">Flip</text><text x="910" y="95">Retire</text>
+          </g>
+          <g class="hair">
+            <line x1="84" y1="112" x2="226" y2="112"/><line x1="284" y1="112" x2="426" y2="112"/>
+            <line x1="484" y1="112" x2="626" y2="112"/><line x1="684" y1="112" x2="826" y2="112"/>
+            <line x1="884" y1="112" x2="1026" y2="112"/>
+          </g>
+          <g class="b" font-size="9.5">
+            <text x="84" y="134">the source sets the vshard</text>
+            <text x="84" y="148">to fenced &mdash; writes are</text>
+            <text x="84" y="162">rejected, reads continue</text>
+            <text x="284" y="134">the target pulls the key</text>
+            <text x="284" y="148">range: objects, assocs,</text>
+            <text x="284" y="162">counts, outbox, vshards</text>
+            <text x="484" y="134">the target marks the</text>
+            <text x="484" y="148">vshard owned at epoch + 1</text>
+            <text x="684" y="134">the directory compare-and-</text>
+            <text x="684" y="148">sets the route to the target</text>
+            <text x="884" y="134">the source answers moved,</text>
+            <text x="884" y="148">then drops the rows after</text>
+            <text x="884" y="162">a grace period</text>
+          </g>
+          <line class="hair" x1="70" y1="206" x2="1040" y2="206"/>
+          <line class="tick" x1="70" y1="200" x2="70" y2="212"/>
+          <line class="tick" x1="1040" y1="200" x2="1040" y2="212"/>
+          <text class="b br" x="555" y="230" font-size="11" text-anchor="middle">the source stays fenced from step 1 to step 5, so the two hosts never both accept writes for this vshard</text>
+          <text class="b dim" x="555" y="248" font-size="10.5" text-anchor="middle">only this one vshard pauses; every other vshard on both hosts keeps serving</text>
+        </svg>
+      </div>
+      <figcaption>Capacity is managed by moving whole vshards, and the directory drives each move as a resumable alarm machine, so a crash mid-move resumes instead of leaving a vshard fenced. A vshard is never divided: sequences follow creation order, so a split by ID range would cut a colocation group apart by age. The deferred <code>changes</code> log would let the target copy a snapshot while writes continue and catch up on the tail, shrinking the fence to the last few entries.</figcaption>
+    </figure>
+  </section>
+
+  <div class="rule"><span class="hr"></span><svg class="lk" viewBox="0 0 104 22" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1" y="4" width="30" height="14" rx="7"/><rect x="26" y="2" width="12" height="18" rx="6"/><rect x="34" y="4" width="30" height="14" rx="7"/><rect x="59" y="2" width="12" height="18" rx="6"/><rect x="67" y="4" width="30" height="14" rx="7"/></g></svg><span class="hr"></span></div>
+
+  <section class="sect" style="margin-top:0">
+    <figure>
+      <div class="fighead">
+        <span class="fignum">FIGURE 5</span>
+        <h2>The catalog is the source of truth</h2>
+      </div>
+      <div class="prose" style="margin-bottom:22px">
+        <p>Object types and edge types are separate entries, each owned by a domain, so no object type lists its edges and no type becomes a god class. Code is generated from the catalog, never the other way around, and each product generates only its projection.</p>
+      </div>
+      <p class="pan">PAN THE DIAGRAM SIDEWAYS &rarr;</p>
+      <div class="scroll" style="--mw:940px">
+        <svg viewBox="0 0 1100 252" role="img" aria-label="One JSON file per domain is diffed into catalog.lock.json, which allocates an integer for every entry and a new catalog version. Every directory DO compare-and-sets its catalog to that version, and each product regenerates one module from the same lock for its own projection.">
+          <g filter="url(#rg)">
+            <polygon class="sl" points="70,40 320,40 330,50 330,162 60,162 60,50"/>
+            <polygon class="sl" points="400,40 690,40 700,50 700,162 390,162 390,50"/>
+            <polygon class="sl" points="770,36 1030,36 1040,46 1040,118 760,118 760,46"/>
+            <polygon class="sl" points="770,138 1030,138 1040,148 1040,220 760,220 760,148"/>
+          </g>
+          <path class="w1" d="M334,101 L386,101" marker-end="url(#a1)"/>
+          <path class="w1" d="M704,101 L730,101 L730,78 L756,78" marker-end="url(#a1)"/>
+          <path class="w1" d="M730,101 L730,178 L756,178" marker-end="url(#a1)"/>
+          <text class="m dim" x="360" y="92" font-size="9" text-anchor="middle">diff</text>
+
+          <text class="n" x="74" y="68" font-size="15">Domain files</text>
+          <text class="m" x="74" y="92" font-size="10">schema/issues.json</text>
+          <g class="b" font-size="10.5">
+            <text x="74" y="110">one file per domain, owned by its team</text>
+            <text x="74" y="128">no integers in it</text>
+            <text x="74" y="146">review on the file is the ownership check</text>
+          </g>
+
+          <text class="n" x="404" y="68" font-size="15">The lock</text>
+          <text class="m" x="404" y="92" font-size="10">schema/catalog.lock.json &middot; v42</text>
+          <g class="b" font-size="10.5">
+            <text x="404" y="110">every entry, its integer, the version</text>
+            <text x="404" y="128">written by hlekk schema plan</text>
+            <text x="404" y="146">every database applies the same lock</text>
+          </g>
+
+          <text class="n" x="774" y="64" font-size="15">Directory DOs</text>
+          <g class="b" font-size="10.5">
+            <text x="774" y="88">compare-and-set the catalog v41 &rarr; v42</text>
+            <text x="774" y="106">a host behind that version fetches it first</text>
+          </g>
+
+          <text class="n" x="774" y="166" font-size="15">Generated code</text>
+          <text class="m" x="774" y="190" font-size="10">hlekk gen issues-web &rarr; schema.gen.ts</text>
+          <text class="b" x="774" y="208" font-size="10.5">only the types and edges that product uses</text>
+
+          <text class="b dim" x="60" y="242" font-size="10.5">Integers are identity and are never reused. Names are labels, so a rename never breaks a deployed client.</text>
+        </svg>
+      </div>
+      <figcaption>Objects are stored as JSON, so the catalog is a lens over stored data rather than its layout: most changes edit the lens and touch no rows. Only two kinds of change touch data &mdash; a check that existing rows meet a stricter rule, and a build of derived rows such as inverses and indexes &mdash; and both run per vshard, resumably, the way a move does. A projection decides what one product&rsquo;s generated module contains and changes no data; an included edge whose target type is not selected yields a <code>Ref</code>, an ID you can hold and link to with no fields.</figcaption>
+    </figure>
+  </section>
+
+  <section class="sect">
+    <h2>What the platform forces</h2>
+    <div class="prose" style="margin-bottom:28px">
+      <p>Most of the shape above is a response to five hard numbers. The vshard exists because a DO caps at 10&nbsp;GB; batching per host exists because a DO caps at a thousand requests a second; BLOB IDs exist because JavaScript cannot hold a 64-bit integer.</p>
+    </div>
+    <table class="forces">
+      <thead><tr><th>LIMIT</th><th>DESIGN CONSEQUENCE</th></tr></thead>
+      <tbody>
+        <tr><td>10 GB per SQLite-backed DO</td><td>vshards are capped near 1 GB, well under it, and one host holds many of them</td></tr>
+        <tr><td>1,000 requests/sec per DO</td><td>one batched request per host per tick; it also caps one object&rsquo;s write rate and a host&rsquo;s density</td></tr>
+        <tr><td>2 MB row size</td><td>the object payload cap</td></tr>
+        <tr><td>DO location fixed at creation</td><td>changing region is a vshard move to a new host created with a <code>locationHint</code> or <code>jurisdiction</code></td></tr>
+        <tr><td>JS integers lose precision above 2<sup>53</sup></td><td>IDs travel as strings and are stored as 8-byte big-endian BLOBs, which also sort in unsigned numeric order</td></tr>
+      </tbody>
+    </table>
+    <div class="prose" style="margin-top:32px">
+      <p>And what v1 deliberately does not do: arbitrary SQL, ad-hoc joins or scans; transactions across colocation groups; incremental view maintenance and change subscriptions; regional read followers and R2 tiering. The <code>changes</code> log that all of those want is designed for and left out.</p>
+    </div>
+  </section>
+
+  <footer>
+    <p>DRAWN FROM DOCS/DESIGN.MD &middot; HLEKK</p>
+    <svg viewBox="0 0 44 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.6"><rect x="1" y="5" width="26" height="14" rx="7"/><rect x="22" y="2" width="12" height="20" rx="6"/><rect x="30" y="5" width="13" height="14" rx="7"/></g></svg>
+  </footer>
+
+</div>
