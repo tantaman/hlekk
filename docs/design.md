@@ -958,7 +958,7 @@ Build the riskiest parts first: per-host performance, then moves under load. Eve
 5. **Allocator and placement controller.** Initial sharding, batch growth of the active set, automatic moves on storage and request pressure, and colocation with `with`. — *built*
 6. **Global unique index.** User by email, with reserve → create → confirm. — *built*
 
-What is not built, and is not the deferred work below: a Workers deployment, so the DO and KV adapters are written and typed but unexercised; the normalized `QueryResult` form, since a built query returns the nested shape its chain describes; and non-unique global index maintenance through the outbox.
+What is not built, and is not the deferred work below: a Workers deployment. `npm run smoke` runs a host on real Durable Object SQLite through the DO adapter, which is what says the adapter is right — blobs arrive as `ArrayBuffer` and are normalized, `transactionSync` commits and rolls back, and an 8-byte big-endian key really does sort in unsigned numeric order up to 2^64−1 in the engine the design rests on. What it does not cover is the directory, KV, routing between real DOs, alarms, eviction or request gates, and it is one host, so it still measures no throughput. Non-unique global index maintenance through the outbox is also not built.
 
 After v1: the `changes` log and snapshot-and-tail moves, then regional followers with session tokens.
 

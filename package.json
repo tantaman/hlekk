@@ -5,10 +5,12 @@
   "scripts": {
     "demo": "node src/query/demo.ts",
     "typecheck": "tsc -p .",
-    "test": "node --test \"src/**/*.test.ts\""
+    "test": "node --test \"src/**/*.test.ts\"",
+    "smoke": "node scripts/smoke.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "wrangler": "^4.156.0"
   }
 }
