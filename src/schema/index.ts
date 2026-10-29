@@ -17,6 +17,6 @@ export {
   ref,
   str,
 } from "./define.ts";
-export type { FieldMap, IsSingle, Relation, RowOf, TargetOf } from "./define.ts";
-export { Query, and, edgeField, exists, gen, not, objField, or } from "./query.ts";
-export type { Pred, RunOptions, Runner } from "./query.ts";
+export type { EdgeInfo, FieldMap, IsSingle, Relation, RowOf, TargetOf } from "./define.ts";
+export { CURSOR_VERSION, Query, and, decodeCursor, edgeField, encodeCursor, exists, gen, not, objField, or } from "./query.ts";
+export type { Page, Pred, RunOptions, Runner } from "./query.ts";

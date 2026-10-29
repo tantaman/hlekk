@@ -127,6 +127,13 @@ export class Catalog {
       if (this.#objectsByType.has(o.otype)) {
         throw new CatalogError(`otype ${o.otype} is used by ${this.#objectsByType.get(o.otype)!.name} and ${name}`);
       }
+      for (const field of Object.keys(o.fields)) {
+        // A result carries id, $version and $edge alongside the payload. A field under one of those
+        // names would be shadowed by it, so refuse the name rather than lose the field.
+        if (field.startsWith("$") || field === "id") {
+          throw new CatalogError(`${name}.${field} uses a reserved name: a result carries id, $version and $edge`);
+        }
+      }
       const t: ObjectType = { name, otype: o.otype, fields: o.fields };
       this.#objectsByName.set(name, t);
       this.#objectsByType.set(o.otype, t);

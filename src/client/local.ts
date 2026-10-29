@@ -241,7 +241,7 @@ export class LocalCluster {
           case "create":
             return h.create({ otype: m.otype, data: m.data, with: m.with, vshard: m.vshard, epoch });
           case "update":
-            return h.update({ id: m.id, data: m.data, epoch });
+            return h.update({ id: m.id, data: m.data, expect: m.expect, epoch });
           case "delete":
             return h.delete({ id: m.id, epoch });
           case "assocAdd":

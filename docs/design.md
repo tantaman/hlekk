@@ -114,6 +114,8 @@ const r = await Issue.gen(id)
 
 - Every `related` has a limit. A default applies when none is given.
 - **A to-one relation yields one object or null**, not a list of one. An edge declared `unique`, and every field relationship, is to-one; the operators always produce lists, so the builder unwraps as its last step.
+- **A row carries what reached it, not only its payload.** `$version`, so a read-modify-write can pass the version it read to `update` and lose nothing; and `$edge`, holding the time and data of the edge that reached the row, absent on a root and on a field hop. Without `$edge` an edge's own fields could be filtered on and never read. These names, and `id`, are reserved: the catalog refuses a field under one rather than letting a result shadow it.
+- **`relatedPage` returns a page**, `{ items, cursor, more }`, and `after` resumes one. Every `related` carries a limit, so a list is always a page; only the gathered graph knows whether one was exhausted, since the rows handed back are the ones that passed a filter and fit a limit. A cursor is `(time, id2)` and carries the comparator version it was written under.
 - **Each `related` level is its own frame**, so two aliases over one edge type with different limits or filters do not share a slot.
 - **A query is a value and is immutable.** Extending one returns another, so a half-built query can be finished two different ways, which is what makes a plain function enough for reuse.
 - `related` over an `edge` reads the newest edges first by `time`. Indexed `where` and `orderBy` are allowed only on edge fields; see Indexing.

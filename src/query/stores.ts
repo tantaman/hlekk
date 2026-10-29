@@ -82,10 +82,19 @@ export interface ReadSet {
   counts: [string, number][];
 }
 
+/** A contiguous run of one edge list, as the coordinator knows it. `from` is the cursor it starts
+ *  immediately after, or null when it starts at the head: without that, a run read from the middle
+ *  would answer a read of the head. */
+export interface KnownRun {
+  from: Cursor | null;
+  rows: Edge[];
+  complete: boolean;
+}
+
 /** The coordinator's normalized graph: everything hosts have shipped back so far. */
 export class Cache {
   readonly objects = new Map<Id, Obj | null>();
-  readonly lists = new Map<string, { rows: Edge[]; complete: boolean }>();
+  readonly lists = new Map<string, KnownRun>();
   readonly counts = new Map<string, number>();
 
   merge(r: ReadSet): void {
@@ -98,15 +107,36 @@ export class Cache {
     const k = listKey(s.id1, s.atype);
     const cur = this.lists.get(k);
     const after = s.after;
-    let head: Edge[] = [];
-    if (after !== null) {
-      // A continuation joins the known prefix only where its cursor falls inside it.
-      const i = cur?.rows.findIndex((e) => edgeOrder(e, after) === 0) ?? -1;
-      if (!cur || i < 0) return;
-      head = cur.rows.slice(0, i + 1);
+
+    // Nothing known yet: the segment is the run, starting wherever it was read from. A plan can name
+    // a starting cursor, so the first read of a list is not always a read of its head.
+    if (!cur) {
+      this.lists.set(k, { from: after, rows: s.rows, complete: s.complete });
+      return;
     }
-    const rows = [...head, ...s.rows];
-    if (!cur || s.complete || rows.length > cur.rows.length) this.lists.set(k, { rows, complete: s.complete });
+    if (after === null) {
+      // A read of the head. It supersedes a run that began mid-list, or one it reads further than.
+      if (cur.from !== null || s.complete || s.rows.length > cur.rows.length) {
+        this.lists.set(k, { from: null, rows: s.rows, complete: s.complete });
+      }
+      return;
+    }
+    // A continuation joins the known run where its cursor falls inside it.
+    const i = cur.rows.findIndex((e) => edgeOrder(e, after) === 0);
+    if (i >= 0) {
+      const rows = [...cur.rows.slice(0, i + 1), ...s.rows];
+      if (s.complete || rows.length > cur.rows.length) this.lists.set(k, { from: cur.from, rows, complete: s.complete });
+      return;
+    }
+    // Or it starts exactly where the known run does, in which case it replaces it.
+    if (cur.from !== null && edgeOrder(cur.from, after) === 0) {
+      if (s.complete || s.rows.length > cur.rows.length) {
+        this.lists.set(k, { from: cur.from, rows: s.rows, complete: s.complete });
+      }
+      return;
+    }
+    // Otherwise the two runs are disjoint and joining them would invent adjacency. Keep what we have;
+    // the read that wanted the other run will ask again.
   }
 
   object(id: Id): Maybe<Obj | null> {
@@ -118,6 +148,16 @@ export class Cache {
   page(id1: Id, atype: number, after: Cursor | null, n: number): Maybe<EdgePage> {
     const list = this.lists.get(listKey(id1, atype));
     if (!list) return UNKNOWN;
+    // The known run has to cover where this read starts, or its rows say nothing about it.
+    if (after === null) {
+      if (list.from !== null) return UNKNOWN;
+    } else if (
+      list.from !== null &&
+      edgeOrder(list.from, after) !== 0 &&
+      !list.rows.some((e) => edgeOrder(e, after) === 0)
+    ) {
+      return UNKNOWN;
+    }
     const i = after === null ? 0 : list.rows.findIndex((e) => edgeOrder(after, e) < 0);
     const from = i < 0 ? list.rows.length : i;
     const rows = list.rows.slice(from, from + n);

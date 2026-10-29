@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import { LocalCluster } from "../client/local.ts";
 import { plan as planCatalog } from "../catalog/catalog.ts";
 import { defineObject, edge, fieldRel, id, num, oneOf, ref, str } from "./define.ts";
-import { and, edgeField, exists, not, objField, or } from "./query.ts";
+import { and, decodeCursor, edgeField, encodeCursor, exists, not, objField, or } from "./query.ts";
 
 // The issue tracker from the design. One lock assigns every integer, and the definitions take theirs
 // from it, exactly as a generated module does: hand-numbering them is how a read and a write end up
@@ -269,5 +269,147 @@ describe("what the types reject", () => {
     const check: (s: Shape) => [number, string, string] = (s) => [s.n, s.labels[0].name, s.title];
     void check;
     assert.ok(true);
+  });
+});
+
+describe("what the nested shape carries", () => {
+  async function seeded() {
+    const c = new LocalCluster();
+    c.directory.applyLock(LOCK);
+    c.spreadCatalog();
+    await c.publish();
+    const db = c.client();
+    const alice = await db.create(User.otype, { name: "alice" }, { vshard: "40" });
+    const issue = await db.create(Issue.otype, { title: "i", status: "open" }, { vshard: "5" });
+    const comments: string[] = [];
+    for (let i = 1; i <= 5; i++) {
+      const id = await db.create(Comment.otype, { body: `c${i}`, authorId: alice }, { with: issue });
+      // Edge data, which only the edge carries: who marked the comment and when.
+      await db.assocAdd(issueComments.atype, issue, id, i * 10, { pinned: i === 5 });
+      comments.push(id);
+    }
+    return { c, db, issue, alice, comments };
+  }
+
+  it("carries the object's version, so a read-modify-write can protect itself", async () => {
+    const { db, issue } = await seeded();
+    const [before] = await Issue.gen(issue).run(db);
+    assert.equal(before.$version, 1);
+
+    const next = await db.update(issue, { title: "edited", status: "open" }, { expect: before.$version });
+    assert.equal(next, 2);
+
+    const [after] = await Issue.gen(issue).run(db);
+    assert.equal(after.$version, 2);
+  });
+
+  it("refuses a write whose expected version has moved on", async () => {
+    const { db, issue } = await seeded();
+    const [read] = await Issue.gen(issue).run(db);
+    await db.update(issue, { title: "someone else", status: "open" }); // lands first, unconditionally
+    await assert.rejects(
+      () => db.update(issue, { title: "mine", status: "open" }, { expect: read.$version }),
+      /is at version 2, not the 1 this write expected/,
+    );
+    const [held] = await Issue.gen(issue).run(db);
+    assert.equal(held.title, "someone else", "the losing write left no trace");
+  });
+
+  it("carries the edge that reached a row, which could be filtered on but never read", async () => {
+    const { db, issue } = await seeded();
+    const [page] = await Issue.gen(issue).related("comments", issueComments, (q) => q.limit(2)).run(db);
+    assert.deepEqual(page.comments.map((c) => c.$edge?.time), [50, 40], "newest first, by the edge's time");
+    assert.deepEqual(page.comments[0].$edge?.data, { pinned: true });
+    assert.deepEqual(page.comments[1].$edge?.data, { pinned: false }, "every edge here carries data");
+  });
+
+  it("reports an edge that carries no data as null, not as absent", async () => {
+    const c = new LocalCluster();
+    c.directory.applyLock(LOCK);
+    c.spreadCatalog();
+    await c.publish();
+    const db = c.client();
+    const alice = await db.create(User.otype, { name: "a" }, { vshard: "40" });
+    const issue = await db.create(Issue.otype, { title: "i", status: "open" }, { vshard: "5" });
+    const bare = await db.create(Comment.otype, { body: "b", authorId: alice }, { with: issue });
+    await db.assocAdd(issueComments.atype, issue, bare, 7);
+
+    const [page] = await Issue.gen(issue).related("comments", issueComments).run(db);
+    assert.equal(page.comments[0].$edge?.time, 7);
+    assert.equal(page.comments[0].$edge?.data, null);
+  });
+
+  it("has no edge on a root or on a field hop, because none reached them", async () => {
+    const { db, issue } = await seeded();
+    const [page] = await Issue.gen(issue)
+      .related("comments", issueComments, (q) => q.related("author", commentAuthor).limit(1))
+      .run(db);
+    assert.equal(page.$edge, undefined);
+    assert.equal(page.comments[0].author?.$edge, undefined);
+  });
+
+  it("refuses a field name a result would shadow", () => {
+    for (const field of ["$edge", "$version", "id"]) {
+      assert.throws(
+        () => planCatalog({ a: { objects: { "a.x": { fields: { [field]: "string" } } } } }),
+        /reserved name/,
+        `${field} should be refused`,
+      );
+    }
+  });
+});
+
+describe("paging a related list", () => {
+  async function seeded() {
+    const c = new LocalCluster();
+    c.directory.applyLock(LOCK);
+    c.spreadCatalog();
+    await c.publish();
+    const db = c.client();
+    const alice = await db.create(User.otype, { name: "alice" }, { vshard: "40" });
+    const issue = await db.create(Issue.otype, { title: "i", status: "open" }, { vshard: "5" });
+    for (let i = 1; i <= 5; i++) {
+      const id = await db.create(Comment.otype, { body: `c${i}`, authorId: alice }, { with: issue });
+      await db.assocAdd(issueComments.atype, issue, id, i * 10);
+    }
+    return { db, issue };
+  }
+
+  it("says whether the list goes on, and hands back a cursor to continue from", async () => {
+    const { db, issue } = await seeded();
+    const [first] = await Issue.gen(issue).relatedPage("comments", issueComments, (q) => q.limit(2)).run(db);
+    assert.deepEqual(first.comments.items.map((c) => c.body), ["c5", "c4"]);
+    assert.equal(first.comments.more, true);
+    assert.ok(first.comments.cursor);
+  });
+
+  it("reads the whole list by following its cursors, with nothing lost or repeated", async () => {
+    const { db, issue } = await seeded();
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    for (let round = 0; round < 10; round++) {
+      const q = Issue.gen(issue).relatedPage("comments", issueComments, (sub) => {
+        const limited = sub.limit(2);
+        return cursor === null ? limited : limited.after(cursor);
+      });
+      const [page] = await q.run(db);
+      seen.push(...page.comments.items.map((c) => c.body));
+      if (!page.comments.more || page.comments.cursor === null) break;
+      cursor = page.comments.cursor;
+    }
+    assert.deepEqual(seen, ["c5", "c4", "c3", "c2", "c1"]);
+  });
+
+  it("reports no more once the list is exhausted", async () => {
+    const { db, issue } = await seeded();
+    const [page] = await Issue.gen(issue).relatedPage("comments", issueComments, (q) => q.limit(50)).run(db);
+    assert.equal(page.comments.items.length, 5);
+    assert.equal(page.comments.more, false);
+  });
+
+  it("versions its cursors, so one encoded under another comparator is refused", () => {
+    const cursor = encodeCursor(50, "12345");
+    assert.deepEqual(decodeCursor(cursor), { time: 50, id2: "12345" });
+    assert.throws(() => decodeCursor("v0:50:12345"), /cursor version v0/);
   });
 });

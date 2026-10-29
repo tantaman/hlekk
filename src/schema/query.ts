@@ -27,8 +27,39 @@ interface Node {
   source: Source;
   where?: Pred;
   limit?: number;
-  children: { alias: string; single: boolean; node: Node }[];
+  after?: { time: number; id2: Id };
+  children: Child[];
   counts: { alias: string; atype: number }[];
+}
+
+interface Child {
+  alias: string;
+  /** To-one: the result holds the object, not a list of one. */
+  single: boolean;
+  /** Paged: the result holds the items plus a cursor to continue from. */
+  paged: boolean;
+  node: Node;
+}
+
+/** A page of a related list: the rows, and what it takes to read the next ones. */
+export interface Page<T> {
+  items: T[];
+  /** Pass to `after` to continue. Null when there is nothing to continue from. */
+  cursor: string | null;
+  /** Whether the list goes on past these rows. */
+  more: boolean;
+}
+
+/** Edges are ordered by (time, id2); id2 is the tie-break, so a cursor is exact. The version prefix
+ *  is here because the comparator can change and an old cursor must not be read under a new one. */
+export const CURSOR_VERSION = "v1";
+
+export const encodeCursor = (time: number, id2: Id): string => `${CURSOR_VERSION}:${time}:${id2}`;
+
+export function decodeCursor(cursor: string): { time: number; id2: Id } {
+  const [version, time, id2] = cursor.split(":");
+  if (version !== CURSOR_VERSION) throw new TypeError(`cursor version ${version}, expected ${CURSOR_VERSION}`);
+  return { time: Number(time), id2 };
 }
 
 const clone = (n: Node): Node => ({ ...n, children: [...n.children], counts: [...n.counts] });
@@ -84,7 +115,30 @@ export class Query<F extends FieldMap, Shape> {
     const child = build ? build(start) : (start as unknown as Query<TargetOf<R>, CS>);
     const single = isFieldRel(rel) || rel.unique === true;
     const node = clone(this.node);
-    node.children.push({ alias, single, node: child.node });
+    node.children.push({ alias, single, paged: false, node: child.node });
+    return new Query(node, this.#roots);
+  }
+
+  /** Follows a relation and returns a page: the rows, a cursor to continue from, and whether the list
+   *  goes on. Every `related` carries a limit, so a list is always a page; this is how the caller
+   *  reads the rest of one. */
+  relatedPage<A extends string, R extends Relation<F, FieldMap>, CS = RowOf<TargetOf<R>>>(
+    alias: A,
+    rel: R,
+    build?: (q: Query<TargetOf<R>, RowOf<TargetOf<R>>>) => Query<TargetOf<R>, CS>,
+  ): Query<F, Shape & { [K in A]: Page<CS> }> {
+    const start = new Query<TargetOf<R>, RowOf<TargetOf<R>>>(leaf(rel));
+    const child = build ? build(start) : (start as unknown as Query<TargetOf<R>, CS>);
+    const node = clone(this.node);
+    node.children.push({ alias, single: false, paged: true, node: child.node });
+    return new Query(node, this.#roots);
+  }
+
+  /** Resumes a related list after a cursor. */
+  after(cursor: string): Query<F, Shape> {
+    const { time, id2 } = decodeCursor(cursor);
+    const node = clone(this.node);
+    node.after = { time, id2 };
     return new Query(node, this.#roots);
   }
 
@@ -124,7 +178,7 @@ export class Query<F extends FieldMap, Shape> {
     const frames: Plan["frames"] = [];
     const emit = (n: Node): number => {
       const index = frames.length;
-      frames.push({ source: n.source, limit: n.limit, children: [], counts: n.counts });
+      frames.push({ source: n.source, limit: n.limit, after: n.after, children: [], counts: n.counts });
       // Children are emitted after this frame is reserved, so a cycle in the builder is impossible
       // and indices are stable.
       const children = n.children.map((c) => ({ alias: c.alias, frame: emit(c.node) }));
@@ -140,8 +194,8 @@ export class Query<F extends FieldMap, Shape> {
   async run(db: Runner, opts?: RunOptions): Promise<Shape[]> {
     if (this.#roots.length === 0) throw new Error("a query needs a root: start it from Type.gen(id)");
     const { plan, root } = this.compile();
-    const rows = await db.query(plan, this.#roots, opts);
-    return rows.map((r) => reshape(r, root)) as Shape[];
+    const answer = await db.answer(plan, [...this.#roots], opts);
+    return answer.rows.map((r) => reshape(r, root, answer.graph)) as Shape[];
   }
 
   /** The ids this query starts from. */
@@ -154,9 +208,15 @@ export interface RunOptions {
   driver?: "async" | "rounds";
 }
 
-/** What a query needs from a database. The client satisfies it. */
+/** What a query needs from a database: the answer, and the graph it was read from. The graph is where
+ *  a cursor comes from, since only it knows whether an edge list was exhausted. */
 export interface Runner {
-  query(plan: Plan, rootIds: Id[], opts?: RunOptions): Promise<Json[]>;
+  answer(plan: Plan, rootIds: Id[], opts?: RunOptions): Promise<{ rows: Json[]; graph: ListSource }>;
+}
+
+/** The part of the gathered graph a cursor needs. */
+export interface ListSource {
+  lists: ReadonlyMap<string, { rows: { time: number; id2: Id }[]; complete: boolean }>;
 }
 
 function resolve(pred: Pred, emit: (n: Node) => number): Cond {
@@ -167,17 +227,46 @@ function resolve(pred: Pred, emit: (n: Node) => number): Cond {
   return pred;
 }
 
-/** Turns a to-one relation's one-element list into the object itself, which is what the caller asked
- *  for by declaring the edge unique. Operators always yield lists, so this is the last step. */
-function reshape(row: Json, node: Node): Json {
+/** The last step: a to-one relation becomes the object itself, and a paged one becomes its items plus
+ *  a cursor. Operators always yield lists, so both shapes are made here. */
+function reshape(row: Json, node: Node, graph: ListSource): Json {
   if (row === null || typeof row !== "object" || Array.isArray(row)) return row;
   const out: Record<string, Json> = { ...(row as Record<string, Json>) };
   for (const c of node.children) {
     const got = out[c.alias];
-    const list = Array.isArray(got) ? got.map((r) => reshape(r, c.node)) : [];
-    out[c.alias] = c.single ? (list.length > 0 ? list[0] : null) : list;
+    const list = Array.isArray(got) ? got.map((r) => reshape(r, c.node, graph)) : [];
+    if (c.single) {
+      out[c.alias] = list.length > 0 ? list[0] : null;
+      continue;
+    }
+    if (!c.paged) {
+      out[c.alias] = list;
+      continue;
+    }
+    out[c.alias] = { items: list, ...edgeOf(out.id as Id, c.node, list, graph) } as unknown as Json;
   }
   return out;
+}
+
+/** A page's cursor and whether the list goes on. Only the graph knows: the rows handed back are the
+ *  ones that passed a filter and fit a limit, which says nothing about what is left. */
+function edgeOf(
+  parent: Id,
+  node: Node,
+  items: Json[],
+  graph: ListSource,
+): { cursor: string | null; more: boolean } {
+  const last = items[items.length - 1];
+  const edge = last && typeof last === "object" && !Array.isArray(last) ? last.$edge : undefined;
+  const cursor =
+    edge && typeof edge === "object" && !Array.isArray(edge) && typeof edge.time === "number"
+      ? encodeCursor(edge.time, (last as Record<string, Json>).id as Id)
+      : null;
+  if (node.source.kind !== "edge") return { cursor, more: false };
+  const list = graph.lists.get(`${parent}:${node.source.atype}`);
+  // More when the list held rows beyond the ones returned, or was never read to its end.
+  const more = list === undefined ? false : items.length < list.rows.length || !list.complete;
+  return { cursor, more };
 }
 
 /** Starts a query from ids the caller already holds. Every query starts from an object and follows
