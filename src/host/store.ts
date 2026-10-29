@@ -30,29 +30,63 @@ interface AssocRow {
   data: string | null;
 }
 
+/** The epoch the caller routed with, per vshard. A host serves a vshard only at the epoch the caller
+ *  expected, so a stale route reads UNKNOWN and the caller re-resolves rather than reading data that
+ *  has since moved. */
+export type Routed = ReadonlyMap<bigint, number>;
+
+export type State = "owned" | "fenced" | "moved";
+
+/** Why a host would not serve a vshard. It knows it no longer owns the vshard, but not who does: its
+ *  vshards row carries no target, so the caller re-reads the directory, which is authoritative. */
+export interface Refusal {
+  vshard: string;
+  state: State | "absent";
+  epoch: number;
+}
+
 export class SqlStore implements Store {
   readonly sql: Sql;
-  #owned: Set<bigint> | null = null;
+  readonly routed: Routed | null;
+  /** Vshards the caller routed to that this host no longer serves at that epoch. */
+  readonly refused = new Map<string, Refusal>();
+  #served: Map<bigint, { state: State; epoch: number }> | null = null;
   readonly #objects = new Map<Id, Obj | null>();
   readonly #lists: EdgeSegment[] = [];
   readonly #counts = new Map<string, number>();
 
-  constructor(sql: Sql) {
+  constructor(sql: Sql, routed: Routed | null = null) {
     this.sql = sql;
+    this.routed = routed;
   }
 
-  /** Which vshards this host owns right now. Read once: a store serves one batch, which is one
-   *  snapshot, so ownership cannot change underneath it. */
-  owned(): Set<bigint> {
-    if (!this.#owned) {
-      const rows = this.sql.all<{ vshard: number }>("SELECT vshard FROM vshards WHERE state = 'owned'");
-      this.#owned = new Set(rows.map((r) => BigInt(r.vshard)));
+  /** Which vshards this host holds, and in what state. Read once: a store serves one batch, which is
+   *  one snapshot, so ownership cannot change underneath it. */
+  #rows(): Map<bigint, { state: State; epoch: number }> {
+    if (!this.#served) {
+      const rows = this.sql.all<{ vshard: number; state: State; epoch: number }>(
+        "SELECT vshard, state, epoch FROM vshards",
+      );
+      this.#served = new Map(rows.map((r) => [BigInt(r.vshard), { state: r.state, epoch: r.epoch }]));
     }
-    return this.#owned;
+    return this.#served;
   }
 
+  /** A read is served while this host still holds the vshard, fenced included: a move stops writes for
+   *  the length of the copy, not reads. A retired vshard, or one at another epoch than the caller
+   *  routed with, is refused so the caller re-resolves. */
   owns(id: Id): boolean {
-    return this.owned().has(vshardOf(id));
+    const vshard = vshardOf(id);
+    const row = this.#rows().get(vshard);
+    const refuse = (state: State | "absent", epoch: number) => {
+      this.refused.set(vshard.toString(), { vshard: vshard.toString(), state, epoch });
+      return false;
+    };
+    if (!row) return this.routed?.has(vshard) ? refuse("absent", -1) : false;
+    if (row.state === "moved") return refuse(row.state, row.epoch);
+    const expected = this.routed?.get(vshard);
+    if (expected !== undefined && expected !== row.epoch) return refuse(row.state, row.epoch);
+    return true;
   }
 
   object(id: Id): Promise<Maybe<Obj | null>> {

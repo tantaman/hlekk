@@ -163,6 +163,7 @@ Every entry is named `<domain>.<name>`, and its domain owns it. People edit one 
 - **Edges are their own entries.** `marketplace.listing_buyer`, from `marketplace.listing` to `core.user`, lives in `schema/marketplace.json` and changes nothing in `core.user`'s entry.
 - **An edge with `field` is a field relationship.** It follows an ID in the source object's payload. Nothing is stored, so it has no atype.
 - **The lock is the canonical form.** Planning a change writes `schema/catalog.lock.json`: every entry, its integer, and the version. Every database applies the same lock, so integers match across development, staging and production.
+- **The lock carries a sum** over its canonical form, so two teams who plan on separate branches conflict in git rather than merging to one version that allocated integers twice. Apply would catch it, but only after review.
 
 ### Projections
 
@@ -906,7 +907,8 @@ CREATE INDEX obj_issue_status
 - [ ] The affinity key a root object hashes into the active set, and what to use when a request has none.
 - [ ] Chunk span for KV shard-map snapshots.
 - [ ] Colocation group limit, and what `with` does when the parent's vshard is full: error or spill.
-- [ ] Deletes: the default onDelete when an edge type declares none, and whether edges to missing objects are dropped at read time.
+- [x] Deletes: an edge type that declares no onDelete detaches, dropping its own edges and leaving the targets alone, since cascading by default would let another team's edge delete your objects. Edges to missing objects are dropped at read time, which is also what covers the window before a cross-vshard inverse is withdrawn, and the hole the ent section names where an edge type has no inverse. A maintained count still counts them, so a count can exceed what a read of the same list yields.
+- [ ] Whether a cascade that crosses a vshard should travel as an outbox op, as built, or wait for cross-vshard transactions.
 - [ ] Heuristic for choosing coordinator placement per query, and whether the choice is exposed to the caller or decided for it.
 - [ ] Whether a query returns the normalized `QueryResult` or an already-nested shape, and whether both are offered.
 - [ ] Read-after-write guarantees to promise for cross-host inverse edges.

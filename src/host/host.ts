@@ -4,6 +4,7 @@
 // any outbox row go together or not at all. A caller routes with an epoch; the host compares it with
 // its own vshards row and refuses the write if it no longer owns that vshard, having written nothing.
 
+import { Catalog } from "../catalog/catalog.ts";
 import { hostExec } from "../query/driver.ts";
 import type { HostReply } from "../query/driver.ts";
 import type { Fields, Id, Miss, Plan } from "../query/types.ts";
@@ -11,16 +12,9 @@ import { MAX_SEQ, makeId, toKey, vshardOf } from "./ids.ts";
 import { MAX_PAYLOAD, migrate } from "./schema.ts";
 import type { Sql } from "./sql.ts";
 import { SqlStore } from "./store.ts";
+import type { Refusal, Routed, State } from "./store.ts";
 
-export type State = "owned" | "fenced" | "moved";
-
-/** Why a write was refused. The host knows it no longer owns the vshard, but not who does: its
- *  vshards row carries no target, so the caller re-reads the directory. */
-export interface Refusal {
-  vshard: string;
-  state: State | "absent";
-  epoch: number;
-}
+export type { Refusal, Routed, State } from "./store.ts";
 
 export class NotOwned extends Error {
   readonly refusal: Refusal;
@@ -31,59 +25,79 @@ export class NotOwned extends Error {
   }
 }
 
-export type Reply<T> = { ok: true; value: T } | { ok: false; moved: Refusal };
+/** An edge type whose onDelete is restrict, holding a delete back. */
+export class Restricted extends Error {
+  readonly id: Id;
+  readonly edge: string;
+  constructor(id: Id, edge: string) {
+    super(`${id} still has ${edge} edges, whose onDelete is restrict`);
+    this.name = "Restricted";
+    this.id = id;
+    this.edge = edge;
+  }
+}
+
+export type Reply<T> =
+  | { ok: true; value: T }
+  | { ok: false; refused: Refusal }
+  | { ok: false; restricted: { id: Id; edge: string } };
 
 /** The epoch the caller routed with. Every host request carries one. */
-export interface Routed {
+export interface RoutedAt {
   epoch: number;
 }
 
-export interface CreateOp extends Routed {
+export interface CreateOp extends RoutedAt {
   otype: number;
   data: Fields;
   /** Hard colocation: the new object takes this object's vshard, so the two can transact. */
   with?: Id;
-  /** Explicit placement, for a root. The allocator chooses this once it exists (build plan step 5). */
+  /** Explicit placement, for a root. The allocator chooses this. */
   vshard?: string;
 }
 
-export interface UpdateOp extends Routed {
+export interface UpdateOp extends RoutedAt {
   id: Id;
   data: Fields;
 }
 
-export interface DeleteOp extends Routed {
+export interface DeleteOp extends RoutedAt {
   id: Id;
 }
 
-export interface AssocAddOp extends Routed {
+export interface AssocAddOp extends RoutedAt {
   atype: number;
   id1: Id;
   id2: Id;
   time?: number;
   data?: Fields | null;
-  /** The paired inverse edge type, when this one has an inverse. The catalog supplies it from step 2;
-   *  until then the caller does. */
-  inverse?: number;
 }
 
-export interface AssocRemoveOp extends Routed {
+export interface AssocRemoveOp extends RoutedAt {
   atype: number;
   id1: Id;
   id2: Id;
-  inverse?: number;
 }
 
-/** An inverse edge waiting for its target's host. */
-export type InverseOp =
+/** Work bound for another vshard: an inverse edge, or a cascade that left this one. */
+export type OutboxOp =
   | { kind: "add"; atype: number; id1: Id; id2: Id; time: number; data: Fields | null }
-  | { kind: "remove"; atype: number; id1: Id; id2: Id };
+  | { kind: "remove"; atype: number; id1: Id; id2: Id }
+  | { kind: "delete"; id: Id };
+
+/** The vshard an op is bound for. */
+export const opTarget = (op: OutboxOp): bigint => vshardOf(op.kind === "delete" ? op.id : op.id1);
 
 export interface OutboxRow {
   vshard: number;
   seq: number;
   target_vshard: number;
-  op: InverseOp;
+  op: OutboxOp;
+}
+
+export interface ExecReply extends HostReply {
+  /** Vshards the caller routed to that this host no longer serves at that epoch. */
+  refusals: Refusal[];
 }
 
 interface VshardRow {
@@ -95,18 +109,29 @@ interface VshardRow {
 
 export class Host {
   readonly sql: Sql;
+  #catalog: Catalog;
 
-  private constructor(sql: Sql) {
+  private constructor(sql: Sql, catalog: Catalog) {
     this.sql = sql;
+    this.#catalog = catalog;
   }
 
-  static open(sql: Sql): Host {
+  static open(sql: Sql, catalog: Catalog = Catalog.empty()): Host {
     migrate(sql);
-    return new Host(sql);
+    return new Host(sql, catalog);
   }
 
-  /** Installs a vshard as owned. The directory drives this during a move (build plan step 3); for now
-   *  a test or the local harness calls it directly. */
+  catalog(): Catalog {
+    return this.#catalog;
+  }
+
+  /** A host behind the newest catalog fetches it from the directory before serving. A host ahead of a
+   *  request's version still serves, since nothing is hidden while a projection includes it. */
+  setCatalog(catalog: Catalog): void {
+    this.#catalog = catalog;
+  }
+
+  /** Installs a vshard as owned. The directory drives this during a move. */
   adopt(vshard: string, epoch = 0, nextSeq = 0): void {
     this.sql.run(
       "INSERT INTO vshards (vshard, epoch, state, next_seq) VALUES (?, ?, 'owned', ?)" +
@@ -118,7 +143,7 @@ export class Host {
   }
 
   /** Fences a vshard, or retires it once a move has flipped the route. A fenced vshard refuses writes
-   *  and still serves reads; a moved one answers moved. */
+   *  and still serves reads; a retired one is refused outright. */
   setState(vshard: string, state: State, epoch?: number): void {
     this.sql.run(
       "UPDATE vshards SET state = ?, epoch = COALESCE(?, epoch) WHERE vshard = ?",
@@ -132,21 +157,31 @@ export class Host {
     return this.sql.all<VshardRow>("SELECT vshard, epoch, state, next_seq FROM vshards ORDER BY vshard");
   }
 
-  /** A fresh store, which serves one batch and records what it read. */
-  store(): SqlStore {
-    return new SqlStore(this.sql);
+  holds(vshard: bigint): boolean {
+    return this.#state(vshard) === "owned";
   }
 
-  /** Runs each task over local data, prefetching below every row it is asked for. */
-  exec(plan: Plan, tasks: Miss[]): Promise<HostReply> {
-    return hostExec(this.store(), plan, tasks);
+  /** A fresh store, which serves one batch and records what it read. */
+  store(routed: Routed | null = null): SqlStore {
+    return new SqlStore(this.sql, routed);
+  }
+
+  /** Runs each task over local data, prefetching below every row it is asked for. A vshard the caller
+   *  routed to that this host no longer serves comes back as a refusal, never as an empty answer. */
+  async exec(plan: Plan, tasks: Miss[], routed: Routed | null = null): Promise<ExecReply> {
+    const store = this.store(routed);
+    const reply = await hostExec(store, plan, tasks);
+    return { ...reply, refusals: [...store.refused.values()] };
   }
 
   // ---- writes
 
   create(op: CreateOp): Reply<Id> {
     return this.#write(() => {
-      const vshard = op.with !== undefined ? vshardOf(op.with) : BigInt(this.#required(op.vshard, "vshard or with"));
+      if ((op.with === undefined) === (op.vshard === undefined)) {
+        throw new TypeError("create takes exactly one of with and vshard");
+      }
+      const vshard = op.with !== undefined ? vshardOf(op.with) : BigInt(op.vshard!);
       const row = this.#claim(vshard, op.epoch);
       const seq = BigInt(row.next_seq);
       if (seq > MAX_SEQ) throw new Error(`vshard ${vshard} has no sequence left`);
@@ -168,15 +203,13 @@ export class Host {
     });
   }
 
-  /** Deletes the object and the edges it owns. Cascading to other types, and withdrawing inverses held
-   *  on other vshards, needs each edge type's onDelete from the catalog (build plan steps 2 and 4). */
+  /** Applies every edge type's onDelete, from the whole catalog and not just the caller's projection.
+   *  A cascade follows colocated targets in this transaction and leaves the vshard through the outbox
+   *  otherwise, since a transaction cannot span vshards. */
   delete(op: DeleteOp): Reply<void> {
     return this.#write(() => {
       this.#claim(vshardOf(op.id), op.epoch);
-      const key = toKey(op.id);
-      this.sql.run("DELETE FROM objects WHERE id = ?", key);
-      this.sql.run("DELETE FROM assocs WHERE id1 = ?", key);
-      this.sql.run("DELETE FROM assoc_counts WHERE id1 = ?", key);
+      this.#erase(op.id, new Set());
     });
   }
 
@@ -186,9 +219,10 @@ export class Host {
     return this.#write(() => {
       this.#claim(vshardOf(op.id1), op.epoch);
       this.#putEdge(op.atype, op.id1, op.id2, time, data);
-      if (op.inverse !== undefined) {
-        // The inverse lives on id2's vshard.
-        this.#inverse(vshardOf(op.id2), { kind: "add", atype: op.inverse, id1: op.id2, id2: op.id1, time, data });
+      const inverse = this.#catalog.inverseOf(op.atype);
+      // The inverse runs the other way, so it lives on id2's vshard.
+      if (inverse !== undefined) {
+        this.#dispatch(vshardOf(op.id1), { kind: "add", atype: inverse, id1: op.id2, id2: op.id1, time, data });
       }
     });
   }
@@ -197,19 +231,22 @@ export class Host {
     return this.#write(() => {
       this.#claim(vshardOf(op.id1), op.epoch);
       this.#dropEdge(op.atype, op.id1, op.id2);
-      if (op.inverse !== undefined) {
-        this.#inverse(vshardOf(op.id2), { kind: "remove", atype: op.inverse, id1: op.id2, id2: op.id1 });
+      const inverse = this.#catalog.inverseOf(op.atype);
+      if (inverse !== undefined) {
+        this.#dispatch(vshardOf(op.id1), { kind: "remove", atype: inverse, id1: op.id2, id2: op.id1 });
       }
     });
   }
 
-  /** Applies an inverse delivered from another host. Add is an upsert and remove is delete-if-present,
-   *  so redelivering after a lost ack is a no-op. */
-  applyInverse(op: InverseOp): Reply<void> {
+  /** Applies an op delivered from another host. Add is an upsert, remove is delete-if-present and so is
+   *  delete, so redelivering after a lost ack is a no-op and a cascade cycle terminates. */
+  apply(op: OutboxOp): Reply<void> {
     return this.#write(() => {
-      this.#claimOwned(vshardOf(op.id1));
+      const vshard = opTarget(op);
+      this.#row(vshard); // must still be ours, at whatever epoch
       if (op.kind === "add") this.#putEdge(op.atype, op.id1, op.id2, op.time, op.data);
-      else this.#dropEdge(op.atype, op.id1, op.id2);
+      else if (op.kind === "remove") this.#dropEdge(op.atype, op.id1, op.id2);
+      else this.#erase(op.id, new Set());
     });
   }
 
@@ -221,7 +258,7 @@ export class Host {
       "SELECT vshard, seq, target_vshard, op FROM outbox ORDER BY vshard, seq LIMIT ?",
       limit,
     );
-    return rows.map((r) => ({ ...r, op: JSON.parse(r.op) as InverseOp }));
+    return rows.map((r) => ({ ...r, op: JSON.parse(r.op) as OutboxOp }));
   }
 
   /** Drops a row once the target has acknowledged it. A crash before this redelivers, which is why
@@ -236,14 +273,10 @@ export class Host {
     try {
       return { ok: true, value: this.sql.txn(f) };
     } catch (e) {
-      if (e instanceof NotOwned) return { ok: false, moved: e.refusal };
+      if (e instanceof NotOwned) return { ok: false, refused: e.refusal };
+      if (e instanceof Restricted) return { ok: false, restricted: { id: e.id, edge: e.edge } };
       throw e;
     }
-  }
-
-  #required<T>(v: T | undefined, what: string): T {
-    if (v === undefined) throw new TypeError(`create needs ${what}`);
-    return v;
   }
 
   /** State must be owned and the routed epoch must match. Checked before anything is written. */
@@ -251,12 +284,6 @@ export class Host {
     const row = this.#row(vshard);
     if (row.epoch !== epoch) throw new NotOwned({ vshard: vshard.toString(), state: row.state, epoch: row.epoch });
     return row;
-  }
-
-  /** The same check without an epoch, for a vshard the caller did not route to: the inverse side of a
-   *  colocated edge pair, and a delivered inverse, which the directory routed by vshard alone. */
-  #claimOwned(vshard: bigint): VshardRow {
-    return this.#row(vshard);
   }
 
   #row(vshard: bigint): VshardRow {
@@ -269,17 +296,62 @@ export class Host {
     return row;
   }
 
-  /** Writes the inverse inline when its vshard is on this host, so a colocated pair is atomic for
-   *  free, and otherwise queues it. */
-  #inverse(target: bigint, op: InverseOp): void {
-    const here = this.sql.all<{ state: State }>("SELECT state FROM vshards WHERE vshard = ?", Number(target))[0];
-    if (here?.state === "owned") {
+  #state(vshard: bigint): State | "absent" {
+    return this.sql.all<{ state: State }>("SELECT state FROM vshards WHERE vshard = ?", Number(vshard))[0]?.state ?? "absent";
+  }
+
+  /** Deletes an object, applying each of its edge types' onDelete. `seen` stops a cascade cycle inside
+   *  this vshard; across vshards, delete-if-present does. */
+  #erase(id: Id, seen: Set<Id>): void {
+    if (seen.has(id)) return;
+    seen.add(id);
+    const key = toKey(id);
+    const row = this.sql.all<{ otype: number }>("SELECT otype FROM objects WHERE id = ?", key)[0];
+    if (!row) return; // already gone
+    const source = vshardOf(id);
+    const types = this.#catalog.edgesFrom(row.otype);
+
+    // Every restrict is checked before anything is written, so a held-back delete leaves no trace.
+    const lists = types.map((e) => ({
+      edge: e,
+      targets: this.sql
+        .all<{ id2: Uint8Array }>("SELECT id2 FROM assocs WHERE id1 = ? AND atype = ?", key, e.atype!)
+        .map((r) => fromKeyOf(r.id2)),
+    }));
+    for (const { edge, targets } of lists) {
+      if (edge.onDelete === "restrict" && targets.length > 0) throw new Restricted(id, edge.name);
+    }
+
+    for (const { edge, targets } of lists) {
+      const inverse = this.#catalog.inverseOf(edge.atype!);
+      for (const t of targets) {
+        // Withdraw the inverse this object's edge put on the other side.
+        if (inverse !== undefined) this.#dispatch(source, { kind: "remove", atype: inverse, id1: t, id2: id });
+        if (edge.onDelete !== "cascade") continue;
+        if (vshardOf(t) === source) this.#erase(t, seen);
+        else this.#dispatch(source, { kind: "delete", id: t });
+      }
+    }
+
+    this.sql.run("DELETE FROM objects WHERE id = ?", key);
+    this.sql.run("DELETE FROM assocs WHERE id1 = ?", key);
+    this.sql.run("DELETE FROM assoc_counts WHERE id1 = ?", key);
+  }
+
+  /** Applies an op inline when its vshard is on this host, so a colocated pair is atomic for free, and
+   *  queues it otherwise. Outbox rows belong to the source vshard and move with it. */
+  #dispatch(source: bigint, op: OutboxOp): void {
+    const target = opTarget(op);
+    if (this.#state(target) === "owned") {
       if (op.kind === "add") this.#putEdge(op.atype, op.id1, op.id2, op.time, op.data);
-      else this.#dropEdge(op.atype, op.id1, op.id2);
+      else if (op.kind === "remove") this.#dropEdge(op.atype, op.id1, op.id2);
+      else this.#erase(op.id, new Set());
       return;
     }
-    const source = vshardOf(op.id2); // the forward edge's vshard, which these rows move with
-    const next = this.sql.all<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM outbox WHERE vshard = ?", Number(source))[0];
+    const next = this.sql.all<{ seq: number }>(
+      "SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM outbox WHERE vshard = ?",
+      Number(source),
+    )[0];
     this.sql.run(
       "INSERT INTO outbox (vshard, seq, target_vshard, op) VALUES (?, ?, ?, ?)",
       Number(source),
@@ -292,12 +364,7 @@ export class Host {
   #putEdge(atype: number, id1: Id, id2: Id, time: number, data: Fields | null): void {
     const k1 = toKey(id1);
     const k2 = toKey(id2);
-    const existed = this.sql.all<{ one: number }>(
-      "SELECT 1 AS one FROM assocs WHERE id1 = ? AND atype = ? AND id2 = ?",
-      k1,
-      atype,
-      k2,
-    ).length > 0;
+    const existed = this.#hasEdge(k1, atype, k2);
     this.sql.run(
       "INSERT INTO assocs (id1, atype, id2, time, data) VALUES (?, ?, ?, ?, ?)" +
         " ON CONFLICT (id1, atype, id2) DO UPDATE SET time = excluded.time, data = excluded.data",
@@ -313,15 +380,13 @@ export class Host {
   #dropEdge(atype: number, id1: Id, id2: Id): void {
     const k1 = toKey(id1);
     const k2 = toKey(id2);
-    const existed = this.sql.all<{ one: number }>(
-      "SELECT 1 AS one FROM assocs WHERE id1 = ? AND atype = ? AND id2 = ?",
-      k1,
-      atype,
-      k2,
-    ).length > 0;
-    if (!existed) return;
+    if (!this.#hasEdge(k1, atype, k2)) return;
     this.sql.run("DELETE FROM assocs WHERE id1 = ? AND atype = ? AND id2 = ?", k1, atype, k2);
     this.#bump(k1, atype, -1);
+  }
+
+  #hasEdge(k1: Uint8Array, atype: number, k2: Uint8Array): boolean {
+    return this.sql.all("SELECT 1 AS one FROM assocs WHERE id1 = ? AND atype = ? AND id2 = ?", k1, atype, k2).length > 0;
   }
 
   /** Counts are maintained in the same transaction as the edge write. An add may need the row created;
@@ -329,8 +394,7 @@ export class Host {
   #bump(id1: Uint8Array, atype: number, by: 1 | -1): void {
     if (by === 1) {
       this.sql.run(
-        "INSERT INTO assoc_counts (id1, atype, n) VALUES (?, ?, 1)" +
-          " ON CONFLICT (id1, atype) DO UPDATE SET n = n + 1",
+        "INSERT INTO assoc_counts (id1, atype, n) VALUES (?, ?, 1) ON CONFLICT (id1, atype) DO UPDATE SET n = n + 1",
         id1,
         atype,
       );
@@ -348,4 +412,8 @@ function payload(data: Fields): string {
     if (bytes > MAX_PAYLOAD) throw new RangeError(`payload is ${bytes} bytes, over the ${MAX_PAYLOAD} cap`);
   }
   return json;
+}
+
+function fromKeyOf(b: Uint8Array): Id {
+  return new DataView(b.buffer, b.byteOffset, b.byteLength).getBigUint64(0).toString();
 }

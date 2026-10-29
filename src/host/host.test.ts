@@ -5,26 +5,66 @@ import { runAsync, runRounds } from "../query/driver.ts";
 import type { HostClient, Stats } from "../query/driver.ts";
 import { UNKNOWN, cmpId } from "../query/types.ts";
 import type { Id, Json, Maybe, Plan } from "../query/types.ts";
+import { Catalog, plan } from "../catalog/catalog.ts";
 import { Host } from "./host.ts";
+import type { Reply } from "./host.ts";
 import { MAX_SEQ, fromKey, makeId, parseId, toKey, vshardOf, vshardRange } from "./ids.ts";
 import { nodeSql } from "./sql.node.ts";
 
-const ISSUE = 1;
-const COMMENT = 2;
-const USER = 3;
-const ISSUE_COMMENT = 1;
-const COMMENT_ISSUE = 2; // its inverse
-const ISSUE_OWNER = 3;
-const USER_OWNED = 4; // its inverse
+// The issue tracker from the design, planned the way a real one would be: domain files with no
+// integers, a lock that assigns them, and a catalog compiled from the lock.
+const LOCK = plan({
+  core: { objects: { "core.user": { fields: { name: "string" } } } },
+  issues: {
+    objects: {
+      "issues.issue": { fields: { title: "string" } },
+      "issues.comment": { fields: { body: "string", authorId: { id: "core.user" } } },
+    },
+    edges: {
+      // Comments are the issue's to keep: deleting the issue deletes them.
+      "issues.issue_comment": {
+        from: "issues.issue",
+        to: "issues.comment",
+        inverse: "issues.comment_issue",
+        onDelete: "cascade",
+      },
+      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment" },
+      // The owner is a person, who outlives the issue.
+      "issues.issue_owner": { from: "issues.issue", to: "core.user", inverse: "issues.user_owned", unique: true },
+      "issues.user_owned": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner" },
+      "issues.comment_author": { from: "issues.comment", to: "core.user", field: "authorId" },
+      // An issue that blocks another cannot be deleted out from under it.
+      "issues.issue_blocks": { from: "issues.issue", to: "issues.issue", onDelete: "restrict" },
+    },
+  },
+});
+const CATALOG = Catalog.compile(LOCK);
+
+const otype = (name: string) => CATALOG.objectNamed(name)!.otype;
+const atype = (name: string) => CATALOG.edgeNamed(name)!.atype!;
+const ISSUE = otype("issues.issue");
+const COMMENT = otype("issues.comment");
+const USER = otype("core.user");
+const ISSUE_COMMENT = atype("issues.issue_comment");
+const COMMENT_ISSUE = atype("issues.comment_issue");
+const ISSUE_OWNER = atype("issues.issue_owner");
+const USER_OWNED = atype("issues.user_owned");
+const ISSUE_BLOCKS = atype("issues.issue_blocks");
 
 const open = (...vshards: string[]) => {
-  const h = Host.open(nodeSql());
+  const h = Host.open(nodeSql(), CATALOG);
   for (const v of vshards) h.adopt(v);
   return h;
 };
-const ok = <T>(r: { ok: true; value: T } | { ok: false; moved: unknown }): T => {
+const ok = <T>(r: Reply<T>): T => {
   assert.equal(r.ok, true, `refused: ${JSON.stringify(r)}`);
   return (r as { ok: true; value: T }).value;
+};
+/** Asserts a write was refused because the host does not own the vshard, and returns why. */
+const refused = <T>(r: Reply<T>) => {
+  assert.equal(r.ok, false);
+  assert.ok(!r.ok && "refused" in r, `expected a refusal, got ${JSON.stringify(r)}`);
+  return (r as { ok: false; refused: { vshard: string; state: string; epoch: number } }).refused;
 };
 /** Asserts a read settled, so the test reads an answer and not "not known here". */
 const known = <T>(v: Maybe<T>): T => {
@@ -105,15 +145,19 @@ describe("objects", () => {
 
   it("refuses a write to a vshard it does not own, and writes nothing", async () => {
     const h = open("1");
-    const absent = h.create({ otype: ISSUE, data: {}, vshard: "9", epoch: 0 });
-    assert.equal(absent.ok, false);
-    assert.deepEqual(absent.ok === false && absent.moved, { vshard: "9", state: "absent", epoch: -1 });
+    assert.deepEqual(refused(h.create({ otype: ISSUE, data: {}, vshard: "9", epoch: 0 })), {
+      vshard: "9",
+      state: "absent",
+      epoch: -1,
+    });
 
     const id = ok(h.create({ otype: ISSUE, data: { v: 1 }, vshard: "1", epoch: 0 }));
     h.setState("1", "fenced");
-    const fenced = h.update({ id, data: { v: 2 }, epoch: 0 });
-    assert.equal(fenced.ok, false);
-    assert.deepEqual(fenced.ok === false && fenced.moved, { vshard: "1", state: "fenced", epoch: 0 });
+    assert.deepEqual(refused(h.update({ id, data: { v: 2 }, epoch: 0 })), {
+      vshard: "1",
+      state: "fenced",
+      epoch: 0,
+    });
 
     h.setState("1", "owned");
     assert.deepEqual(known(await h.store().object(id))?.data, { v: 1 }); // the refused write left no trace
@@ -122,9 +166,11 @@ describe("objects", () => {
   it("refuses a write routed at a stale epoch", () => {
     const h = open("1");
     h.adopt("1", 4); // as if a move had landed it here at epoch 4
-    const stale = h.create({ otype: ISSUE, data: {}, vshard: "1", epoch: 3 });
-    assert.equal(stale.ok, false);
-    assert.deepEqual(stale.ok === false && stale.moved, { vshard: "1", state: "owned", epoch: 4 });
+    assert.deepEqual(refused(h.create({ otype: ISSUE, data: {}, vshard: "1", epoch: 3 })), {
+      vshard: "1",
+      state: "owned",
+      epoch: 4,
+    });
     ok(h.create({ otype: ISSUE, data: {}, vshard: "1", epoch: 4 }));
   });
 });
@@ -180,7 +226,7 @@ describe("inverse edges", () => {
     const h = open("1");
     const issue = ok(h.create({ otype: ISSUE, data: {}, vshard: "1", epoch: 0 }));
     const user = ok(h.create({ otype: USER, data: {}, vshard: "1", epoch: 0 }));
-    ok(h.assocAdd({ atype: ISSUE_OWNER, id1: issue, id2: user, time: 1, inverse: USER_OWNED, epoch: 0 }));
+    ok(h.assocAdd({ atype: ISSUE_OWNER, id1: issue, id2: user, time: 1, epoch: 0 }));
 
     assert.equal(await h.store().count(user, USER_OWNED), 1);
     assert.equal(h.pending().length, 0); // nothing queued: it went in with the forward edge
@@ -192,14 +238,14 @@ describe("inverse edges", () => {
     const issue = ok(a.create({ otype: ISSUE, data: {}, vshard: "1", epoch: 0 }));
     const user = ok(b.create({ otype: USER, data: {}, vshard: "2", epoch: 0 }));
 
-    ok(a.assocAdd({ atype: ISSUE_OWNER, id1: issue, id2: user, time: 1, inverse: USER_OWNED, epoch: 0 }));
+    ok(a.assocAdd({ atype: ISSUE_OWNER, id1: issue, id2: user, time: 1, epoch: 0 }));
     const rows = a.pending();
     assert.equal(rows.length, 1);
     assert.equal(rows[0].target_vshard, 2);
     assert.equal(rows[0].op.kind, "add");
 
-    ok(b.applyInverse(rows[0].op));
-    ok(b.applyInverse(rows[0].op)); // a redelivery after a lost ack is a no-op
+    ok(b.apply(rows[0].op));
+    ok(b.apply(rows[0].op)); // a redelivery after a lost ack is a no-op
     assert.equal(await b.store().count(user, USER_OWNED), 1);
 
     a.ack(rows[0].vshard, rows[0].seq);
@@ -210,8 +256,8 @@ describe("inverse edges", () => {
     const a = open("1");
     const issue = ok(a.create({ otype: ISSUE, data: {}, vshard: "1", epoch: 0 }));
     const far = makeId(2n, 0n);
-    ok(a.assocAdd({ atype: ISSUE_OWNER, id1: issue, id2: far, time: 1, inverse: USER_OWNED, epoch: 0 }));
-    ok(a.assocRemove({ atype: ISSUE_OWNER, id1: issue, id2: far, inverse: USER_OWNED, epoch: 0 }));
+    ok(a.assocAdd({ atype: ISSUE_OWNER, id1: issue, id2: far, time: 1, epoch: 0 }));
+    ok(a.assocRemove({ atype: ISSUE_OWNER, id1: issue, id2: far, epoch: 0 }));
     assert.deepEqual(a.pending().map((r) => [r.seq, r.op.kind]), [[1, "add"], [2, "remove"]]);
   });
 });
@@ -246,7 +292,7 @@ describe("the same query over one host and two", () => {
     const authors = [alice, bob, bob, alice, bob];
     authors.forEach((a, i) => {
       const c = ok(issues.create({ otype: COMMENT, data: { body: `c${i + 1}`, authorId: a }, with: issue, epoch: 0 }));
-      ok(issues.assocAdd({ atype: ISSUE_COMMENT, id1: issue, id2: c, time: i + 1, inverse: COMMENT_ISSUE, epoch: 0 }));
+      ok(issues.assocAdd({ atype: ISSUE_COMMENT, id1: issue, id2: c, time: i + 1, epoch: 0 }));
     });
     return issue;
   };
@@ -305,5 +351,70 @@ describe("the same query over one host and two", () => {
       root.comments.map((c) => [c.body, c.author[0].name]),
       [["c5", "bob"], ["c4", "alice"], ["c3", "bob"], ["c2", "bob"], ["c1", "alice"]],
     );
+  });
+});
+
+describe("onDelete", () => {
+  it("cascades to colocated children in the same transaction", async () => {
+    const h = open("1");
+    const issue = ok(h.create({ otype: ISSUE, data: { title: "i" }, vshard: "1", epoch: 0 }));
+    const comments = [1, 2].map((t) => {
+      const c = ok(h.create({ otype: COMMENT, data: { body: `c${t}` }, with: issue, epoch: 0 }));
+      ok(h.assocAdd({ atype: ISSUE_COMMENT, id1: issue, id2: c, time: t, epoch: 0 }));
+      return c;
+    });
+
+    ok(h.delete({ id: issue, epoch: 0 }));
+    assert.equal(await h.store().object(issue), null);
+    for (const c of comments) assert.equal(await h.store().object(c), null, "its comments went with it");
+    assert.equal(await h.store().count(issue, ISSUE_COMMENT), 0);
+  });
+
+  it("detaches rather than cascading when the edge declares nothing, and withdraws the inverse", async () => {
+    const h = open("1");
+    const issue = ok(h.create({ otype: ISSUE, data: {}, vshard: "1", epoch: 0 }));
+    const user = ok(h.create({ otype: USER, data: { name: "alice" }, vshard: "1", epoch: 0 }));
+    ok(h.assocAdd({ atype: ISSUE_OWNER, id1: issue, id2: user, time: 1, epoch: 0 }));
+    assert.equal(await h.store().count(user, USER_OWNED), 1);
+
+    ok(h.delete({ id: issue, epoch: 0 }));
+    assert.notEqual(await h.store().object(user), null, "the owner outlives the issue");
+    assert.equal(await h.store().count(user, USER_OWNED), 0, "and no longer claims to own it");
+  });
+
+  it("holds a delete back on restrict, writing nothing", async () => {
+    const h = open("1");
+    const issue = ok(h.create({ otype: ISSUE, data: {}, vshard: "1", epoch: 0 }));
+    const blocked = ok(h.create({ otype: ISSUE, data: {}, vshard: "1", epoch: 0 }));
+    ok(h.assocAdd({ atype: ISSUE_BLOCKS, id1: issue, id2: blocked, time: 1, epoch: 0 }));
+
+    const r = h.delete({ id: issue, epoch: 0 });
+    assert.ok(!r.ok && "restricted" in r, `expected a restriction, got ${JSON.stringify(r)}`);
+    assert.notEqual(await h.store().object(issue), null, "the delete left no trace");
+    assert.equal(await h.store().count(issue, ISSUE_BLOCKS), 1);
+
+    ok(h.assocRemove({ atype: ISSUE_BLOCKS, id1: issue, id2: blocked, epoch: 0 }));
+    ok(h.delete({ id: issue, epoch: 0 })); // now it goes
+  });
+
+  it("leaves the vshard through the outbox when a cascade crosses one", () => {
+    const a = open("1");
+    const issue = ok(a.create({ otype: ISSUE, data: {}, vshard: "1", epoch: 0 }));
+    const far = makeId(2n, 7n); // a comment on another vshard
+    ok(a.assocAdd({ atype: ISSUE_COMMENT, id1: issue, id2: far, time: 1, epoch: 0 }));
+
+    ok(a.delete({ id: issue, epoch: 0 }));
+    const kinds = a.pending().map((r) => r.op.kind);
+    assert.ok(kinds.includes("delete"), `expected a queued delete, got ${kinds.join(", ")}`);
+    assert.ok(kinds.includes("remove"), "and the inverse withdrawn");
+  });
+
+  it("a delivered cascade is delete-if-present, so a cycle terminates", () => {
+    const a = open("1");
+    const b = open("2");
+    const far = ok(b.create({ otype: COMMENT, data: {}, vshard: "2", epoch: 0 }));
+    ok(b.delete({ id: far, epoch: 0 }));
+    ok(b.apply({ kind: "delete", id: far })); // already gone: a no-op, not an error
+    assert.equal(a.pending().length, 0);
   });
 });
