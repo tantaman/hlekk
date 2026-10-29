@@ -45,6 +45,19 @@ export const DDL: readonly string[] = [
      PRIMARY KEY (id1, atype)
    ) WITHOUT ROWID`,
 
+  // Global index entries. A local index cannot answer "user by email": the coordinator does not know
+  // which host to ask. Entries live in index vshards keyed by hash(value), so every entry for one
+  // value has one home and uniqueness is enforced there, on one host, in one transaction.
+  `CREATE TABLE IF NOT EXISTS index_entries (
+     vshard INTEGER NOT NULL,      -- the index vshard this entry lives in
+     idx    INTEGER NOT NULL,      -- which index
+     key    TEXT    NOT NULL,      -- the normalized value
+     id     BLOB,                  -- the object it points at; null while only reserved
+     state  TEXT    NOT NULL,      -- 'reserved' | 'confirmed'
+     at     INTEGER NOT NULL,      -- when it was reserved, for reclaiming it
+     PRIMARY KEY (vshard, idx, key)
+   ) WITHOUT ROWID`,
+
   // Inverse edges bound for other vshards, delivered by alarm.
   `CREATE TABLE IF NOT EXISTS outbox (
      vshard        INTEGER NOT NULL, -- source vshard; rows move with it

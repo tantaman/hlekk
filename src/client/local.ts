@@ -205,6 +205,23 @@ export class LocalCluster {
     return delivered;
   }
 
+  /** Opens index vshards and installs them, which a database does the first time an index exists. */
+  openIndexVshards(n = 4): bigint[] {
+    const opened = this.allocator.grow().slice(0, n);
+    this.directory.setIndexVshards([...this.directory.indexVshards(), ...opened]);
+    return opened;
+  }
+
+  /** Reclaims expired reservations on every index vshard, as an alarm would. */
+  sweepIndexes(now = Date.now(), ttlMs = 30_000): number {
+    let n = 0;
+    for (const v of this.directory.indexVshards()) {
+      const route = this.directory.resolve(v);
+      if (route) n += this.host(route.host).indexSweep(v.toString(), now, ttlMs);
+    }
+    return n;
+  }
+
   /** Rows still waiting across every host. */
   queued(): number {
     return [...this.hosts.values()].reduce((n, h) => n + h.pending().length, 0);
@@ -233,6 +250,12 @@ export class LocalCluster {
             return h.assocRemove({ atype: m.atype, id1: m.id1, id2: m.id2, epoch });
           case "apply":
             return h.apply(m.op);
+          case "indexReserve":
+            return h.indexReserve({ vshard: m.vshard, idx: m.idx, key: m.key, now: m.now, ttlMs: m.ttlMs, epoch });
+          case "indexConfirm":
+            return h.indexConfirm({ vshard: m.vshard, idx: m.idx, key: m.key, id: m.id, epoch });
+          case "indexRelease":
+            return h.indexRelease({ vshard: m.vshard, idx: m.idx, key: m.key, epoch });
         }
       },
       chunk(index: number): Promise<Uint8Array | null> {
@@ -252,6 +275,14 @@ export class LocalCluster {
       },
       async place(affinity?: string): Promise<string> {
         return cluster.allocator.place(affinity).toString();
+      },
+      async indexVshardFor(key: string): Promise<string> {
+        return cluster.directory.indexVshardFor(key).toString();
+      },
+      async indexLookup(host: number, vshard: string, idx: number, key: string): Promise<string | null> {
+        const h = cluster.host(host);
+        if (!h.holds(BigInt(vshard))) throw new Error(`host ${host} does not hold index vshard ${vshard}`);
+        return h.indexLookup(vshard, idx, key);
       },
     };
   }

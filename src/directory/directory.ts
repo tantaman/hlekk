@@ -158,6 +158,27 @@ export class Directory {
     return out;
   }
 
+  // ---- global index vshards
+
+  /** Vshards dedicated to global index entries. Their own, so a hot index does not drag a data vshard
+   *  around with it, and either can move without the other. */
+  indexVshards(): bigint[] {
+    const raw = this.#meta("indexVshards");
+    return raw ? (JSON.parse(raw) as string[]).map(BigInt) : [];
+  }
+
+  setIndexVshards(vshards: readonly bigint[]): void {
+    this.setMeta("indexVshards", JSON.stringify(vshards.map(String)));
+  }
+
+  /** Where a value's entry lives. Every entry for one value has one home, which is what lets
+   *  uniqueness be checked on a single host in a single transaction. */
+  indexVshardFor(key: string): bigint {
+    const set = this.indexVshards();
+    if (set.length === 0) throw new Error("no index vshards have been opened for this database");
+    return set[indexHash(key) % set.length];
+  }
+
   // ---- the catalog
 
   /** Compare-and-sets the catalog from version N to N + 1, re-checking what it can. */
@@ -230,4 +251,11 @@ export class Directory {
   static get maxVshards(): bigint {
     return 1n << VSHARD_BITS;
   }
+}
+
+/** FNV-1a over the normalized value. It only has to spread evenly across the index vshards. */
+export function indexHash(key: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < key.length; i++) h = Math.imul(h ^ key.charCodeAt(i), 0x01000193) >>> 0;
+  return h >>> 0;
 }

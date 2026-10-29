@@ -13,7 +13,10 @@ export type Mutation =
   | { kind: "delete"; id: Id }
   | { kind: "assocAdd"; atype: number; id1: Id; id2: Id; time?: number; data?: Fields | null }
   | { kind: "assocRemove"; atype: number; id1: Id; id2: Id }
-  | { kind: "apply"; op: OutboxOp };
+  | { kind: "apply"; op: OutboxOp }
+  | { kind: "indexReserve"; vshard: string; idx: number; key: string; now: number; ttlMs: number }
+  | { kind: "indexConfirm"; vshard: string; idx: number; key: string; id: Id }
+  | { kind: "indexRelease"; vshard: string; idx: number; key: string };
 
 /** Which vshard a mutation is routed by: the one whose host must own it to accept the write. */
 export function anchorOf(m: Mutation): { kind: "vshard"; vshard: string } | { kind: "id"; id: Id } {
@@ -28,6 +31,10 @@ export function anchorOf(m: Mutation): { kind: "vshard"; vshard: string } | { ki
       return { kind: "id", id: m.id1 };
     case "apply":
       return { kind: "id", id: m.op.kind === "delete" ? m.op.id : m.op.id1 };
+    case "indexReserve":
+    case "indexConfirm":
+    case "indexRelease":
+      return { kind: "vshard", vshard: m.vshard };
   }
 }
 
@@ -44,4 +51,8 @@ export interface Transport {
   catalog(): Promise<Catalog>;
   /** Where a new root should go. The allocator decides; the caller never sizes or picks a vshard. */
   place(affinity?: string): Promise<string>;
+  /** Which index vshard holds a value's entry. */
+  indexVshardFor(key: string): Promise<string>;
+  /** Reads a global index entry from the host that holds it. */
+  indexLookup(host: number, vshard: string, idx: number, key: string): Promise<Id | null>;
 }
