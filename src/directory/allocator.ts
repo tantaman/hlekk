@@ -90,19 +90,20 @@ export class Allocator {
     const highest = this.directory.sql.all<{ hi: number | null }>("SELECT MAX(vshard) AS hi FROM assignments")[0]?.hi;
     const from = highest === null || highest === undefined ? 0n : BigInt(highest) + 1n;
     const batch = BigInt(this.directory.batch);
+    // Hosts in load order, read once. The vshards this opens are empty, so adding them cannot change
+    // that order, and recomputing it per vshard made opening a batch quadratic.
+    const hosts = this.directory.hostsByLoad();
     const opened: { vshard: bigint; host: number }[] = [];
-    this.directory.sql.txn(() => {
-      for (let i = 0n; i < batch; i++) {
-        const v = from + i;
-        if (v > MAX_VSHARD) break;
-        if (this.directory.resolve(v)) continue;
-        // A new vshard goes to the host with the least on it. Hosts receive vshards; they never mint
-        // them, so this opens no host of its own.
-        const host = this.#emptiest();
-        this.directory.assign(v, host, 0);
-        opened.push({ vshard: v, host });
-      }
-    });
+    for (let i = 0n; i < batch; i++) {
+      const v = from + i;
+      if (v > MAX_VSHARD) break;
+      if (this.directory.resolve(v)) continue;
+      // Spread the batch across hosts, lightest first. Putting a whole batch on the emptiest host
+      // would send every new root to one host, which is the mistake opening one vshard would have
+      // made. Hosts receive vshards; they never mint them, so this opens no host of its own.
+      opened.push({ vshard: v, host: hosts[opened.length % Math.max(1, hosts.length)] ?? 0 });
+    }
+    this.directory.assignMany(opened.map((o) => ({ ...o, epoch: 0 })));
     for (const o of opened) this.#open(o.vshard, o.host, 0);
     return opened.map((o) => o.vshard);
   }
@@ -138,14 +139,6 @@ export class Allocator {
     this.directory.sql.run("UPDATE usage SET requests = 0");
   }
 
-  #emptiest(): number {
-    const rows = this.directory.sql.all<{ host: number; bytes: number }>(
-      "SELECT h.host AS host, COALESCE(SUM(u.bytes), 0) AS bytes FROM hosts h" +
-        " LEFT JOIN assignments a ON a.host = h.host LEFT JOIN usage u ON u.vshard = a.vshard" +
-        " GROUP BY h.host ORDER BY bytes ASC, h.host ASC LIMIT 1",
-    );
-    return rows[0]?.host ?? 0;
-  }
 }
 
 /** FNV-1a. An affinity key only has to spread evenly; nothing here depends on it being unguessable. */
