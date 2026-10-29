@@ -1,0 +1,425 @@
+<title>Hlekk on Durable Objects</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  /* Layout: a single column of flat, lightly-bordered panels, light-first with a
+     dark counterpart. Orange is reserved for one meaning only, in every figure and
+     every table: the part this proposal would add. Everything else is grey. */
+  :root {
+    color-scheme: light;
+    --bg: #ffffff;
+    --panel: #f7f7f7;
+    --panel-2: #efefef;
+    --line: #e3e3e3;
+    --line-2: #b9b9b9;
+    --fg: #1d1f20;
+    --fg-2: #55595c;
+    --fg-3: #85898c;
+    --accent: #f6821f;
+    --accent-ink: #a8550b;
+    --accent-soft: #fef1e4;
+    --f-s: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    --f-m: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #141516; --panel: #1e2021; --panel-2: #26292a;
+      --line: #2e3133; --line-2: #4a4f52;
+      --fg: #f1f2f2; --fg-2: #b2b7ba; --fg-3: #868c90;
+      --accent: #f6821f; --accent-ink: #fbad41; --accent-soft: #2d1f12;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #141516; --panel: #1e2021; --panel-2: #26292a;
+    --line: #2e3133; --line-2: #4a4f52;
+    --fg: #f1f2f2; --fg-2: #b2b7ba; --fg-3: #868c90;
+    --accent: #f6821f; --accent-ink: #fbad41; --accent-soft: #2d1f12;
+  }
+
+  body {
+    background: var(--bg); color: var(--fg); font-family: var(--f-s);
+    font-size: 16px; line-height: 1.6; -webkit-font-smoothing: antialiased;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 56px 80px;
+  }
+  .wrap { max-width: 1120px; margin-inline: auto; }
+  .prose { max-width: 68ch; }
+  p { margin: 0 0 1em; color: var(--fg-2); }
+  strong { color: var(--fg); font-weight: 600; }
+  code { font-family: var(--f-m); font-size: .86em; color: var(--fg); background: var(--panel); padding: 1px 5px; border-radius: 3px; }
+
+  .eyebrow { font-family: var(--f-m); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--fg-3); margin: 0 0 20px; }
+  h1 { font-size: clamp(32px, 5.4vw, 50px); font-weight: 700; letter-spacing: -.022em; line-height: 1.08; margin: 0 0 20px; color: var(--fg); text-wrap: balance; }
+  .deck { font-size: clamp(17px, 2.1vw, 20px); line-height: 1.5; color: var(--fg-2); max-width: 62ch; margin: 0 0 14px; }
+  .deck em { color: var(--fg); font-style: normal; font-weight: 600; }
+  h2 { font-size: clamp(22px, 3vw, 28px); font-weight: 600; letter-spacing: -.016em; margin: 0 0 10px; color: var(--fg); text-wrap: balance; }
+  h3 { font-size: 15px; font-weight: 600; margin: 0 0 6px; color: var(--fg); }
+  .sect { margin-top: 68px; }
+  .sect > .prose { margin-bottom: 30px; }
+  .kicker { font-family: var(--f-m); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--accent-ink); margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+  .kicker::before { content: ""; width: 10px; height: 10px; background: var(--accent); flex: none; }
+
+  figure { margin: 0; }
+  .scroll { overflow-x: auto; overscroll-behavior-x: contain; }
+  .scroll svg { display: block; width: 100%; height: auto; min-width: var(--mw, 900px); }
+  figcaption { margin-top: 16px; max-width: 80ch; font-size: 14.5px; line-height: 1.6; color: var(--fg-2); }
+  .pan { display: none; font-family: var(--f-m); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--fg-3); margin: 0 0 8px; }
+  @media (max-width: 1120px) { .pan { display: block; } }
+
+  /* svg paint */
+  .bx  { fill: var(--bg);       stroke: var(--line-2); stroke-width: 1.2; }
+  .bxp { fill: var(--panel);    stroke: var(--line-2); stroke-width: 1.2; }
+  .bxd { fill: var(--panel-2);  stroke: var(--line-2); stroke-width: 1.2; stroke-dasharray: 5 4; }
+  .bxs { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.4; }
+  .bxa { fill: var(--accent); stroke: none; }
+  .t   { fill: var(--fg);   font-family: var(--f-s); }
+  .t2  { fill: var(--fg-2); font-family: var(--f-s); }
+  .t3  { fill: var(--fg-3); font-family: var(--f-s); }
+  .to  { fill: var(--accent-ink); font-family: var(--f-s); }
+  .m   { font-family: var(--f-m); fill: var(--fg-2); }
+  .m3  { font-family: var(--f-m); fill: var(--fg-3); }
+  .mo  { font-family: var(--f-m); fill: var(--accent-ink); }
+  .cap { font-family: var(--f-m); fill: var(--fg-3); letter-spacing: .13em; }
+  .capo{ font-family: var(--f-m); fill: var(--accent-ink); letter-spacing: .13em; }
+  .sq  { fill: var(--line-2); }
+  .sqo { fill: var(--accent); }
+  .ln  { fill: none; stroke: var(--line-2); stroke-width: 1.4; }
+  .lnd { fill: none; stroke: var(--line-2); stroke-width: 1.2; stroke-dasharray: 5 4; }
+  .lno { fill: none; stroke: var(--accent); stroke-width: 1.8; }
+  .hair{ fill: none; stroke: var(--line); stroke-width: 1; }
+  .ah  { fill: var(--line-2); }
+  .aho { fill: var(--accent); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+  th { text-align: left; font-family: var(--f-m); font-weight: 400; font-size: 10.5px; letter-spacing: .13em; text-transform: uppercase; color: var(--fg-3); padding: 0 18px 10px 0; border-bottom: 1px solid var(--line-2); }
+  td { padding: 14px 18px 14px 0; border-bottom: 1px solid var(--line); color: var(--fg-2); vertical-align: top; }
+  td:first-child { color: var(--fg); font-weight: 500; }
+  td.mono { font-family: var(--f-m); font-size: 12.5px; font-weight: 400; color: var(--fg-2); }
+  th:last-child, td:last-child { padding-right: 0; }
+  .chip { display: inline-block; font-family: var(--f-m); font-size: 10.5px; letter-spacing: .06em; padding: 3px 9px; border-radius: 3px; white-space: nowrap; background: var(--panel); border: 1px solid var(--line-2); color: var(--fg-2); }
+  .chip.new { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); font-weight: 500; }
+  .tscroll { overflow-x: auto; }
+  .tscroll table { min-width: 620px; }
+
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line-2); border: 1px solid var(--line-2); border-radius: 6px; overflow: hidden; }
+  .steps > div { background: var(--bg); padding: 20px 18px 22px; min-width: 0; }
+  .steps .n { font-family: var(--f-m); font-size: 11px; color: var(--accent-ink); margin: 0 0 10px; }
+  .steps p { margin: 0; font-size: 13.5px; line-height: 1.5; }
+  @media (max-width: 860px) { .steps { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 460px) { .steps { grid-template-columns: 1fr; } }
+
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; }
+  .two ul { margin: 0; padding-left: 18px; color: var(--fg-2); font-size: 14.5px; line-height: 1.6; }
+  .two li { margin-bottom: 8px; }
+  .two li::marker { color: var(--accent); }
+  @media (max-width: 760px) { .two { grid-template-columns: 1fr; gap: 28px; } }
+
+  footer { margin-top: 76px; padding-top: 22px; border-top: 1px solid var(--line-2); font-family: var(--f-m); font-size: 11px; letter-spacing: .08em; color: var(--fg-3); }
+  footer p { margin: 0; color: var(--fg-3); }
+</style>
+
+<svg aria-hidden="true" focusable="false" width="0" height="0" style="position:absolute;width:0;height:0;overflow:hidden">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L10,5 L0,9.5 Z" class="ah"/></marker>
+    <marker id="aro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0.5 L10,5 L0,9.5 Z" class="aho"/></marker>
+  </defs>
+</svg>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">A proposal for the Durable Objects platform team &middot; from the Hlekk design</p>
+    <h1>The layer every customer rebuilds</h1>
+    <p class="deck">Durable Objects give an application a transactional, 10&nbsp;GB SQLite database that can be placed anywhere. What they do not give it is a <em>second</em> one. The moment a customer's data outgrows one object, they write the sharding layer themselves &mdash; ID allocation, routing, rebalancing, cross-object consistency &mdash; and every one of them writes it differently.</p>
+    <p class="deck">This is a proposal to ship that layer: a TAO-style object-and-edge database in which the platform, not the application, owns partitioning, placement and capacity. It is built almost entirely out of primitives Durable Objects already have.</p>
+  </header>
+
+  <section class="sect">
+    <p class="kicker">Figure 1 &middot; the problem</p>
+    <h2>Where the boundary sits today</h2>
+    <div class="prose">
+      <p>The three columns run the same application over the same storage. The only thing that moves is the boundary between what the platform operates and what the customer has to build and operate themselves.</p>
+    </div>
+    <figure>
+      <p class="pan">Pan the figure sideways &rarr;</p>
+      <div class="scroll" style="--mw:960px">
+        <svg viewBox="0 0 1200 440" role="img" aria-label="Three stacks compared. With D1, the platform owns everything below the SQL API but caps at 10 GB per database. With Durable Objects today, the customer writes a thick layer of ID allocation, routing, rebalancing, resharding and cross-object consistency between their application and the object. With Hlekk, that same layer is shipped by the platform, over the same Durable Objects.">
+          <g class="cap" font-size="9.5">
+            <text x="40" y="22">TODAY</text>
+            <text x="440" y="22">TODAY</text>
+          </g>
+          <text x="840" y="22" class="capo" font-size="9.5">PROPOSED</text>
+          <g class="t" font-size="19" font-weight="600">
+            <text x="40" y="52">D1</text>
+            <text x="440" y="52">Durable Objects</text>
+            <text x="840" y="52">Hlekk</text>
+          </g>
+
+          <rect class="bx"  x="40"  y="76"  width="320" height="46"  rx="6"/>
+          <rect class="bx"  x="440" y="76"  width="320" height="46"  rx="6"/>
+          <rect class="bx"  x="840" y="76"  width="320" height="46"  rx="6"/>
+          <g class="t" font-size="13.5" text-anchor="middle">
+            <text x="200" y="105">Your application</text>
+            <text x="600" y="105">Your application</text>
+            <text x="1000" y="105">Your application</text>
+          </g>
+
+          <rect class="bx"  x="40"  y="132" width="320" height="46"  rx="6"/>
+          <text x="200" y="161" class="t" font-size="13.5" text-anchor="middle">SQL: joins, scans, read replicas</text>
+          <rect class="bxp" x="40"  y="188" width="320" height="134" rx="6"/>
+          <text x="200" y="218" class="t" font-size="16" font-weight="600" text-anchor="middle">D1</text>
+          <g class="t2" font-size="12.5" text-anchor="middle">
+            <text x="200" y="244">the platform owns partitioning,</text>
+            <text x="200" y="262">placement and capacity</text>
+          </g>
+          <text x="200" y="294" class="m" font-size="12" text-anchor="middle">up to 10 GB per database</text>
+
+          <rect class="bxd" x="440" y="132" width="320" height="134" rx="6"/>
+          <text x="456" y="154" class="cap" font-size="9.5">YOUR CUSTOMER WRITES THIS</text>
+          <g class="sq">
+            <rect x="456" y="176" width="5" height="5"/><rect x="456" y="196" width="5" height="5"/>
+            <rect x="456" y="216" width="5" height="5"/><rect x="456" y="236" width="5" height="5"/>
+            <rect x="456" y="254" width="5" height="5"/>
+          </g>
+          <g class="t" font-size="12.5">
+            <text x="472" y="181">ID allocation that never collides</text>
+            <text x="472" y="201">routing, and invalidating stale routes</text>
+            <text x="472" y="221">rebalancing when one object gets hot</text>
+            <text x="472" y="241">resharding as the data grows</text>
+            <text x="472" y="259">consistency across objects</text>
+          </g>
+          <rect class="bxp" x="440" y="276" width="320" height="46" rx="6"/>
+          <text x="600" y="304" class="t" font-size="13.5" font-weight="600" text-anchor="middle">Durable Objects + SQLite</text>
+
+          <rect class="bxs" x="840" y="132" width="320" height="46" rx="6"/>
+          <text x="1000" y="161" class="to" font-size="13.5" text-anchor="middle">Objects and associations</text>
+          <rect class="bxs" x="840" y="188" width="320" height="78" rx="6"/>
+          <text x="856" y="216" class="to" font-size="16" font-weight="600">Hlekk</text>
+          <text x="856" y="240" class="to" font-size="12.5">owns partitioning, placement and capacity</text>
+          <text x="856" y="258" class="mo" font-size="11.5">moves whole shards between DOs</text>
+          <rect class="bxa" x="1098" y="196" width="46" height="18" rx="3"/>
+          <text x="1121" y="209" font-size="9.5" font-weight="600" font-family="var(--f-m)" fill="#1d1f20" text-anchor="middle">NEW</text>
+          <rect class="bxp" x="840" y="276" width="320" height="46" rx="6"/>
+          <text x="1000" y="304" class="t" font-size="13.5" font-weight="600" text-anchor="middle">Durable Objects + SQLite</text>
+
+          <g class="t2" font-size="12.5">
+            <text x="40" y="348">A customer who outgrows that</text>
+            <text x="40" y="366">has to leave for another database.</text>
+            <text x="440" y="348">No ceiling &mdash; but every customer</text>
+            <text x="440" y="366">builds this layer, differently.</text>
+            <text x="840" y="348">One object at 1 MB, many at 500 GB,</text>
+            <text x="840" y="366">with no application change.</text>
+          </g>
+
+          <rect class="bxp" x="40"  y="402" width="22" height="16" rx="3"/>
+          <rect class="bxd" x="200" y="402" width="22" height="16" rx="3"/>
+          <rect class="bxs" x="440" y="402" width="22" height="16" rx="3"/>
+          <g class="t2" font-size="12">
+            <text x="70"  y="415">ships today</text>
+            <text x="230" y="415">your customer writes it</text>
+            <text x="470" y="415">what this proposal adds</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption>The middle column is the one to look at. That slab is not optional &mdash; any customer past one object&rsquo;s worth of data has written some version of it &mdash; and it is the same slab in the right-hand column, with one difference: who operates it. The 10 GB per-database and 10 GB per-object figures are from the published limits cited in the design doc.</figcaption>
+    </figure>
+  </section>
+
+  <section class="sect">
+    <p class="kicker">Figure 2 &middot; the build</p>
+    <h2>One new component</h2>
+    <div class="prose">
+      <p>The shape is a Worker that coordinates, one control-plane object per database, and many objects that own shards. Reads and writes go from the Worker straight to the object that owns the data; the control plane is consulted only when a cached route misses.</p>
+    </div>
+    <figure>
+      <p class="pan">Pan the figure sideways &rarr;</p>
+      <div class="scroll" style="--mw:1000px">
+        <svg viewBox="0 0 1200 600" role="img" aria-label="A Workers isolate holds the Hlekk query coordinator and sends one batched fetch per Durable Object per tick. Each Durable Object holds the Hlekk host library over its own SQLite storage and checks a routing epoch on every request. Inverse edges travel between objects on alarms. A new control-plane Durable Object, one per database, holds the shard-to-object map, the allocator, the placement controller and the schema catalog, and drives shard moves. Workers KV holds a route snapshot for cold isolates.">
+          <rect class="bxp" x="40" y="96" width="300" height="134" rx="6"/>
+          <text x="56" y="124" class="t" font-size="16" font-weight="600">Workers</text>
+          <text x="324" y="120" class="cap" font-size="9.5" text-anchor="end">SHIPS TODAY</text>
+          <rect class="bxs" x="56" y="142" width="268" height="70" rx="4"/>
+          <text x="70" y="164" class="to" font-size="12.5" font-weight="600">Hlekk coordinator</text>
+          <text x="70" y="182" class="to" font-size="11">runs the query once; one batched</text>
+          <text x="70" y="198" class="to" font-size="11">fetch per DO, per tick</text>
+
+          <rect class="bxs" x="760" y="60" width="400" height="180" rx="6"/>
+          <rect class="bxa" x="1098" y="70" width="46" height="18" rx="3"/>
+          <text x="1121" y="83" font-size="9.5" font-weight="600" font-family="var(--f-m)" fill="#1d1f20" text-anchor="middle">NEW</text>
+          <text x="776" y="96" class="to" font-size="17" font-weight="600">Control plane</text>
+          <text x="776" y="116" class="mo" font-size="11.5">one Durable Object per database</text>
+          <g class="sqo">
+            <rect x="776" y="141" width="5" height="5"/><rect x="776" y="161" width="5" height="5"/>
+            <rect x="776" y="181" width="5" height="5"/><rect x="776" y="201" width="5" height="5"/>
+          </g>
+          <g class="to" font-size="12.5">
+            <text x="792" y="146">shard &rarr; DO, with an epoch</text>
+            <text x="792" y="166">allocator and placement controller</text>
+            <text x="792" y="186">drives every shard move</text>
+            <text x="792" y="206">the schema catalog</text>
+          </g>
+          <text x="776" y="228" class="to" font-size="11.5">the only new server-side component</text>
+
+          <rect class="bxp" x="760" y="268" width="300" height="68" rx="6"/>
+          <text x="776" y="296" class="t" font-size="14" font-weight="600">Workers KV</text>
+          <text x="1044" y="292" class="cap" font-size="9.5" text-anchor="end">SHIPS TODAY</text>
+          <text x="776" y="318" class="t2" font-size="11.5">a route snapshot, read by cold isolates</text>
+
+          <rect class="bxp" x="40"  y="400" width="320" height="140" rx="6"/>
+          <rect class="bxp" x="390" y="400" width="320" height="140" rx="6"/>
+          <rect class="bxp" x="740" y="400" width="320" height="140" rx="6"/>
+          <g class="t" font-size="14" font-weight="600">
+            <text x="56" y="428">Durable Object</text>
+            <text x="406" y="428">Durable Object</text>
+            <text x="756" y="428">Durable Object</text>
+          </g>
+          <g class="cap" font-size="9.5" text-anchor="end">
+            <text x="344" y="424">SHIPS TODAY</text>
+            <text x="694" y="424">SHIPS TODAY</text>
+            <text x="1044" y="424">SHIPS TODAY</text>
+          </g>
+          <g class="m3" font-size="10.5">
+            <text x="56" y="446">SQLite storage API &middot; alarms &middot; locationHint</text>
+            <text x="406" y="446">SQLite storage API &middot; alarms &middot; locationHint</text>
+            <text x="756" y="446">SQLite storage API &middot; alarms &middot; locationHint</text>
+          </g>
+          <rect class="bxs" x="56"  y="460" width="288" height="66" rx="4"/>
+          <rect class="bxs" x="406" y="460" width="288" height="66" rx="4"/>
+          <rect class="bxs" x="756" y="460" width="288" height="66" rx="4"/>
+          <g class="to" font-size="12" font-weight="600">
+            <text x="70" y="482">Hlekk host</text>
+            <text x="420" y="482">Hlekk host</text>
+            <text x="770" y="482">Hlekk host</text>
+          </g>
+          <g class="to" font-size="10.5">
+            <text x="70" y="500">objects, assocs, counts, outbox</text>
+            <text x="70" y="516">epoch check on every request</text>
+            <text x="420" y="502">the same library, other shards</text>
+            <text x="770" y="502">the same library, other shards</text>
+          </g>
+          <text x="1080" y="468" class="t3" font-size="12.5">many more</text>
+          <text x="1080" y="486" class="t3" font-size="12.5">per database</text>
+
+          <path class="ln" d="M340,140 L752,140" marker-end="url(#ar)"/>
+          <text x="546" y="132" class="t2" font-size="11" text-anchor="middle">route miss only &mdash; the map is cached in the isolate</text>
+
+          <path class="ln" d="M200,234 L200,396" marker-start="url(#ar)" marker-end="url(#ar)"/>
+          <path class="ln" d="M200,360 L900,360"/>
+          <path class="ln" d="M550,360 L550,396" marker-end="url(#ar)"/>
+          <path class="ln" d="M900,360 L900,396" marker-end="url(#ar)"/>
+          <text x="212" y="262" class="t2" font-size="11">one batched fetch per DO, per tick</text>
+          <text x="212" y="280" class="m3" font-size="10.5">the 1,000 req/s per-DO limit is the scarce resource</text>
+
+          <path class="lnd" d="M1120,244 L1120,382 L820,382 L820,396" marker-end="url(#ar)"/>
+          <text x="1110" y="368" class="m3" font-size="10.5" text-anchor="end">move a shard: fence, copy, install, flip &mdash; on alarms</text>
+
+          <path class="lno" d="M200,544 L200,566 L550,566 L550,542" marker-end="url(#aro)"/>
+          <text x="212" y="586" class="t2" font-size="11">inverse edges to another DO &mdash; appended to an outbox, delivered by alarms</text>
+          <text x="1060" y="586" class="t3" font-size="11" text-anchor="end">new DOs are created with locationHint or jurisdiction</text>
+        </svg>
+      </div>
+      <figcaption>Orange is what this proposal adds. Two of the three orange pieces are libraries that run inside primitives you already ship &mdash; one in the isolate, one in the object. The third is a genuinely new role: one control-plane object per database holding the shard map, the allocator and the catalog. Nothing in the design needs a feature that does not exist, and nothing on the read path needs global coordination: a shard&rsquo;s identity is carried in the top 24 bits of every 64-bit object ID, so a Worker routes with a shift and an object knows whether it owns an ID without asking anyone.</figcaption>
+    </figure>
+  </section>
+
+  <section class="sect">
+    <p class="kicker">Bill of materials</p>
+    <h2>Six of nine parts already ship</h2>
+    <div class="prose">
+      <p>Every piece of the system maps to a Durable Objects or Workers feature that exists today, except three: a control-plane object, a schema toolchain, and the query engine itself.</p>
+    </div>
+    <div class="tscroll">
+      <table>
+        <thead><tr><th>Part</th><th>Made of</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td>API and query coordination</td><td class="mono">Workers</td><td><span class="chip">ships today</span></td></tr>
+          <tr><td>Objects, edges, edge counts, outbox</td><td class="mono">DO SQLite storage API</td><td><span class="chip">ships today</span></td></tr>
+          <tr><td>One mutation, one transaction</td><td class="mono">transactionSync() in the DO</td><td><span class="chip">ships today</span></td></tr>
+          <tr><td>Inverse-edge delivery, move driver, backfills</td><td class="mono">DO alarms</td><td><span class="chip">ships today</span></td></tr>
+          <tr><td>Region and data residency</td><td class="mono">locationHint, jurisdiction</td><td><span class="chip">ships today</span></td></tr>
+          <tr><td>Route map for cold isolates</td><td class="mono">Workers KV</td><td><span class="chip">ships today</span></td></tr>
+          <tr><td>Shard map, epochs, allocation, placement, moves</td><td class="mono">a new DO role, one per database</td><td><span class="chip new">to build</span></td></tr>
+          <tr><td>Schema catalog, projections, code generation</td><td class="mono">a CLI over the same DO</td><td><span class="chip new">to build</span></td></tr>
+          <tr><td>Graph query planning and execution</td><td class="mono">a library, in the isolate and the DO</td><td><span class="chip new">to build</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="sect">
+    <p class="kicker">Fit</p>
+    <h2>Designed against your published limits</h2>
+    <div class="prose">
+      <p>Each of these numbers forced a decision rather than being worked around. They are the reason the design looks the way it does.</p>
+    </div>
+    <div class="tscroll">
+      <table>
+        <thead><tr><th>Limit</th><th>What the design does about it</th></tr></thead>
+        <tbody>
+          <tr><td>10 GB per SQLite-backed DO</td><td>Shards are capped near 1 GB, well under it, and one object holds many of them. The cap is set by how long a move takes, not by storage.</td></tr>
+          <tr><td>1,000 requests/sec per DO, soft</td><td>Request count is treated as the scarce resource: everything a query can read without waiting is sent as one batched fetch per object, per tick.</td></tr>
+          <tr><td>2 MB row size</td><td>The object payload cap, surfaced to the developer as such.</td></tr>
+          <tr><td>Location fixed at creation</td><td>Changing region is a shard move to a new object created with a <code>locationHint</code> or <code>jurisdiction</code> &mdash; the shard is the unit of residency.</td></tr>
+          <tr><td>Integers imprecise above 2<sup>53</sup> in JS</td><td>IDs cross the wire as strings and are stored as 8-byte big-endian BLOBs, which also sort in unsigned numeric order, so one shard is one contiguous key range.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="sect">
+    <p class="kicker">Build order</p>
+    <h2>Riskiest parts first</h2>
+    <div class="steps">
+      <div>
+        <p class="n">01</p>
+        <h3>One object</h3>
+        <p>Schema, ID helpers, the write transaction, local execution. Measure per-object throughput first &mdash; it sets shard density, and therefore cost.</p>
+      </div>
+      <div>
+        <p class="n">02</p>
+        <h3>Control plane</h3>
+        <p>Epoch checks and <code>moved</code> replies, the catalog, route caching in the isolate, and the coordinator end to end over many objects.</p>
+      </div>
+      <div>
+        <p class="n">03</p>
+        <h3>Shard moves</h3>
+        <p>Stop-the-world moves under write load, with a harness that kills objects mid-move. The part most likely to be subtly wrong.</p>
+      </div>
+      <div>
+        <p class="n">04</p>
+        <h3>Automatic placement</h3>
+        <p>Inverse edges through the outbox, then the allocator and the placement controller moving shards on storage and request pressure.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="sect">
+    <h2>What this is not, and what would help</h2>
+    <div class="two">
+      <div>
+        <p class="kicker">Out of scope, deliberately</p>
+        <ul>
+          <li>Arbitrary SQL, ad-hoc joins and scans. The API is objects, edges, edge counts and ordered edge ranges, so every operation is cheap to route and cheap to cache.</li>
+          <li>Transactions across colocation groups. A transaction is anchored to one shard; everything it touches has to live there.</li>
+          <li>Incremental view maintenance and change subscriptions. Parked, with room left for them.</li>
+          <li>This does not replace D1. It is for the customers who outgrow it and who read graph-shaped data.</li>
+        </ul>
+      </div>
+      <div>
+        <p class="kicker">What the platform could add</p>
+        <ul>
+          <li>A per-shard change feed. With an ordered log of mutations, a move copies a snapshot while writes continue and catches up on the tail, so the write pause shrinks from the whole copy to a few entries. Regional read followers would tail the same log.</li>
+          <li>A bulk key-range copy between objects, so a move is not a row-by-row read and insert.</li>
+          <li>A higher per-object request ceiling. It converts directly into shard density, which is cost per customer.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Hlekk &middot; full design in docs/design.md &middot; an external proposal, not a Cloudflare document</p>
+  </footer>
+</div>
