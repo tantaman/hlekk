@@ -817,7 +817,13 @@ An edge list lives on id1's host, while its targets may live anywhere. Indexed `
 
 ### Global lookups and uniqueness
 
-A local index can't answer "user by email": the coordinator doesn't know which host to ask. Global indexes live in their own vshards, keyed by `hash(value)`, and are updated through the outbox like inverse edges. Uniqueness uses reserve → create → confirm, and unconfirmed reservations are cleaned up after a timeout.
+A local index can't answer "user by email": the coordinator doesn't know which host to ask. Global indexes live in their own vshards, keyed by `hash(value)`, so every entry for one value has one home and uniqueness is checked there, on one host, in one transaction. Their own vshards, so a hot index doesn't drag a data vshard around with it and either can move without the other; entries travel with the vshard like any other row.
+
+Uniqueness uses reserve → create → confirm. The reservation and its check are one transaction on the index vshard's host, so two callers racing for a value cannot both win. The create is a second write, on another host, which is why the three steps cannot be one transaction: if it fails the reservation is released, and if the caller dies first the reservation expires and is swept, so a crash can't hold a value forever. A reserved value reads as absent, since the object does not exist yet and the reserving caller may never confirm it.
+
+Values are normalized once, in one place, before they are hashed or compared — case and surrounding space don't make an email distinct, and two spellings reaching two entries would make the constraint a lie.
+
+Non-unique global index maintenance is the part that rides the outbox, like inverse edges; it is not built yet.
 
 ### Expression indexes
 

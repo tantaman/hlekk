@@ -26,6 +26,21 @@ export class NotOwned extends Error {
   }
 }
 
+/** A value a unique index already holds. `by` names the object holding it, or null while another
+ *  caller's reservation is still live. */
+export class Taken extends Error {
+  readonly idx: number;
+  readonly key: string;
+  readonly by: Id | null;
+  constructor(idx: number, key: string, by: Id | null) {
+    super(`index ${idx} already holds ${JSON.stringify(key)}${by === null ? " under a live reservation" : ` for ${by}`}`);
+    this.name = "Taken";
+    this.idx = idx;
+    this.key = key;
+    this.by = by;
+  }
+}
+
 /** An edge type whose onDelete is restrict, holding a delete back. */
 export class Restricted extends Error {
   readonly id: Id;
@@ -41,7 +56,35 @@ export class Restricted extends Error {
 export type Reply<T> =
   | { ok: true; value: T }
   | { ok: false; refused: Refusal }
-  | { ok: false; restricted: { id: Id; edge: string } };
+  | { ok: false; restricted: { id: Id; edge: string } }
+  | { ok: false; taken: { idx: number; key: string; by: Id | null } };
+
+export interface IndexReserveOp extends RoutedAt {
+  vshard: string;
+  idx: number;
+  key: string;
+  now: number;
+  ttlMs: number;
+}
+
+export interface IndexConfirmOp extends RoutedAt {
+  vshard: string;
+  idx: number;
+  key: string;
+  id: Id;
+}
+
+export interface IndexReleaseOp extends RoutedAt {
+  vshard: string;
+  idx: number;
+  key: string;
+}
+
+interface IndexRow {
+  id: Uint8Array | null;
+  state: string;
+  at: number;
+}
 
 /** The epoch the caller routed with. Every host request carries one. */
 export interface RoutedAt {
@@ -107,6 +150,7 @@ export interface Snapshot {
   assocs: { id1: Id; atype: number; id2: Id; time: number; data: string | null }[];
   counts: { id1: Id; atype: number; n: number }[];
   outbox: { seq: number; target: number; op: string }[];
+  index: { idx: number; key: string; id: Id | null; state: string; at: number }[];
 }
 
 /** What a vshard costs this host, for the placement controller. Bytes are the stored payloads, which
@@ -348,6 +392,13 @@ export class Host {
           Number(v),
         )
         .map((r) => ({ seq: r.seq, target: r.target_vshard, op: r.op })),
+      // Index entries live in an index vshard, so they travel when it moves.
+      index: this.sql
+        .all<{ idx: number; key: string; id: Uint8Array | null; state: string; at: number }>(
+          "SELECT idx, key, id, state, at FROM index_entries WHERE vshard = ?",
+          Number(v),
+        )
+        .map((r) => ({ idx: r.idx, key: r.key, id: r.id === null ? null : fromKey(r.id), state: r.state, at: r.at })),
     };
   }
 
@@ -381,6 +432,17 @@ export class Host {
           o.op,
         );
       }
+      for (const e of snap.index ?? []) {
+        this.sql.run(
+          "INSERT OR REPLACE INTO index_entries (vshard, idx, key, id, state, at) VALUES (?, ?, ?, ?, ?, ?)",
+          Number(v),
+          e.idx,
+          e.key,
+          e.id === null ? null : toKey(e.id),
+          e.state,
+          e.at,
+        );
+      }
       // next_seq comes with it, or the new owner would hand out ids the old one already used.
       this.sql.run(
         "INSERT INTO vshards (vshard, epoch, state, next_seq) VALUES (?, ?, 'owned', ?)" +
@@ -401,8 +463,99 @@ export class Host {
       this.sql.run("DELETE FROM assocs WHERE id1 BETWEEN ? AND ?", lo, hi);
       this.sql.run("DELETE FROM assoc_counts WHERE id1 BETWEEN ? AND ?", lo, hi);
       this.sql.run("DELETE FROM outbox WHERE vshard = ?", Number(v));
+      this.sql.run("DELETE FROM index_entries WHERE vshard = ?", Number(v));
       this.sql.run("DELETE FROM vshards WHERE vshard = ?", Number(v));
     });
+  }
+
+  // ---- global unique index
+
+  /** Claims a value before the object that will hold it exists. Fails if a confirmed entry holds it,
+   *  or a reservation that has not yet expired. The entry and the check are one transaction on one
+   *  host, which is what makes the constraint real. */
+  indexReserve(op: IndexReserveOp): Reply<void> {
+    return this.#write(() => {
+      this.#claim(BigInt(op.vshard), op.epoch);
+      const held = this.#entry(op.vshard, op.idx, op.key);
+      if (held) {
+        const stale = held.state === "reserved" && op.now - held.at >= op.ttlMs;
+        if (!stale) throw new Taken(op.idx, op.key, held.state === "confirmed" ? fromKeyOf(held.id!) : null);
+      }
+      this.sql.run(
+        "INSERT INTO index_entries (vshard, idx, key, id, state, at) VALUES (?, ?, ?, NULL, 'reserved', ?)" +
+          " ON CONFLICT (vshard, idx, key) DO UPDATE SET id = NULL, state = 'reserved', at = excluded.at",
+        Number(op.vshard),
+        op.idx,
+        op.key,
+        op.now,
+      );
+    });
+  }
+
+  /** Points a reservation at the object that was created for it. */
+  indexConfirm(op: IndexConfirmOp): Reply<void> {
+    return this.#write(() => {
+      this.#claim(BigInt(op.vshard), op.epoch);
+      const held = this.#entry(op.vshard, op.idx, op.key);
+      if (!held) throw new Error(`no reservation for ${op.idx}/${op.key}`);
+      if (held.state === "confirmed" && fromKeyOf(held.id!) !== op.id) {
+        throw new Taken(op.idx, op.key, fromKeyOf(held.id!));
+      }
+      this.sql.run(
+        "UPDATE index_entries SET id = ?, state = 'confirmed' WHERE vshard = ? AND idx = ? AND key = ?",
+        toKey(op.id),
+        Number(op.vshard),
+        op.idx,
+        op.key,
+      );
+    });
+  }
+
+  /** Drops an entry: a reservation whose create failed, or a confirmed one whose object is gone. */
+  indexRelease(op: IndexReleaseOp): Reply<void> {
+    return this.#write(() => {
+      this.#claim(BigInt(op.vshard), op.epoch);
+      this.sql.run(
+        "DELETE FROM index_entries WHERE vshard = ? AND idx = ? AND key = ?",
+        Number(op.vshard),
+        op.idx,
+        op.key,
+      );
+    });
+  }
+
+  /** The object a value points at, or null. A reservation is not an answer: the object does not exist
+   *  yet, and the reserving caller may never confirm it. */
+  indexLookup(vshard: string, idx: number, key: string): Id | null {
+    const held = this.#entry(vshard, idx, key);
+    return held && held.state === "confirmed" && held.id ? fromKeyOf(held.id) : null;
+  }
+
+  /** Reclaims reservations nobody confirmed, which is what keeps a crashed create from holding a value
+   *  forever. An alarm calls this. */
+  indexSweep(vshard: string, now: number, ttlMs: number): number {
+    const stale = this.sql.all<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM index_entries WHERE vshard = ? AND state = 'reserved' AND ? - at >= ?",
+      Number(BigInt(vshard)),
+      now,
+      ttlMs,
+    )[0]?.n ?? 0;
+    this.sql.run(
+      "DELETE FROM index_entries WHERE vshard = ? AND state = 'reserved' AND ? - at >= ?",
+      Number(BigInt(vshard)),
+      now,
+      ttlMs,
+    );
+    return stale;
+  }
+
+  #entry(vshard: string, idx: number, key: string): IndexRow | undefined {
+    return this.sql.all<IndexRow>(
+      "SELECT id, state, at FROM index_entries WHERE vshard = ? AND idx = ? AND key = ?",
+      Number(BigInt(vshard)),
+      idx,
+      key,
+    )[0];
   }
 
   // ---- outbox
@@ -430,6 +583,7 @@ export class Host {
     } catch (e) {
       if (e instanceof NotOwned) return { ok: false, refused: e.refusal };
       if (e instanceof Restricted) return { ok: false, restricted: { id: e.id, edge: e.edge } };
+      if (e instanceof Taken) return { ok: false, taken: { idx: e.idx, key: e.key, by: e.by } };
       throw e;
     }
   }

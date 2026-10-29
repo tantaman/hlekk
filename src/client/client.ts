@@ -175,7 +175,8 @@ export class Hlekk {
       if (!route) throw new Unroutable(vshard);
       const reply = (await this.#transport.write(route.host, m, route.epoch)) as Reply<T>;
       if (reply.ok) return reply.value;
-      if (!("refused" in reply)) throw new WriteRefused(m, reply.restricted);
+      if ("restricted" in reply) throw new WriteRefused(m, reply.restricted);
+      if ("taken" in reply) throw new ValueTaken(reply.taken.idx, reply.taken.key, reply.taken.by);
 
       if (reply.refused.state === "fenced") {
         // Mid-move. The route is not wrong, so re-resolving would find the same host; the write waits
@@ -219,6 +220,90 @@ export class Hlekk {
 
   assocRemove(atype: number, id1: Id, id2: Id): Promise<void> {
     return this.write<void>({ kind: "assocRemove", atype, id1, id2 });
+  }
+
+  // ---- global unique index
+
+  /** The object a value points at, or null. A local index cannot answer this: the coordinator does
+   *  not know which host to ask, so the entry lives in an index vshard keyed by the value. */
+  async lookupUnique(idx: number, value: string): Promise<Id | null> {
+    const key = normalize(value);
+    const vshard = await this.#transport.indexVshardFor(key);
+    for (let depth = 0; ; depth++) {
+      const route = await this.routes.route(BigInt(vshard));
+      if (!route) throw new Unroutable(BigInt(vshard));
+      try {
+        return await this.#transport.indexLookup(route.host, vshard, idx, key);
+      } catch (e) {
+        // A host that no longer holds the index vshard throws rather than answering null, because a
+        // missing entry and a missing vshard are not the same answer.
+        if (depth >= MAX_REROUTES) throw e;
+        await this.routes.reroute([BigInt(vshard)]);
+      }
+    }
+  }
+
+  /** Creates an object holding a value no other object may hold.
+   *
+   *  Reserve, create, confirm. The reservation and its check are one transaction on the one host that
+   *  owns the value's index vshard, so two callers racing for the same value cannot both win. The
+   *  create is a second write, on another host, which is why this cannot be one transaction; if it
+   *  fails the reservation is released, and if this process dies first the reservation expires and is
+   *  swept, so a crash cannot hold a value forever. */
+  async createUnique(
+    idx: number,
+    value: string,
+    otype: number,
+    data: Record<string, Json>,
+    at: { with: Id } | { vshard: string } | { affinity?: string } = {},
+    opts: { ttlMs?: number; now?: number } = {},
+  ): Promise<Id> {
+    const key = normalize(value);
+    const vshard = await this.#transport.indexVshardFor(key);
+    const ttlMs = opts.ttlMs ?? RESERVATION_TTL_MS;
+    const now = opts.now ?? Date.now();
+
+    await this.write({ kind: "indexReserve", vshard, idx, key, now, ttlMs });
+    let id: Id;
+    try {
+      id = await this.create(otype, data, at);
+    } catch (e) {
+      await this.write({ kind: "indexRelease", vshard, idx, key }).catch(() => {});
+      throw e;
+    }
+    try {
+      await this.write({ kind: "indexConfirm", vshard, idx, key, id });
+    } catch (e) {
+      // The object exists but nothing points at it. Take it back out rather than leaving it stranded.
+      await this.delete(id).catch(() => {});
+      await this.write({ kind: "indexRelease", vshard, idx, key }).catch(() => {});
+      throw e;
+    }
+    return id;
+  }
+}
+
+/** How a value is compared. Case and surrounding space are not what makes an email distinct, and the
+ *  normalization has to be the same everywhere or two spellings would each get an entry. */
+export function normalize(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+/** How long an unconfirmed reservation holds a value. Long enough to cover a create and a confirm,
+ *  short enough that a crash does not strand the value for long. */
+export const RESERVATION_TTL_MS = 30_000;
+
+export class ValueTaken extends Error {
+  readonly idx: number;
+  readonly key: string;
+  /** The object holding the value, or null while another caller's reservation is still live. */
+  readonly by: Id | null;
+  constructor(idx: number, key: string, by: Id | null) {
+    super(`${JSON.stringify(key)} is already taken${by === null ? " by a reservation in flight" : ` by ${by}`}`);
+    this.name = "ValueTaken";
+    this.idx = idx;
+    this.key = key;
+    this.by = by;
   }
 }
 
