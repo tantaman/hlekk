@@ -27,7 +27,7 @@ D1 already offers SQL with read replicas, up to 10 GB per database. This system 
 ## Principles
 
 1. **Identity, ownership, storage and read serving are separate.** An object's ID never changes. The DO that owns its writes can change. Where cached copies are served is a separate decision again.
-2. **Move, never split.** IDs embed one of many small, fixed logical shards (vshards). Capacity is managed by the allocator and by moving whole vshards between DOs. No split protocol, no log lineage, no transaction group cut in half.
+2. **Move, never split.** IDs embed one of many small, fixed logical shards (vshards). A database is pre-sharded, so even its first write lands in one of many. Capacity is managed by the allocator and by moving whole vshards between DOs. No split protocol, no log lineage, no transaction group cut in half.
 3. **The query rides, control stays central.** Each host DO resolves everything it holds and ships back what it read. One coordinator runs the query once and batches its reads per host.
 4. **Routing is a hint; the owner enforces.** Cached routes can be stale. The owning DO checks the epoch on every request and answers `moved` when it no longer owns a vshard.
 5. **One mutation, one local transaction.** The ownership check, the data write, counts and the outbox row commit together in one SQLite transaction on one host.
@@ -318,7 +318,7 @@ const vshardRange = (v: bigint) => [
 
 A vshard is the unit of placement, movement and transactions. Each has a soft size cap, proposed at about 1 GB, well under the 10 GB DO limit. The cap is set by move time, not storage: a stop-the-world move pauses the vshard's writes for the whole copy. One host DO holds many vshards.
 
-- **Allocation.** A new object goes to a vshard with room, homed near the creating request. `with: parentId` forces the parent's vshard. A vshard stops taking new root objects at about half its byte cap, keeping the rest for colocated children of objects already in it. It stops taking any once it is full, by bytes or by exhausted sequence.
+- **Allocation.** A new root object goes to a vshard in the active set, homed near the creating request. `with: parentId` forces the parent's vshard. A vshard leaves the active set at about half its byte cap, keeping the rest for colocated children of objects already in it. It stops taking any object once it is full, by bytes or by exhausted sequence.
 - **Region is metadata.** Each vshard records its home region and jurisdiction in the directory, not in the ID. DOs don't relocate after creation, so changing region means moving the vshard to a new host DO created with a `locationHint` or `jurisdiction`.
 - **Moves, never splits.** Hosts shed whole vshards to new hosts. A vshard is never divided: sequences follow creation order, so a split by ID range would cut colocation groups apart by age.
 
@@ -328,6 +328,36 @@ A vshard can still grow from inside, in two ways:
 - **Large edge lists.** A high-degree object's edges live on its vshard. Overflow storage keyed by `(id1, atype)` is deferred until needed.
 
 **If splits are ever needed**, allocation can make them safe. Each colocation group gets its own sub-slab of the sequence, say 2^16 IDs, with continuation slabs when it fills. A split along slab boundaries never cuts a group, and routing matches either the vshard or the vshard plus slab. New vshards could adopt this without touching old ones.
+
+### Initial sharding
+
+A new database is created with a fixed number of vshards, `N`, proposed at 64, all placed on one host DO at epoch 0. The directory holds them as one range. A database holding two rows therefore costs one host DO, one directory range and `N` rows of `vshards` bookkeeping, about 2 KB: the goal of one DO for a small database holds exactly.
+
+`N` is a floor, not a budget. It is how many hosts the founding data can ever spread across without a split, and splits do not exist.
+
+**Why not start with one.** Nothing divides a vshard later. The sub-slab scheme above is safe only for vshards allocated that way from their first write, so vshard 0 of an existing database can never be split. A database that starts with one vshard welds its first half gigabyte of root objects to a single DO permanently, and those roots, the tenants and users and organizations, are what every query touches.
+
+A second reason matters more in practice. With one vshard every `db.txn(anchorId, …)` succeeds, because every ID trivially shares the anchor's vshard, and every inverse edge is written inline in the same transaction, because its target vshard is on the same host. Both stop being true the day the allocator opens vshard 1. An application developed against a single-vshard database is written against guarantees it does not have and finds out in production. Pre-sharding makes a two-row database behave like a 500 GB one, which is principle 7 applied to capacity.
+
+**Why not start with many more.** Several loops are per-vshard whether or not the vshard holds data: the directory's range entries once moves have fragmented them, the placement controller's bookkeeping, and the per-vshard checks and backfills that schema changes drive by alarm. `N` wants to stay small enough that those stay trivial. 64 is. A database known in advance to be large can be created with 256 or 1,024.
+
+### Growing the vshard count
+
+A new host DO is created empty and receives whole vshards. **It never mints them.** Minting a vshard is a database-level act by the allocator, and the two events are independent: a database spreads from 1 host to 64 without creating a single new vshard, and it opens vshard 64 whether or not a new host exists to hold it.
+
+- **The active set.** When the active set empties, the allocator opens the next `N` vshards, not the next one. Opening a single vshard would funnel every create in the database onto one vshard on one host, against the 1,000 requests/sec ceiling: the same mistake as starting with one.
+- **Total count is bytes-bound.** Each vshard caps at about 1 GB, so a database ends up with roughly one vshard per gigabyte of live data however it got there. `N` sets the floor for a small database and stops mattering above `N` GB.
+- **Allocation within the active set.** A root object hashes an affinity key, the tenant or owning user or the creating request's root, into the active set. `with: parentId` overrides it. Spreading costs nothing while the active set is co-resident: reads batch per host, so vshards on one host are one request, and an inverse edge between two vshards on the same host is written inline in that host's transaction. It buys a placement controller that has something to move on day one.
+
+Hosts and vshards grow on separate curves. The host column below assumes 5 GB of live data per DO, half the limit; build plan step 1 measures the density that actually holds.
+
+| Live data | vshards | Hosts |
+| --- | --- | --- |
+| 2 rows | 64 | 1 |
+| 64 GB | 64 | 13 |
+| 1 TB | ~1,000 | ~200 |
+| 100 TB | ~100,000 | ~20,000 |
+| 16 PB | 16.7M, the 24-bit ceiling | ~3.4M |
 
 ## Host schema
 
@@ -587,10 +617,34 @@ The directory says where a vshard probably is; the host that owns it decides. St
 
 - **The caller names the database; the ID names the vshard.** A request is scoped to a database by its binding, and the ID's top 24 bits give the vshard. Neither needs a lookup.
 - **One directory DO per database** maps each vshard to its host DO name, epoch, home region and jurisdiction.
-- **Stored as ranges.** The allocator fills one host before opening another, so consecutive vshards usually share a host. A small database is one range pointing at one DO; moves break ranges up.
+- **Stored as ranges.** A database's vshards are created in batches and placed together, so consecutive vshards usually share a host. A new database is one range pointing at one DO; moves break ranges up.
 - **Cached in Workers.** Workers cache the map in isolate memory. It changes only on allocation of new vshards and on moves, so the directory stays out of the request path.
 - **Cold Workers read a snapshot.** A stale route costs only a `moved` reply, so the directory publishes versioned snapshots to Workers KV, and a cold isolate reads that instead of the directory DO.
+- **Snapshots are chunked by vshard range**, so what an isolate holds is bounded by the vshards it routes to, not by the size of the database. See Shard map size.
 - **The owner enforces.** Every host request carries the epoch it routed with for each vshard. The host compares it with its own `vshards` row and answers `moved {to, epoch}` on a mismatch.
+
+### Shard map size
+
+Every isolate that serves queries holds some of this map, so its size is a standing cost rather than a one-time one.
+
+An entry is a run of consecutive vshards on one host: a start vshard, a host index and an epoch. Interning host DO names into a side table keeps an entry to 12 bytes, held as three parallel `Uint32Array`s and binary-searched by vshard with no object allocation per lookup. The side table carries one row per host, name included.
+
+Entry count sits between the number of hosts and the number of vshards. It lands near the bottom when the placement controller sheds contiguous runs and near the top when it sheds individual hot vshards. The column below is the top of that range.
+
+| Live data | vshards | Entries, fully fragmented | Map at 12 B/entry |
+| --- | --- | --- | --- |
+| 2 rows | 64 | 1 | ~100 B |
+| 64 GB | 64 | 64 | 768 B |
+| 1 TB | ~1,000 | ~1,000 | 12 KB |
+| 100 TB | ~100,000 | ~100,000 | 1.2 MB |
+| 2 PB | ~2M | ~2M | 24 MB |
+| 16 PB | 16.7M | 16.7M | 200 MB |
+
+A whole map fits an isolate to roughly a petabyte of live data. Two things give way before the 24-bit ceiling does: a KV value caps at 25 MB, around 2M entries, and a cold isolate's fetch grows linearly well before that.
+
+So the snapshot is **chunked by vshard range from the start**, a fixed span of vshards per KV key, and an isolate caches chunks rather than the map. A new database is one chunk, so nothing changes for small databases, and nothing has to change at the ceiling. A chunk an isolate has never fetched costs one KV read, and a chunk gone stale costs a `moved` reply, which is already the correction path.
+
+**The vshard cap is the map-size knob.** At a 1 GB cap the map carries one entry per gigabyte of live data. A 4 GB cap quarters the map and quadruples the write pause of a stop-the-world move. The deferred `changes` log removes that pressure by making moves snapshot-and-tail, so it is also what would let the cap rise and the map shrink.
 
 ### Moving a vshard (v1, stop-the-world)
 
@@ -705,8 +759,12 @@ CREATE INDEX obj_issue_status
 
 ### Open questions
 
-- [ ] Exact ID bit split between vshard and sequence (24/40 proposed; IDs are unsigned and use all 64 bits, with no reserved bit).
-- [ ] vshard size cap and the placement controller's move thresholds.
+- [ ] Exact ID bit split between vshard and sequence (24/40 proposed; IDs are unsigned and use all 64 bits, with no reserved bit). The vshard bits also cap the shard map.
+- [ ] vshard size cap and the placement controller's move thresholds. The cap trades a move's write pause against the size of the shard map.
+- [ ] Initial vshard count `N` (64 proposed), and whether it is fixed or a creation-time parameter.
+- [ ] Whether the placement controller prefers shedding a contiguous run of vshards, keeping the shard map compact, over shedding the single largest or busiest one.
+- [ ] The affinity key a root object hashes into the active set, and what to use when a request has none.
+- [ ] Chunk span for KV shard-map snapshots.
 - [ ] Colocation group limit, and what `with` does when the parent's vshard is full: error or spill.
 - [ ] Deletes: the default onDelete when an edge type declares none, and whether edges to missing objects are dropped at read time.
 - [ ] Heuristic for choosing coordinator placement per query.
@@ -726,7 +784,7 @@ Build the riskiest parts first: per-host performance, then moves under load. Eve
 2. **Directory, schema catalog and many hosts.** Epoch checks, `moved` replies, catalog migrations and projection codegen, Worker route caching, and the async coordinator end to end.
 3. **Stop-the-world vshard moves.** Driven by the directory, run under write load with a chaos harness that kills hosts mid-move. This is the part most likely to be subtly wrong.
 4. **Inverse edges through the outbox.** Same-host inline writes, ordered idempotent delivery, retries across moves.
-5. **Allocator and placement controller.** Automatic moves on storage and request pressure; colocation with `with`.
+5. **Allocator and placement controller.** Initial sharding, batch growth of the active set, automatic moves on storage and request pressure, and colocation with `with`.
 6. **Global unique index.** User by email, with reserve → create → confirm.
 
 After v1: the `changes` log and snapshot-and-tail moves, then regional followers with session tokens.
