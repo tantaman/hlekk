@@ -939,6 +939,7 @@ CREATE INDEX obj_issue_status
 - [ ] Heuristic for choosing coordinator placement per query, and whether the choice is exposed to the caller or decided for it.
 - [ ] Whether a query returns the normalized `QueryResult` or an already-nested shape, and whether both are offered.
 - [ ] Read-after-write guarantees to promise for cross-host inverse edges.
+- [ ] Whether `create` needs an idempotency key. A write whose reply is lost has landed, and the caller cannot tell. Every other mutation survives a blind retry: an edge add is an upsert, a remove and a delete are if-present, a delivered inverse is both, and an `update` carrying the version it read comes back as a conflict, which tells the caller the first one landed. `create` is the exception — retrying it makes a second object — so today the client surfaces the error rather than retrying, and the decision is the caller's with nothing to decide it on.
 - [ ] Directory DO load and failure: how long Worker route caches and KV snapshots may live.
 - [ ] Backfills for new inverses and global indexes: rate limits, and how progress is reported.
 - [ ] Catalog version skew: how far hosts may lag the newest catalog, and how long a client's catalog version and projection hash stay accepted.
