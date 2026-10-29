@@ -10,6 +10,7 @@ import type { Route } from "../directory/map.ts";
 import { Mover } from "../directory/move.ts";
 import type { MoveHosts } from "../directory/move.ts";
 import { Host } from "../host/host.ts";
+import { Deliverer } from "../host/outbox.ts";
 import type { ExecReply, Reply, Routed, Snapshot } from "../host/host.ts";
 import { nodeSql } from "../host/sql.node.ts";
 import type { Catalog } from "../catalog/catalog.ts";
@@ -159,6 +160,27 @@ export class LocalCluster {
 
   client(): Hlekk {
     return Hlekk.from(this.transport);
+  }
+
+  /** Runs every host's alarm until the outbox is quiet, as a cluster at rest would reach. */
+  async deliverAll(passes = 16): Promise<number> {
+    let delivered = 0;
+    for (let i = 0; i < passes; i++) {
+      let moved = 0;
+      for (const [index, host] of [...this.hosts]) {
+        void index;
+        const pass = await new Deliverer(host, this.client()).drainAll();
+        moved += pass.delivered;
+      }
+      delivered += moved;
+      if (moved === 0) break; // nothing left that can be delivered
+    }
+    return delivered;
+  }
+
+  /** Rows still waiting across every host. */
+  queued(): number {
+    return [...this.hosts.values()].reduce((n, h) => n + h.pending().length, 0);
   }
 
   #transport(): Transport {
