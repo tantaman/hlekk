@@ -1,8 +1,8 @@
 // The coordinator's two drivers, rounds and async, and a host's handler for one batch of tasks.
 
 import { Pass, drain, materialize } from "./ops.ts";
-import { Cache, CacheStore, HostStore } from "./stores.ts";
-import type { HostData, ReadSet } from "./stores.ts";
+import { Cache, CacheStore } from "./stores.ts";
+import type { ReadSet } from "./stores.ts";
 import { UNKNOWN, missKey, missOwner } from "./types.ts";
 import type { Cursor, EdgePage, Id, Json, Maybe, Miss, Obj, Plan, Store } from "./types.ts";
 
@@ -16,18 +16,22 @@ export interface HostClient {
   exec(plan: Plan, tasks: Miss[]): Promise<HostReply>;
 }
 
+/** A store over one host's own data, which also records what it read. */
+export interface LocalStore extends Store {
+  reads(): ReadSet;
+}
+
 /** A host runs each task against its local data and reports what it read and what it couldn't. Every
  *  read settles at once, so the batch runs to completion before the DO takes another event: one
  *  snapshot, and no SQL cursor open across real I/O. */
-export async function hostExec(host: HostData, plan: Plan, tasks: Miss[]): Promise<HostReply> {
-  const store = new HostStore(host);
+export async function hostExec(store: LocalStore, plan: Plan, tasks: Miss[]): Promise<HostReply> {
   const p = new Pass(store, plan);
   await Promise.all(tasks.map((t) => runTask(p, store, t)));
   await p.settle(); // speculative reads too, so what the reply holds doesn't depend on timing
   return { reads: store.reads(), misses: p.misses };
 }
 
-async function runTask(p: Pass, store: HostStore, t: Miss): Promise<void> {
+async function runTask(p: Pass, store: LocalStore, t: Miss): Promise<void> {
   if (t.kind === "object") return drain(p.rowOp(t.frame).fetch(p, { ids: [t.id] }));
   if (t.kind === "count") {
     await store.count(t.id1, t.atype);
@@ -35,7 +39,7 @@ async function runTask(p: Pass, store: HostStore, t: Miss): Promise<void> {
   }
   // One page of the list, then each target as a row of the frame, separately so that an unknown
   // target doesn't stop the prefetch below the others. The coordinator judges membership.
-  const page = await store.edges(t.id1, t.atype, t.after, t.n);
+  const page = await store.edges(t.id1, t.atype, t.after, t.n, t.frame);
   if (page === UNKNOWN) return;
   await Promise.all(page.rows.map((e) => drain(p.rowOp(t.frame).fetch(p, { ids: [e.id2] }))));
 }

@@ -502,7 +502,7 @@ Every mutation commits in one `transactionSync()` on the host that owns its vsha
 
 Inside the transaction:
 
-1. Decode the vshard from the ID. Check its `vshards` row: state must be `owned` and the request's epoch must match. Otherwise reply `moved {to, epoch}` or `fenced`, and write nothing.
+1. Decode the vshard from the ID. Check its `vshards` row: state must be `owned` and the request's epoch must match. Otherwise reply `{vshard, state, epoch}` and write nothing.
 2. Write the object or edge. Object writes bump `version`; creates take the next sequence from `vshards.next_seq`.
 3. Update `assoc_counts` for edge adds and removes.
 4. If the catalog gives the edge type an inverse:
@@ -700,7 +700,7 @@ The directory says where a vshard probably is; the host that owns it decides. St
 - **Cached in Workers.** Workers cache the map in isolate memory. It changes only on allocation of new vshards and on moves, so the directory stays out of the request path.
 - **Cold Workers read a snapshot.** A stale route costs only a `moved` reply, so the directory publishes versioned snapshots to Workers KV, and a cold isolate reads a chunk of one instead of asking the directory DO. The snapshot is a load shield for the directory's request ceiling, not a faster path: a cold read of classic KV is slower than asking the directory. Long-lived readers skip it and read the directory directly.
 - **Snapshots are chunked by vshard range**, so what a reader holds is bounded by the vshards it routes to, not by the size of the database. See Shard map.
-- **The owner enforces.** Every host request carries the epoch it routed with for each vshard. The host compares it with its own `vshards` row and answers `moved {to, epoch}` on a mismatch.
+- **The owner enforces.** Every host request carries the epoch it routed with for each vshard. The host compares it with its own `vshards` row and refuses on a mismatch, naming the vshard, its state and its epoch. It does not name the new owner: its `vshards` row carries no target, so the caller re-reads the directory, which is authoritative anyway.
 
 ### Shard map
 
