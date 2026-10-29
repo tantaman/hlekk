@@ -1,0 +1,9 @@
+{
+  "name": "hlekk",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "demo": "node src/query/demo.ts",
+    "typecheck": "tsc -p ."
+  }
+}
