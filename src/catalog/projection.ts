@@ -102,7 +102,13 @@ function hashOf(r: Omit<Resolved, "hash">): string {
 
 /** Generates the one module a product imports from. The lock is the source of truth; this is a mirror,
  *  never a second source, which is why it says so and why nothing hand-written belongs in it. */
-export function generate(resolved: Resolved): string {
+export interface GenerateOptions {
+  /** Where the generated module imports its runtime from. A relative path inside this repo, the
+   *  package elsewhere. */
+  importFrom?: string;
+}
+
+export function generate(resolved: Resolved, opts: GenerateOptions = {}): string {
   const out: string[] = [];
   const ident = (name: string) => {
     const bare = name.slice(name.indexOf(".") + 1);
@@ -113,8 +119,15 @@ export function generate(resolved: Resolved): string {
     return pascal.charAt(0).toLowerCase() + pascal.slice(1);
   };
 
+  // Two domains can hold the same bare name, and both would render to one identifier. Better to refuse
+  // than to emit a module whose second definition silently shadows its first.
+  const taken = new Map<string, string>();
+  for (const o of resolved.objects) claim(taken, ident(o.type.name), o.type.name);
+  for (const e of resolved.edges) claim(taken, camel(e.name), e.name);
+
   out.push(`// Generated from catalog v${resolved.catalog} for projection ${resolved.name}. Do not edit.`);
-  out.push(`import { defineObject, edge, fieldRel, id, oneOf, ref, json, bool, num, str } from "hlekk/schema";`);
+  const from = opts.importFrom ?? "hlekk/schema";
+  out.push(`import { bool, defineObject, edge, fieldRel, id, json, num, oneOf, ref, str } from ${JSON.stringify(from)};`);
   out.push("");
   out.push(
     `export const projection = { name: ${JSON.stringify(resolved.name)}, catalog: ${resolved.catalog},` +
@@ -167,3 +180,13 @@ export function stamp(resolved: Resolved): { catalog: number; hash: string } {
 }
 
 export { canonical };
+
+function claim(taken: Map<string, string>, ident: string, name: string): void {
+  const held = taken.get(ident);
+  if (held !== undefined) {
+    throw new CatalogError(
+      `${name} and ${held} both generate as ${ident}. Rename one, or narrow the projection to exclude it.`,
+    );
+  }
+  taken.set(ident, name);
+}

@@ -108,16 +108,20 @@ const r = await Issue.gen(id)
   .related('comments', issueComments, q => q.related('author', commentAuthor).limit(50))
   .related('labels', issueLabels)
   .related('owner', issueOwner)
-  .run();
+  .countAs('commentCount', issueComments)
+  .run(db);
 ```
 
 - Every `related` has a limit. A default applies when none is given.
+- **A to-one relation yields one object or null**, not a list of one. An edge declared `unique`, and every field relationship, is to-one; the operators always produce lists, so the builder unwraps as its last step.
+- **Each `related` level is its own frame**, so two aliases over one edge type with different limits or filters do not share a slot.
+- **A query is a value and is immutable.** Extending one returns another, so a half-built query can be finished two different ways, which is what makes a plain function enough for reuse.
 - `related` over an `edge` reads the newest edges first by `time`. Indexed `where` and `orderBy` are allowed only on edge fields; see Indexing.
 - The result is a normalized graph. Nesting into the query's shape happens last, so each object appears once.
 - **Queries are built, not declared.** There is no `defineQuery` or `defineFragment`: a query is the builder's value, and reuse is an ordinary function over it. Rindle needs named, validated queries because an untrusted client sends them; hlekk's caller is a trusted server, so the wrapper would guard nothing. By principle 10 that does not change, so this is not a v1 simplification.
 
 ```ts
-const card = (q: Query<Issue>) => q.related('owner', issueOwner).related('labels', issueLabels);
+const card = <S>(q: Query<typeof Issue.fields, S>) => q.related('owner', issueOwner).related('labels', issueLabels);
 
 const r = await card(Issue.gen(id)).related('comments', issueComments, q => q.limit(50)).run();
 ```
@@ -203,7 +207,8 @@ export const issueOwner    = edge('issues.issue_owner', 3, Issue, User, { unique
 export const commentAuthor = fieldRel('issues.comment_author', Comment, User, 'authorId');
 ```
 
-- **Integers on the wire.** Requests name types by integer, so a rename never breaks a deployed client. Names serve people and error messages.
+- **Integers on the wire.** Requests name types by integer, so a rename never breaks a deployed client. Names serve people and error messages. Definitions take their integers from the lock and never carry their own: hand-numbering them is how a read and a write come to disagree about which edge they mean.
+- **One identifier per definition.** Two domains can hold the same bare name, which would render to one identifier and silently shadow; generation refuses rather than emitting it.
 - **Requests carry the catalog version and projection hash.** A change since that version that touches none of the projection's entries never invalidates the client.
 - **Refinements the schema can't express**, such as a JSON field's TypeScript shape, go in a hand-written module over the generated one, as with rindle's `refineTable`, so they survive regeneration.
 - **Other languages** get generators over the same lock and projection.
@@ -939,7 +944,7 @@ Build the riskiest parts first: per-host performance, then moves under load. Eve
 5. **Allocator and placement controller.** Initial sharding, batch growth of the active set, automatic moves on storage and request pressure, and colocation with `with`. — *built*
 6. **Global unique index.** User by email, with reserve → create → confirm. — *built*
 
-What is not built, and is not the deferred work below: the fluent query builder and the `Query` and `Ref` types the generated module imports, so a query is still assembled as a `Plan`; a Workers deployment, so the DO and KV adapters are written and typed but unexercised; and non-unique global index maintenance through the outbox.
+What is not built, and is not the deferred work below: a Workers deployment, so the DO and KV adapters are written and typed but unexercised; the normalized `QueryResult` form, since a built query returns the nested shape its chain describes; and non-unique global index maintenance through the outbox.
 
 After v1: the `changes` log and snapshot-and-tail moves, then regional followers with session tokens.
 
