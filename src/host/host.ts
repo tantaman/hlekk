@@ -265,6 +265,13 @@ export class Host {
     for (const t of tasks) this.#count(vshardOf(missOwner(t)));
     const store = this.store(routed);
     const reply = await hostExec(store, plan, tasks);
+    // Every task the caller asked for is answered or refused. Returning nothing for one it routed
+    // here, because this host happens not to hold the vshard, would read as an empty answer: the
+    // coordinator cannot tell "no such object" from "not mine" unless the host says which.
+    for (const t of tasks) {
+      const verdict = store.serves(vshardOf(missOwner(t)));
+      if (verdict !== true) store.refuse(verdict);
+    }
     return { ...reply, refusals: [...store.refused.values()] };
   }
 

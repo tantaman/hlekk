@@ -147,8 +147,8 @@ export class Hlekk {
       const vshard = vshardOf(id);
       const route = this.routes.peek(vshard);
       // A driver's route() is synchronous, so a vshard the cache has never seen cannot be resolved
-      // here. It goes to the host the cache does know, which refuses it, and the retry below places
-      // it. One extra round, which is what a stale route costs anyway.
+      // here. It batches under a host it does know, and #exec resolves the batch properly before
+      // sending, so the guess costs nothing.
       const host = route?.host ?? this.#anyHost();
       return this.#clientFor(host);
     };
@@ -175,6 +175,24 @@ export class Hlekk {
   /** Sends a batch to one host and places whatever it refuses. */
   async #exec(host: number, plan: Plan, tasks: Miss[], depth: number): Promise<HostReply> {
     const vshards = [...new Set(tasks.map((t) => vshardOf(missOwner(t))))];
+    // Resolve before sending. The batching above groups by whatever the cache knew synchronously,
+    // which for a vshard it had never seen is a guess; placing it here costs no round trip.
+    const placed = await this.routes.routeAll(vshards);
+    const elsewhere = vshards.filter((v) => placed.get(v) !== undefined && placed.get(v)!.host !== host);
+    if (elsewhere.length > 0 && depth < MAX_REROUTES) {
+      const mine = tasks.filter((t) => !elsewhere.includes(vshardOf(missOwner(t))));
+      const byHost = new Map<number, Miss[]>();
+      for (const t of tasks.filter((t) => elsewhere.includes(vshardOf(missOwner(t))))) {
+        const to = placed.get(vshardOf(missOwner(t)))!.host;
+        byHost.set(to, [...(byHost.get(to) ?? []), t]);
+      }
+      const parts = await Promise.all([
+        ...(mine.length > 0 ? [this.#exec(host, plan, mine, depth + 1)] : []),
+        ...[...byHost].map(([h, ts]) => this.#exec(h, plan, ts, depth + 1)),
+      ]);
+      return { reads: merge(parts.map((p) => p.reads)), misses: parts.flatMap((p) => p.misses) };
+    }
+
     const routed = new Map<bigint, number>();
     for (const v of vshards) {
       const r = this.routes.peek(v);
@@ -185,7 +203,7 @@ export class Hlekk {
     if (depth >= MAX_REROUTES) throw new TooManyReroutes(reply.refusals);
 
     const refused = reply.refusals.map((r) => BigInt(r.vshard));
-    const placed = await this.routes.reroute(refused);
+    const replaced = await this.routes.reroute(refused);
     const again = tasks.filter((t) => refused.includes(vshardOf(missOwner(t))));
 
     // Re-partition by the new owner: a batch can be refused for several vshards at once, which may
@@ -193,7 +211,7 @@ export class Hlekk {
     const byHost = new Map<number, Miss[]>();
     for (const t of again) {
       const v = vshardOf(missOwner(t));
-      const route = placed.get(v);
+      const route = replaced.get(v);
       if (!route) throw new Unroutable(v);
       byHost.set(route.host, [...(byHost.get(route.host) ?? []), t]);
     }
