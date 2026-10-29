@@ -1,0 +1,247 @@
+<title>Hlekk at a Glance</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=IBM+Plex+Mono:wght@400&family=Spectral:ital,wght@0,300;0,400;0,500;1,400&display=swap">
+<style>
+  /* One orienting figure, four layers deep. Bone ink on charcoal; a single
+     ember accent on the one idea the picture exists to carry: the id's high
+     bits name a logical database, and that is the thing that moves. */
+  :root {
+    color-scheme: dark;
+    --ground: #202524; --ground-2: #262c2a;
+    --ink: #ece7dc; --ink-2: #b8b4a8; --ink-3: #8d938f;
+    --ember: #d8793f; --ember-2: #eda268;
+    --f-d: 'Cinzel', Georgia, serif;
+    --f-b: 'Spectral', Georgia, 'Times New Roman', serif;
+    --f-m: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  body {
+    background: var(--ground); color: var(--ink); font-family: var(--f-b);
+    font-size: 16px; line-height: 1.62;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 48px 72px;
+  }
+  .wrap { max-width: 1160px; margin-inline: auto; }
+  p { margin: 0 0 1em; color: var(--ink-2); font-weight: 300; }
+  .prose { max-width: 66ch; }
+  strong { color: var(--ink); font-weight: 500; }
+  code { font-family: var(--f-m); font-size: .86em; color: var(--ink); }
+  .eyebrow { font-family: var(--f-m); font-size: 10.5px; letter-spacing: .22em; color: var(--ink-3); margin: 0 0 16px; }
+  h1 { font-family: var(--f-d); font-weight: 700; font-size: clamp(38px, 9vw, 64px); letter-spacing: .14em; line-height: 1; margin: 0 0 12px; }
+  .gloss { font-family: var(--f-b); font-style: italic; font-size: 15px; color: var(--ink-3); margin: 0 0 26px; }
+  .scroll { overflow-x: auto; overscroll-behavior-x: contain; margin-top: 40px; }
+  .glance { display: block; width: 100%; height: auto; min-width: 880px; }
+  figure { margin: 0; }
+  figcaption { margin-top: 18px; max-width: 76ch; font-size: 14.5px; color: var(--ink-2); font-weight: 300; }
+  .pan { display: none; font-family: var(--f-m); font-size: 9.5px; letter-spacing: .18em; color: var(--ink-3); margin: 0 0 8px; }
+  @media (max-width: 1160px) { .pan { display: block; } }
+  .reading { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--ink-3); border: 1px solid var(--ink-3); margin-top: 52px; }
+  .reading > div { background: var(--ground-2); padding: 18px 16px 20px; min-width: 0; }
+  .reading .k { font-family: var(--f-m); font-size: 9px; letter-spacing: .2em; color: var(--ink-3); margin: 0 0 8px; }
+  .reading p + p { margin: 0; font-size: 13.5px; line-height: 1.5; }
+  @media (max-width: 860px) { .reading { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 460px) { .reading { grid-template-columns: 1fr; } }
+  footer { margin-top: 64px; padding-top: 22px; border-top: 1px solid var(--ink-3); display: flex; justify-content: space-between; align-items: flex-end; gap: 20px; flex-wrap: wrap; }
+  footer p { margin: 0; font-family: var(--f-m); font-size: 10.5px; letter-spacing: .14em; color: var(--ink-3); }
+  footer svg { width: 44px; height: 24px; color: var(--ink-3); flex: none; }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">PROPOSAL &middot; OPENING FIGURE</p>
+  <h1>Hlekk</h1>
+  <p class="gloss">Old Norse for a chain link.</p>
+  <div class="prose">
+    <p>A TAO-style object-and-edge database built on actors, targeting any actor platform with durable local storage &mdash; Durable Objects, celld, Rivet. Hlekk owns partitioning, placement and capacity.</p>
+    <p>Four layers, and the id is what holds them together.</p>
+  </div>
+
+  <figure>
+    <div class="scroll">
+      <p class="pan">PAN THE FIGURE SIDEWAYS &rarr;</p>
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 620" class="glance" role="img" aria-label="Hlekk at a glance, in four layers. The graph: objects such as an issue, two comments, a user and a label, joined by named associations. The id: 64 bits, where the top 24 name a logical database and the low 40 name the object. Logical databases: each owns a range of ids and holds a set of objects. Actors: each actor holds many logical databases, and a logical database moves between actors as load changes without any id changing.">
+  <defs>
+    <pattern id="hg" width="6" height="6" patternUnits="userSpaceOnUse">
+      <rect width="6" height="6" fill="#262c2a"/>
+      <path d="M-1,1 L1,-1 M0,6 L6,0 M5,7 L7,5" fill="none" stroke="#ece7dc" stroke-width="0.5" opacity="0.2"/>
+    </pattern>
+    <filter id="rgh" x="-3%" y="-3%" width="106%" height="106%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.04" numOctaves="2" seed="11" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="1.4" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0.5 L10,5 L0,9.5 Z" fill="#ece7dc"/>
+    </marker>
+    <marker id="agd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0.5 L10,5 L0,9.5 Z" fill="#8d938f"/>
+    </marker>
+    <marker id="age" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0.5 L10,5 L0,9.5 Z" fill="#d8793f"/>
+    </marker>
+  </defs>
+
+  <rect width="1240" height="620" fill="#202524"/>
+
+  <!-- carved slabs -->
+  <g filter="url(#rgh)" fill="url(#hg)" stroke="#ece7dc" stroke-width="1.4">
+    <polygon points="308,44 396,44 404,52 404,78 300,78 300,52"/>
+    <polygon points="528,24 616,24 624,32 624,58 520,58 520,32"/>
+    <polygon points="528,92 616,92 624,100 624,126 520,126 520,100"/>
+    <polygon points="748,58 836,58 844,66 844,92 740,92 740,66"/>
+    <polygon points="308,112 396,112 404,120 404,146 300,146 300,120"/>
+    <rect x="562" y="204" width="438" height="48" stroke-width="1.5"/>
+    <rect x="300" y="204" width="262" height="48" stroke="#d8793f" stroke-width="2"/>
+    <polygon points="308,304 532,304 540,312 540,400 300,400 300,312"/>
+    <polygon points="588,304 812,304 820,312 820,400 580,400 580,312"/>
+    <polygon points="868,304 1092,304 1100,312 1100,400 860,400 860,312"/>
+    <polygon points="310,456 630,456 640,466 640,566 300,566 300,466"/>
+    <polygon points="750,456 1070,456 1080,466 1080,566 740,566 740,466"/>
+  </g>
+
+  <!-- band labels -->
+  <g font-family="'IBM Plex Mono', ui-monospace, Menlo, monospace" font-size="9.5" fill="#8d938f" letter-spacing="0.18em" text-anchor="end">
+    <text x="260" y="78">THE GRAPH</text>
+    <text x="260" y="224">THE ID</text>
+    <text x="260" y="340">LOGICAL DATABASES</text>
+    <text x="260" y="500">ACTORS</text>
+  </g>
+  <g font-family="'Spectral', Georgia, serif" font-style="italic" font-size="10.5" fill="#8d938f" text-anchor="end">
+    <text x="260" y="96">objects and associations</text>
+    <text x="260" y="242">64 bits, stable for ever</text>
+    <text x="260" y="358">the unit of placement</text>
+    <text x="260" y="518">Durable Object, celld, Rivet</text>
+  </g>
+
+  <!-- the graph -->
+  <g fill="none" stroke="#ece7dc" stroke-width="1.4" marker-end="url(#ag)">
+    <path d="M404,56 L516,40"/>
+    <path d="M404,68 L516,106"/>
+    <path d="M624,112 L736,84"/>
+    <path d="M352,78 L352,108"/>
+  </g>
+  <g font-family="'Cinzel', Georgia, serif" font-size="13" fill="#ece7dc" text-anchor="middle" letter-spacing="0.04em">
+    <text x="352" y="66">Issue</text>
+    <text x="572" y="46">Comment</text>
+    <text x="572" y="114">Comment</text>
+    <text x="792" y="80">User</text>
+    <text x="352" y="134">Label</text>
+  </g>
+  <g font-family="'IBM Plex Mono', ui-monospace, Menlo, monospace" font-size="9" fill="#b8b4a8">
+    <text x="462" y="36" text-anchor="middle">comments</text>
+    <text x="686" y="90" text-anchor="middle">author</text>
+    <text x="362" y="98">labels</text>
+  </g>
+
+  <!-- graph to id -->
+  <path d="M300,164 L844,164" fill="none" stroke="#8d938f" stroke-width="1" opacity="0.55"/>
+  <path d="M572,164 L572,198" fill="none" stroke="#8d938f" stroke-width="1.2" marker-end="url(#agd)"/>
+  <text x="584" y="187" font-family="'Spectral', Georgia, serif" font-size="10.5" fill="#b8b4a8">every object, and every end of every association, is one of these</text>
+
+  <!-- the id -->
+  <g font-family="'IBM Plex Mono', ui-monospace, Menlo, monospace" font-size="9" fill="#8d938f">
+    <text x="300" y="196">63</text>
+    <text x="558" y="196" text-anchor="end">40</text>
+    <text x="566" y="196">39</text>
+    <text x="1000" y="196" text-anchor="end">0</text>
+  </g>
+  <text x="431" y="227" font-family="'Cinzel', Georgia, serif" font-size="15" fill="#eda268" text-anchor="middle" letter-spacing="0.05em">logical db</text>
+  <text x="431" y="243" font-family="'IBM Plex Mono', ui-monospace, Menlo, monospace" font-size="9.5" fill="#eda268" text-anchor="middle">24 bits</text>
+  <text x="781" y="227" font-family="'Cinzel', Georgia, serif" font-size="15" fill="#ece7dc" text-anchor="middle" letter-spacing="0.05em">sequence</text>
+  <text x="781" y="243" font-family="'IBM Plex Mono', ui-monospace, Menlo, monospace" font-size="9.5" fill="#b8b4a8" text-anchor="middle">40 bits, the object itself</text>
+  <text x="1016" y="224" font-family="'IBM Plex Mono', ui-monospace, Menlo, monospace" font-size="11" fill="#ece7dc">568447511589576</text>
+  <text x="1016" y="240" font-family="'Spectral', Georgia, serif" font-size="9.5" fill="#8d938f">logical db 517, object 29 384</text>
+
+  <!-- id to logical dbs -->
+  <path d="M431,256 L431,296" fill="none" stroke="#d8793f" stroke-width="1.6" marker-end="url(#age)"/>
+  <text x="443" y="274" font-family="'Spectral', Georgia, serif" font-size="10.5" fill="#eda268">these 24 bits name the logical database that holds the object</text>
+  <text x="443" y="290" font-family="'Spectral', Georgia, serif" font-size="10.5" fill="#8d938f">so a route is a shift, not a lookup &mdash; and nothing has to resolve a name</text>
+
+  <!-- logical databases -->
+  <g font-family="'Cinzel', Georgia, serif" font-size="15" fill="#ece7dc" letter-spacing="0.05em">
+    <text x="316" y="331">logical db 4</text>
+    <text x="596" y="331">logical db 517</text>
+    <text x="876" y="331">logical db 1 902</text>
+  </g>
+  <g fill="#202524" stroke="#8d938f" stroke-width="1">
+    <rect x="316" y="341" width="62" height="20"/>
+    <rect x="386" y="341" width="62" height="20"/>
+    <rect x="456" y="341" width="62" height="20"/>
+    <rect x="596" y="341" width="62" height="20"/>
+    <rect x="876" y="341" width="62" height="20"/>
+  </g>
+  <g font-family="'IBM Plex Mono', ui-monospace, Menlo, monospace" font-size="9" fill="#ece7dc" text-anchor="middle">
+    <text x="347" y="355">Issue</text>
+    <text x="417" y="355">Comment</text>
+    <text x="487" y="355">Comment</text>
+    <text x="627" y="355">User</text>
+    <text x="907" y="355">Label</text>
+  </g>
+  <g font-family="'Spectral', Georgia, serif" font-size="10" fill="#b8b4a8">
+    <text x="316" y="385">colocated with its issue on create</text>
+    <text x="596" y="385">created in another request</text>
+    <text x="876" y="385">shared, pointed at from everywhere</text>
+  </g>
+  <text x="300" y="418" font-family="'Spectral', Georgia, serif" font-size="10.5" fill="#b8b4a8">each one owns its own range of ids, so no two can ever mint the same id &mdash; and an association may point into any of them</text>
+
+  <!-- logical dbs to actors -->
+  <path d="M352,430 L352,452" fill="none" stroke="#8d938f" stroke-width="1.2" marker-end="url(#agd)"/>
+  <text x="364" y="446" font-family="'Spectral', Georgia, serif" font-size="10.5" fill="#b8b4a8">each lives on exactly one actor at a time</text>
+
+  <!-- actors -->
+  <g font-family="'Cinzel', Georgia, serif" font-size="17" fill="#ece7dc" letter-spacing="0.05em">
+    <text x="318" y="487">Actor A</text>
+    <text x="758" y="487">Actor B</text>
+  </g>
+  <g fill="#202524" stroke="#8d938f" stroke-width="1">
+    <rect x="318" y="500" width="94" height="22"/>
+    <rect x="421" y="500" width="94" height="22"/>
+    <rect x="524" y="500" width="94" height="22"/>
+    <rect x="758" y="500" width="94" height="22"/>
+    <rect x="861" y="500" width="94" height="22"/>
+  </g>
+  <rect x="318" y="500" width="94" height="22" fill="none" stroke="#d8793f" stroke-width="1.6"/>
+  <g font-family="'IBM Plex Mono', ui-monospace, Menlo, monospace" font-size="9" text-anchor="middle" fill="#b8b4a8">
+    <text x="365" y="514" fill="#eda268">logical db 4</text>
+    <text x="468" y="514">logical db 517</text>
+    <text x="571" y="514" fill="#8d938f">+ 38 more</text>
+    <text x="805" y="514">logical db 1 902</text>
+    <text x="908" y="514" fill="#8d938f">+ 12 more</text>
+  </g>
+  <g font-family="'Spectral', Georgia, serif" font-size="10.5" fill="#b8b4a8">
+    <text x="318" y="546">one actor holds many logical databases</text>
+    <text x="758" y="546">created with a location hint, near its users</text>
+  </g>
+  <path d="M644,511 L732,511" fill="none" stroke="#d8793f" stroke-width="1.8" marker-end="url(#age)"/>
+  <text x="688" y="502" font-family="'IBM Plex Mono', ui-monospace, Menlo, monospace" font-size="9" fill="#eda268" text-anchor="middle">moves</text>
+
+  <text x="300" y="590" font-family="'Spectral', Georgia, serif" font-size="11" fill="#b8b4a8">a logical database moves between actors as load changes</text>
+  <text x="300" y="608" font-family="'Spectral', Georgia, serif" font-size="11" fill="#eda268">every id inside it stays exactly the same, so nothing that points at it has to be told</text>
+</svg>
+    </div>
+    <figcaption>Read it downward. A graph of objects and associations; every endpoint in it is a 64-bit id; the top 24 bits of that id name a logical database; and a logical database is the thing that actually sits on an actor &mdash; and moves between them. Nothing above the bottom layer knows or cares which actor it is on.</figcaption>
+  </figure>
+
+  <div class="reading">
+    <div>
+      <p class="k">THE GRAPH</p>
+      <p>What the application writes: typed objects with a JSON payload, and typed, ordered associations between them. Nothing else.</p>
+    </div>
+    <div>
+      <p class="k">THE ID</p>
+      <p>Stable and unique for the life of the graph. It is both the name of an object and the route to it, which is why a cross-database read needs no lookup.</p>
+    </div>
+    <div>
+      <p class="k">LOGICAL DATABASES</p>
+      <p>The unit of placement. Each owns a slab of the id space, so two of them can never mint the same id, and each can be moved whole.</p>
+    </div>
+    <div>
+      <p class="k">ACTORS</p>
+      <p>The machines. One actor holds many logical databases until some of them get hot; a small graph is one actor, and growing to many changes no application code.</p>
+    </div>
+  </div>
+
+  <footer>
+    <p>DOCS/HLEKK-AT-A-GLANCE.SVG</p>
+    <svg viewBox="0 0 44 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.6"><rect x="1" y="5" width="26" height="14" rx="7"/><rect x="22" y="2" width="12" height="20" rx="6"/><rect x="30" y="5" width="13" height="14" rx="7"/></g></svg>
+  </footer>
+</div>
