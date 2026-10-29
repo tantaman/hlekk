@@ -182,6 +182,7 @@ A projection is a named selection of the catalog, declared for the product that 
 - **Fields can be narrowed.** `fields` limits what a type exposes. A create is generated only when the projection holds every required field; an update writes only projected fields.
 - **Isolation by selection.** issues-web's `User` has no listing purchases; the marketplace app's projection includes them. Selection, not imports, is what keeps any type from becoming a god class.
 - **Projections live beside the domain files**, so a plan sees who uses what, and refuses to remove a type that a projection still includes.
+- **A projection's hash covers what it resolved to, not the catalog version**, which a request carries separately. That is what lets a catalog change touching none of a projection's entries leave its client untouched.
 
 ### Generated code
 
@@ -819,6 +820,8 @@ An edge list lives on id1's host, while its targets may live anywhere. Indexed `
 
 A local index can't answer "user by email": the coordinator doesn't know which host to ask. Global indexes live in their own vshards, keyed by `hash(value)`, so every entry for one value has one home and uniqueness is checked there, on one host, in one transaction. Their own vshards, so a hot index doesn't drag a data vshard around with it and either can move without the other; entries travel with the vshard like any other row.
 
+Index vshards are not in the allocator's active set: a root placed in one would tie a hot index to unrelated data and leave neither able to move without the other.
+
 Uniqueness uses reserve → create → confirm. The reservation and its check are one transaction on the index vshard's host, so two callers racing for a value cannot both win. The create is a second write, on another host, which is why the three steps cannot be one transaction: if it fails the reservation is released, and if the caller dies first the reservation expires and is swept, so a crash can't hold a value forever. A reserved value reads as absent, since the object does not exist yet and the reserving caller may never confirm it.
 
 Values are normalized once, in one place, before they are hashed or compared — case and surrounding space don't make an email distinct, and two spellings reaching two entries would make the constraint a lie.
@@ -929,12 +932,14 @@ CREATE INDEX obj_issue_status
 
 Build the riskiest parts first: per-host performance, then moves under load. Everything after that builds on a host and a move protocol that are already proven.
 
-1. **One host DO.** Schema, ID helpers, object and edge ops, the write transaction, and `exec()`. Add a fake second host so the frontier path runs from day one. Measure per-DO throughput, since it sets vshard density and cost.
-2. **Directory, schema catalog and many hosts.** Epoch checks, `moved` replies, catalog migrations and projection codegen, Worker route caching, and the async coordinator end to end.
-3. **Stop-the-world vshard moves.** Driven by the directory, run under write load with a chaos harness that kills hosts mid-move. This is the part most likely to be subtly wrong.
-4. **Inverse edges through the outbox.** Same-host inline writes, ordered idempotent delivery, retries across moves.
-5. **Allocator and placement controller.** Initial sharding, batch growth of the active set, automatic moves on storage and request pressure, and colocation with `with`.
-6. **Global unique index.** User by email, with reserve → create → confirm.
+1. **One host DO.** Schema, ID helpers, object and edge ops, the write transaction, and `exec()`. Add a fake second host so the frontier path runs from day one. Measure per-DO throughput, since it sets vshard density and cost. — *built, except the throughput measurement, which needs real DOs*
+2. **Directory, schema catalog and many hosts.** Epoch checks, `moved` replies, catalog migrations and projection codegen, Worker route caching, and the async coordinator end to end. — *built*
+3. **Stop-the-world vshard moves.** Driven by the directory, run under write load with a chaos harness that kills hosts mid-move. This is the part most likely to be subtly wrong. — *built*
+4. **Inverse edges through the outbox.** Same-host inline writes, ordered idempotent delivery, retries across moves. — *built*
+5. **Allocator and placement controller.** Initial sharding, batch growth of the active set, automatic moves on storage and request pressure, and colocation with `with`. — *built*
+6. **Global unique index.** User by email, with reserve → create → confirm. — *built*
+
+What is not built, and is not the deferred work below: the fluent query builder and the `Query` and `Ref` types the generated module imports, so a query is still assembled as a `Plan`; a Workers deployment, so the DO and KV adapters are written and typed but unexercised; and non-unique global index maintenance through the outbox.
 
 After v1: the `changes` log and snapshot-and-tail moves, then regional followers with session tokens.
 
