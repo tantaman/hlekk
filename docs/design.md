@@ -436,7 +436,7 @@ An alarm on the host delivers outbox rows and deletes each one when acknowledged
 
 - **In order, one at a time, per (source vshard, target vshard).** Each inverse edge has exactly one writer, the vshard of its forward edge, so per-source ordering is enough.
 - **Idempotent apply.** Add is an upsert and remove is delete-if-present, so redelivering an op after a lost ack is a no-op.
-- **Moves are retries.** A `moved` reply from the target updates the route cache and the row is retried against the new owner. Outbox rows belong to their source vshard and move with it.
+- **Moves are retries.** Delivery routes through the host's own shard-map cache, filled a chunk at a time from the directory. A `moved` reply from the target updates that cache, and the row is retried against the new owner. Outbox rows belong to their source vshard and move with it.
 
 The inverse of a cross-host edge is eventually consistent. A reader who needs it immediately must read the forward edge.
 
@@ -619,32 +619,86 @@ The directory says where a vshard probably is; the host that owns it decides. St
 - **One directory DO per database** maps each vshard to its host DO name, epoch, home region and jurisdiction.
 - **Stored as ranges.** A database's vshards are created in batches and placed together, so consecutive vshards usually share a host. A new database is one range pointing at one DO; moves break ranges up.
 - **Cached in Workers.** Workers cache the map in isolate memory. It changes only on allocation of new vshards and on moves, so the directory stays out of the request path.
-- **Cold Workers read a snapshot.** A stale route costs only a `moved` reply, so the directory publishes versioned snapshots to Workers KV, and a cold isolate reads that instead of the directory DO.
-- **Snapshots are chunked by vshard range**, so what an isolate holds is bounded by the vshards it routes to, not by the size of the database. See Shard map size.
+- **Cold Workers read a snapshot.** A stale route costs only a `moved` reply, so the directory publishes versioned snapshots to Workers KV, and a cold isolate reads a chunk of one instead of asking the directory DO. The snapshot is a load shield for the directory's request ceiling, not a faster path: a cold read of classic KV is slower than asking the directory. Long-lived readers skip it and read the directory directly.
+- **Snapshots are chunked by vshard range**, so what a reader holds is bounded by the vshards it routes to, not by the size of the database. See Shard map.
 - **The owner enforces.** Every host request carries the epoch it routed with for each vshard. The host compares it with its own `vshards` row and answers `moved {to, epoch}` on a mismatch.
+
+### Shard map
+
+The directory's SQLite is the only place the whole map exists. Every other reader holds the part of it that it routed to.
+
+```sql
+CREATE TABLE routes (             -- runs: maximal spans of vshards sharing a host and epoch
+  start_vshard INTEGER PRIMARY KEY,
+  host         INTEGER NOT NULL,  -- host index; the DO name is `h-` plus the index
+  epoch        INTEGER NOT NULL
+);
+
+CREATE TABLE hosts (              -- fixed at creation, since a DO never relocates
+  host         INTEGER PRIMARY KEY,
+  region       TEXT,
+  jurisdiction TEXT
+);
+```
+
+A vshard's route is the `routes` row with the greatest `start_vshard` at or below it.
+
+- **Host DO names are derived, not stored.** The name is `h-` plus the host index, so no table of names travels with the map. At 20,000 hosts such a table would be most of a published chunk, and at the 24-bit ceiling it would dwarf the routes themselves.
+- **A run shares a host and an epoch.** Two adjacent vshards on one host at different epochs cannot share a run, so shedding scattered vshards fragments the map twice over: once for the host change and once for the epoch. This is the second reason the placement controller should shed contiguous runs, which move together and therefore share an epoch.
+- **Region is per host**, looked up by host index in `hosts`, rather than carried per entry. A vshard's region is the region of the host that holds it, so moving a vshard is how its region changes.
+
+**Nobody else materializes the whole map.** Every reader fetches by chunk, on demand, and caches what it routed to. The readers differ only in where a miss goes.
+
+| Reader | Lifetime | A miss goes to |
+| --- | --- | --- |
+| Worker isolate | Seconds to minutes | A KV chunk, and the directory when the chunk is absent |
+| Coordinator DO | Hours | The directory |
+| Host DO, delivering the outbox | Hours | The directory |
+
+The chunk is therefore the unit every reader fetches, not an artifact of KV's value cap, and what any one reader holds is bounded by its working set rather than by the size of the database. Ten chunks is about 500 KB whether the database holds two rows or 16 PB.
 
 ### Shard map size
 
-Every isolate that serves queries holds some of this map, so its size is a standing cost rather than a one-time one.
-
-An entry is a run of consecutive vshards on one host: a start vshard, a host index and an epoch. Interning host DO names into a side table keeps an entry to 12 bytes, held as three parallel `Uint32Array`s and binary-searched by vshard with no object allocation per lookup. The side table carries one row per host, name included.
-
-Entry count sits between the number of hosts and the number of vshards. It lands near the bottom when the placement controller sheds contiguous runs and near the top when it sheds individual hot vshards. The column below is the top of that range.
+An entry packs to 12 bytes, a start vshard, a host index and an epoch as three parallel `Uint32Array`s, binary-searched with no allocation per lookup. Entry count sits between the number of hosts and the number of vshards: near the bottom when the controller sheds contiguous runs, near the top when it sheds individual hot vshards. The column below is the top of that range.
 
 | Live data | vshards | Entries, fully fragmented | Map at 12 B/entry |
 | --- | --- | --- | --- |
-| 2 rows | 64 | 1 | ~100 B |
+| 2 rows | 64 | 1 | ~12 B |
 | 64 GB | 64 | 64 | 768 B |
 | 1 TB | ~1,000 | ~1,000 | 12 KB |
 | 100 TB | ~100,000 | ~100,000 | 1.2 MB |
 | 2 PB | ~2M | ~2M | 24 MB |
 | 16 PB | 16.7M | 16.7M | 200 MB |
 
-A whole map fits an isolate to roughly a petabyte of live data. Two things give way before the 24-bit ceiling does: a KV value caps at 25 MB, around 2M entries, and a cold isolate's fetch grows linearly well before that.
-
-So the snapshot is **chunked by vshard range from the start**, a fixed span of vshards per KV key, and an isolate caches chunks rather than the map. A new database is one chunk, so nothing changes for small databases, and nothing has to change at the ceiling. A chunk an isolate has never fetched costs one KV read, and a chunk gone stale costs a `moved` reply, which is already the correction path.
+Persistence is not what constrains this. Even the fully fragmented ceiling is 16.7M rows in the directory's SQLite, one to two gigabytes against a 10 GB limit, where a lookup is a four-page B-tree descent and republishing one chunk is a range scan of a few thousand rows. What cannot hold 200 MB is a Worker isolate, a 25 MiB KV value, and a cold start's fetch. All three are properties of readers, which is why readers hold chunks and the directory holds the map.
 
 **The vshard cap is the map-size knob.** At a 1 GB cap the map carries one entry per gigabyte of live data. A 4 GB cap quarters the map and quadruples the write pause of a stop-the-world move. The deferred `changes` log removes that pressure by making moves snapshot-and-tail, so it is also what would let the cap rise and the map shrink.
+
+### Publishing the shard map
+
+v1 publishes to classic Workers KV, which is generally available. Its only client is the Worker isolate; the long-lived readers go to the directory. The published snapshot is there to absorb isolate cold starts, not to be fast.
+
+One key per span of 4,096 vshards, at `m/<database>/<chunk>`, each chunk self-describing so a reader computes its key from the vshard it wants and does one read:
+
+```
+header  : magic u32 | encVersion u16 | span u32 | chunk u32 | mapVersion u64 | nEntries u32
+entries : u32 starts[nEntries] | u32 hosts[nEntries] | u32 epochs[nEntries]
+```
+
+An absent chunk means ask the directory. There is no head key: with classic KV a version check costs as much as the chunk, so a reader that wants to know whether its copy is current refetches it, and `moved` covers the rest.
+
+A 64-vshard database is one chunk of one entry, about 40 bytes. 1 TB is one chunk of 12 KB. 100 TB is 25 chunks of about 50 KB. The 24-bit ceiling is 4,096 chunks, each far below the value cap.
+
+**Four decisions are expensive to revisit. The rest is not.** At 64 vshards and one entry the encoding is unmeasurable, so JSON would serve build plan step 2 as long as the format carries its version number.
+
+1. **Host DO names derive from the host index**, so the map never carries a name table.
+2. **A run shares a host and an epoch**, which is what makes contiguous-run shedding a map-size decision and not only a load one.
+3. **Chunked from the first write**, span 4,096. The chunk is the unit every reader fetches and also the write-rate domain, since classic KV allows one write per second per key.
+4. **One namespace, keys prefixed by database.** Classic KV caps namespaces at 1,000 per account, and databases are scoped by binding, so a deployment has few; a hosted multi-tenant deployment would not. This is the one place the KV Instant path diverges.
+
+**Coalesce map writes.** The controller publishes once per rebalance, not once per move. On classic KV a chunk rewritten per move is rate-limited at one write per second; on KV Instant the same pattern costs $0.10 an operation, so shedding 1,000 vshards one write at a time would cost $100 against $0.10 coalesced.
+
+**Later: Workers KV Instant.** Announced October 2026 and in private beta, it is the same API over Quicksilver: 1.62 ms p99 reads against classic KV's 287 ms, and 256 ms p99 global replication against 4.38 s. It would make the snapshot a latency win as well as a load shield, and cheap enough to poll for a version, which would turn `moved` from the primary staleness mechanism into a backstop. Its envelope is 1 MB per namespace over at most 10,000 keys, which holds a whole map to roughly 80 TB at 12 bytes an entry. Two things to note: the 1 MB is per namespace rather than per key, so chunking does not escape it, and a namespace per database runs back into the 1,000-namespace cap. Adoption adds a head key carrying the map version and chunk index, polled on a timer rather than per request.
 
 ### Moving a vshard (v1, stop-the-world)
 
@@ -663,6 +717,9 @@ The source stays fenced from step 1 until step 5, so the two hosts never both ac
 ### When to move
 
 A placement controller in the directory DO watches each host's storage bytes and request rate. When a host crosses a threshold, it moves its largest or busiest vshards to a new or underused host. Thresholds are an open question.
+
+- **Prefer a contiguous run.** A run moves as one unit and so shares an epoch, which keeps it to one shard-map entry, where shedding scattered vshards costs an entry each. Under the hash allocation above the vshards in a batch fill at about the same rate, so a run is about as good a choice as the single largest or busiest one.
+- **Publish once per rebalance.** The controller coalesces shard-map writes rather than writing per move. See Publishing the shard map.
 
 ## Indexing
 
@@ -707,6 +764,8 @@ CREATE INDEX obj_issue_status
 | [Row size](https://developers.cloudflare.com/durable-objects/platform/limits/) | 2 MB | Object payload cap |
 | [DO location](https://developers.cloudflare.com/durable-objects/reference/data-location/) | Fixed after creation; `locationHint` is best-effort | Region changes are vshard moves to new hosts |
 | [Integer precision](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/) | Imprecise above 2^53 in JS | IDs stored as BLOBs |
+| [Workers KV value and write rate](https://developers.cloudflare.com/kv/platform/limits/) | 25 MiB per value; 1 write/sec per key | Shard map published in chunks, coalesced to one write per rebalance |
+| [Workers KV propagation](https://developers.cloudflare.com/kv/concepts/how-kv-works/) | Up to 60 seconds, 4.38 s p99 | A published route is a hint; the owner's epoch check corrects it |
 
 ### Design limits
 
@@ -728,6 +787,8 @@ CREATE INDEX obj_issue_status
 - [ ] vshard size cap and the placement controller's move thresholds. The cap trades a move's write pause against the size of the shard map.
 - [ ] Initial vshard count `N` (64 proposed), and whether it is fixed or a creation-time parameter.
 - [ ] Whether the placement controller prefers shedding a contiguous run of vshards, keeping the shard map compact, over shedding the single largest or busiest one.
+- [ ] Whether to adopt Workers KV Instant for the published snapshot once it is generally available, and whether a namespace per database is workable against 1,000 namespaces per account.
+- [ ] How often a reader polls the map version once there is a head key cheap enough to poll.
 - [ ] The affinity key a root object hashes into the active set, and what to use when a request has none.
 - [ ] Chunk span for KV shard-map snapshots.
 - [ ] Colocation group limit, and what `with` does when the parent's vshard is full: error or spill.
