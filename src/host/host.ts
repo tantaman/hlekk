@@ -672,7 +672,9 @@ export class Host {
         if (inverse !== undefined) this.#dispatch(source, { kind: "remove", atype: inverse, id1: t, id2: id });
         if (edge.onDelete !== "cascade") continue;
         if (vshardOf(t) === source) this.#erase(t, seen);
-        else this.#dispatch(source, { kind: "delete", id: t });
+        // `seen` travels with it: another vshard on this host is another key range in the same
+        // database, so the cascade runs inline, and a cycle through it has nothing else to stop it.
+        else this.#dispatch(source, { kind: "delete", id: t }, seen);
       }
     }
 
@@ -682,13 +684,16 @@ export class Host {
   }
 
   /** Applies an op inline when its vshard is on this host, so a colocated pair is atomic for free, and
-   *  queues it otherwise. Outbox rows belong to the source vshard and move with it. */
-  #dispatch(source: bigint, op: OutboxOp): void {
+   *  queues it otherwise. Outbox rows belong to the source vshard and move with it.
+   *
+   *  `seen` is the cascade this op is part of, where it has one. A delete delivered from elsewhere
+   *  starts its own, and terminates because the object that sent it is already gone. */
+  #dispatch(source: bigint, op: OutboxOp, seen?: Set<Id>): void {
     const target = opTarget(op);
     if (this.#state(target) === "owned") {
       if (op.kind === "add") this.#putEdge(op.atype, op.id1, op.id2, op.time, op.data);
       else if (op.kind === "remove") this.#dropEdge(op.atype, op.id1, op.id2);
-      else this.#erase(op.id, new Set());
+      else this.#erase(op.id, seen ?? new Set());
       return;
     }
     const next = this.sql.all<{ seq: number }>(

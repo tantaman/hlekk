@@ -180,6 +180,28 @@ export class LocalCluster {
     }
   }
 
+  /** Spreads the vshards a new database starts with over several hosts, in the contiguous blocks the
+   *  placement controller would leave behind. Only sound on an empty database, which is why it hands
+   *  the vshard over directly rather than through the move protocol: nothing is copied because there
+   *  is nothing in it yet.
+   *
+   *  A test that writes before doing this writes everything to host 0, where an inverse edge is
+   *  written inline and no request is ever routed anywhere. */
+  scatter(hosts: number): void {
+    const all = this.directory
+      .hostIndexes()
+      .flatMap((h) => this.directory.vshardsOn(h))
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const per = Math.ceil(all.length / hosts);
+    const moving = all
+      .map((vshard, i) => ({ vshard, host: Math.min(hosts - 1, Math.floor(i / per)), epoch: 0 }))
+      .filter((e) => this.directory.resolve(e.vshard)!.host !== e.host);
+    for (const e of moving) this.host(e.host); // creates the DO and registers it
+    for (const e of moving) this.host(this.directory.resolve(e.vshard)!.host).purge(e.vshard.toString());
+    this.directory.assignMany(moving);
+    this.adoptAll();
+  }
+
   /** Publishes the map. Once per rebalance, not once per move: a chunk rewritten per move is rate
    *  limited on classic KV and expensive on KV Instant. */
   async publish(): Promise<void> {

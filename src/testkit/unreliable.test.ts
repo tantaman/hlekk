@@ -8,7 +8,7 @@ import { Deliverer } from "../host/outbox.ts";
 import type { Json } from "../query/types.ts";
 import { deterministic, seeded } from "../runtime/runtime.ts";
 import { generateGraph, generateQuery, replay } from "./generate.ts";
-import { Comment, Issue, LOCK, User, issueComments, issueOwner, userOwned } from "./schema.ts";
+import { Comment, FIXED, Issue, LOCK, User, issueComments, issueOwner, userOwned } from "./schema.ts";
 import { Dropped, unreliable } from "./unreliable.ts";
 import type { Faults } from "./unreliable.ts";
 
@@ -32,8 +32,8 @@ const over = (c: LocalCluster, faults: Faults, faultSeed = 1) => {
 /** A graph laid down and spread over the hosts, with the answer to one query recorded. */
 async function scene(seed: number) {
   const c = await cluster(seed);
-  const script = generateGraph(seeded(seed), { objects: 20, vshards: 5, edges: 24 });
-  const laid = await replay(c.client(), script);
+  const script = generateGraph(seeded(seed), FIXED, { objects: 20, vshards: 5, edges: 24 });
+  const laid = await replay(c.client(), FIXED, script);
   await c.deliverAll();
   const r = seeded(seed ^ 0x33);
   for (const vshard of script.vshards) {
@@ -45,7 +45,7 @@ async function scene(seed: number) {
   await c.publish();
 
   const root = laid.ids[laid.types.findIndex((t) => t === "Issue")] ?? laid.ids[0];
-  const build = () => generateQuery(seeded(seed ^ 0x77), "Issue", Issue.gen(root) as never, { depth: 3 });
+  const build = () => generateQuery(seeded(seed ^ 0x77), FIXED, "Issue", Issue.gen(root) as never, { depth: 3 });
   const truth = canonical((await build().run(c.client())) as unknown as Json);
   return { c, root, build, truth };
 }

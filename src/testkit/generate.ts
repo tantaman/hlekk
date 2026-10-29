@@ -3,22 +3,34 @@
 // A graph is generated as a script of operations rather than written straight into a cluster, so the
 // same script can be replayed against two clusters whose data sits in different places. Ids come from
 // a vshard's own sequence, so replaying the same script in the same order produces the same ids
-// wherever the vshards happen to live — which is what lets two runs be compared at all.
+// wherever the vshards happen to live — which is what lets two runs be compared at all. A delete does
+// not give its sequence number back, so a script that deletes replays to the same ids too.
+//
+// Every operation names objects by their position in the script, not by id: the script is written
+// before any id exists.
 
 import type { Hlekk } from "../client/client.ts";
 import type { Fields, Id, Json } from "../query/types.ts";
 import type { Random } from "../runtime/runtime.ts";
 import type { Query } from "../schema/query.ts";
-import { Comment, Issue, Label, User, comparable, outgoing, types } from "./schema.ts";
-import type { Outgoing } from "./schema.ts";
+import type { EdgeType, FieldMap } from "../schema/define.ts";
+import type { Shape } from "./shape.ts";
+import { storedOut } from "./shape.ts";
+
+/** A payload, and which of the script's objects its id fields point at. */
+interface Written {
+  data: Fields;
+  refs: Record<string, number>;
+}
 
 export type Op =
-  | { kind: "create"; type: TypeName; vshard: string; data: Fields }
+  | ({ kind: "create"; type: string; vshard: string } & Written)
   /** Hard colocation: the new object takes the vshard of an object already made. */
-  | { kind: "with"; type: TypeName; parent: number; data: Fields }
-  | { kind: "assoc"; rel: string; from: number; to: number; time: number; data: Fields | null };
-
-export type TypeName = keyof typeof types;
+  | ({ kind: "with"; type: string; parent: number } & Written)
+  | ({ kind: "update"; at: number; /** The version to require, or null to write unconditionally. */ expect: number | null } & Written)
+  | { kind: "erase"; at: number }
+  | { kind: "assoc"; atype: number; from: number; to: number; time: number; data: Fields | null }
+  | { kind: "unassoc"; atype: number; from: number; to: number };
 
 export interface Script {
   ops: Op[];
@@ -33,112 +45,162 @@ export interface GraphOptions {
   vshards?: number;
   /** How many edges to write. */
   edges?: number;
+  /** How many objects to update. */
+  updates?: number;
+  /** How many objects to delete. A delete applies every edge type's onDelete, so it reaches further
+   *  than the one object and is the only operation that can leave an edge pointing at nothing. */
+  deletes?: number;
+  /** How many edges to take back out. */
+  removes?: number;
 }
 
-const TYPE_NAMES: TypeName[] = ["Issue", "Comment", "User", "Label"];
-
-/** A payload for a type, from a small pool of values so filters actually match some rows. */
-function payload(r: Random, type: TypeName, authors: number[], ids: Id[]): Fields {
-  switch (type) {
-    case "Issue":
-      return { title: r.pick(["t0", "t1", "t2"]), status: r.pick(["open", "closed"]) };
-    case "Comment": {
-      // authorId points at a user already made, so the field relationship has somewhere to land.
-      const author = authors.length > 0 ? ids[r.pick(authors)] : "0";
-      return { body: r.pick(["b0", "b1", "b2"]), score: r.int(4), authorId: author };
-    }
-    case "User":
-      return { name: r.pick(["u0", "u1", "u2"]), rank: r.int(3) };
-    case "Label":
-      return { name: r.pick(["l0", "l1"]) };
-  }
-}
-
-export function generateGraph(r: Random, opts: GraphOptions = {}): Script {
+export function generateGraph(r: Random, shape: Shape, opts: GraphOptions = {}): Script {
   const count = opts.objects ?? 24;
   const spread = opts.vshards ?? 6;
   const edges = opts.edges ?? 32;
+  const names = Object.keys(shape.types);
   // Vshards picked from the batch a new database starts with.
   const vshards = [...new Set([...Array(spread)].map(() => String(r.int(64))))];
 
   const ops: Op[] = [];
-  const made: TypeName[] = [];
-  const authors: number[] = [];
-  const placeholderIds: Id[] = [];
+  /** The type of the object each position made. */
+  const made: string[] = [];
+  const byType = new Map<string, number[]>();
+  const ref = (target: string) => {
+    const positions = byType.get(target);
+    return positions && positions.length > 0 ? r.pick(positions) : undefined;
+  };
 
-  // Users first, so a comment's authorId can point at one.
   for (let i = 0; i < count; i++) {
-    const type: TypeName = i < 3 ? "User" : r.pick(TYPE_NAMES);
-    const data = payload(r, type, authors, placeholderIds);
+    // The first few cover every type, so an id field and an edge both have somewhere to land.
+    const type = i < names.length ? names[i] : r.pick(names);
+    const { data, refs } = shape.payload(r, type, ref);
     // A third of objects are colocated with something already made, which is how a colocation group
     // forms and the only way two objects are guaranteed to share a host.
-    const parents = made.map((_, j) => j).filter((j) => made[j] === type || type === "Comment");
-    if (parents.length > 0 && r.chance(0.3)) {
-      ops.push({ kind: "with", type, parent: r.pick(parents), data });
+    if (made.length > 0 && r.chance(0.3)) {
+      ops.push({ kind: "with", type, parent: r.int(made.length), data, refs });
     } else {
-      ops.push({ kind: "create", type, vshard: r.pick(vshards), data });
+      ops.push({ kind: "create", type, vshard: r.pick(vshards), data, refs });
     }
-    if (type === "User") authors.push(i);
+    byType.set(type, [...(byType.get(type) ?? []), i]);
     made.push(type);
-    placeholderIds.push("0"); // filled in on replay
   }
+
+  /** Edges the script has written, so a remove mostly lands on one rather than on nothing. */
+  const written: { atype: number; from: number; to: number }[] = [];
+  const positionsOf = (type: string) => byType.get(type) ?? [];
 
   for (let i = 0; i < edges; i++) {
     const from = r.int(made.length);
-    const out = outgoing[made[from]].filter((o) => o.countable); // stored edges only
+    const out = storedOut(shape, made[from]);
     if (out.length === 0) continue;
     const rel = r.pick(out);
-    const candidates = made.map((_, j) => j).filter((j) => made[j] === rel.to);
+    const candidates = positionsOf(rel.to);
     if (candidates.length === 0) continue;
+    const to = r.pick(candidates);
     ops.push({
       kind: "assoc",
-      rel: rel.name,
+      atype: rel.atype!,
       from,
-      to: r.pick(candidates),
+      to,
       // A small pool of times, so ties happen and the id tie-break is exercised.
       time: r.int(8),
       data: r.chance(0.3) ? { tag: r.pick(["x", "y"]) } : null,
     });
+    written.push({ atype: rel.atype!, from, to });
   }
+
+  // Updates, removes and deletes are shuffled into the tail rather than each run as a block, so a
+  // delete can land on an object a later edge write still names.
+  const tail: Op[] = [];
+  for (let i = 0; i < (opts.updates ?? 0); i++) {
+    const at = r.int(made.length);
+    const { data, refs } = shape.payload(r, made[at], ref);
+    // An absolute version rather than one that was read: a guess conflicts about as often as it
+    // holds, which is what puts a conflict on the path at all.
+    tail.push({ kind: "update", at, expect: r.chance(0.3) ? 1 + r.int(3) : null, data, refs });
+  }
+  for (let i = 0; i < (opts.removes ?? 0); i++) {
+    if (written.length === 0) break;
+    // Mostly an edge that exists; sometimes one that never did, which must be a no-op and not an
+    // error.
+    const e = r.chance(0.85) ? r.pick(written) : { ...r.pick(written), to: r.int(made.length) };
+    tail.push({ kind: "unassoc", atype: e.atype, from: e.from, to: e.to });
+  }
+  for (let i = 0; i < (opts.deletes ?? 0); i++) {
+    tail.push({ kind: "erase", at: r.int(made.length) });
+  }
+  ops.push(...r.shuffle(tail));
+
   return { ops, vshards };
 }
 
-const relByName = new Map<string, Outgoing>(
-  Object.values(outgoing)
-    .flat()
-    .map((o) => [o.name, o]),
-);
+/** What one operation did. A replay compares these between two clusters: an operation that was
+ *  refused on one and accepted on the other is a difference, however the data ends up. */
+export type Outcome = { ok: true } | { ok: false; error: string };
 
-const otypeOf: Record<TypeName, number> = {
-  Issue: Issue.otype,
-  Comment: Comment.otype,
-  User: User.otype,
-  Label: Label.otype,
-};
+export interface Replayed {
+  /** The id each create made, in the script's order. */
+  ids: Id[];
+  /** The type at each position. */
+  types: string[];
+  /** One per operation, in the script's order. */
+  outcomes: Outcome[];
+}
 
-/** Replays a script, returning the ids it made, in order. Sequential, so two replays of one script
- *  hand out the same ids. */
-export async function replay(db: Hlekk, script: Script): Promise<{ ids: Id[]; types: TypeName[] }> {
+const failed = (e: unknown): Outcome => ({ ok: false, error: e instanceof Error ? e.name : String(e) });
+
+/** Replays a script. Sequential, so two replays of one script hand out the same ids.
+ *
+ *  `settle` runs between operations where one is given: an inverse that crosses a vshard is queued
+ *  rather than written, and an operation that reads what an earlier one queued would otherwise see
+ *  the cluster at a point the script cannot describe. */
+export async function replay(db: Hlekk, shape: Shape, script: Script, settle?: () => Promise<unknown>): Promise<Replayed> {
   const ids: Id[] = [];
-  const kinds: TypeName[] = [];
+  const kinds: string[] = [];
+  const outcomes: Outcome[] = [];
+  const otypeOf = (type: string) => shape.types[type].otype;
+  /** An id field's placeholder, resolved to whatever the position it names actually became. */
+  const fill = (w: { data: Fields; refs: Record<string, number> }): Record<string, Json> => {
+    const data = { ...w.data };
+    for (const [field, at] of Object.entries(w.refs)) data[field] = ids[at];
+    return data;
+  };
+
   for (const op of script.ops) {
-    if (op.kind === "assoc") {
-      const rel = relByName.get(op.rel)!;
-      const atype = (rel.rel as { atype: number }).atype;
-      await db.assocAdd(atype, ids[op.from], ids[op.to], op.time, op.data as Record<string, Json> | null);
-      continue;
+    try {
+      switch (op.kind) {
+        case "create":
+          ids.push(await db.create(otypeOf(op.type), fill(op), { vshard: op.vshard }));
+          kinds.push(op.type);
+          break;
+        case "with":
+          ids.push(await db.create(otypeOf(op.type), fill(op), { with: ids[op.parent] }));
+          kinds.push(op.type);
+          break;
+        case "update":
+          await db.update(ids[op.at], fill(op), op.expect === null ? {} : { expect: op.expect });
+          break;
+        case "erase":
+          await db.delete(ids[op.at]);
+          break;
+        case "assoc":
+          await db.assocAdd(op.atype, ids[op.from], ids[op.to], op.time, op.data as Record<string, Json> | null);
+          break;
+        case "unassoc":
+          await db.assocRemove(op.atype, ids[op.from], ids[op.to]);
+          break;
+      }
+      outcomes.push({ ok: true });
+    } catch (e) {
+      // A create that cannot land would shift every later position, so it is not survivable; every
+      // other refusal is part of what the script is testing.
+      if (op.kind === "create" || op.kind === "with") throw e;
+      outcomes.push(failed(e));
     }
-    // authorId was a placeholder in the script; point it at the user that index actually became.
-    const data = { ...op.data };
-    if (op.type === "Comment" && typeof data.authorId === "string") {
-      const user = kinds.findIndex((k) => k === "User");
-      data.authorId = user >= 0 ? ids[user] : "0";
-    }
-    const at = op.kind === "with" ? { with: ids[op.parent] } : { vshard: op.vshard };
-    ids.push(await db.create(otypeOf[op.type], data as Record<string, Json>, at));
-    kinds.push(op.type);
+    if (settle) await settle();
   }
-  return { ids, types: kinds };
+  return { ids, types: kinds, outcomes };
 }
 
 export interface QueryOptions {
@@ -152,29 +214,30 @@ export interface QueryOptions {
  *  statically, and what is under test is the answer, not the types. */
 export function generateQuery(
   r: Random,
-  root: TypeName,
+  shape: Shape,
+  root: string,
   start: Query<never, unknown>,
   opts: QueryOptions = {},
 ): Query<never, unknown> {
   const depth = opts.depth ?? 3;
   const width = opts.width ?? 2;
 
-  const build = (q: unknown, type: TypeName, left: number): unknown => {
+  const build = (q: unknown, type: string, left: number): unknown => {
     let out = q as Record<string, (...a: unknown[]) => unknown>;
-    const options = outgoing[type];
+    const options = shape.outgoing[type];
 
     // Every level carries a limit. A small one, so a filter's read-ahead window matters.
     out = out.limit(1 + r.int(6)) as typeof out;
 
     if (r.chance(0.5)) {
-      const countable = options.filter((o) => o.countable);
+      const countable = options.filter((o) => o.atype !== undefined);
       if (countable.length > 0) {
         const c = r.pick(countable);
-        out = out.countAs(`n_${c.name}`, c.rel) as typeof out;
+        out = out.countAs(`n_${c.name}`, c.rel as EdgeType<FieldMap, FieldMap, boolean>) as typeof out;
       }
     }
     if (r.chance(0.4)) {
-      const fields = comparable[type];
+      const fields = shape.comparable[type];
       if (fields.length > 0) {
         const f = r.pick(fields);
         out = out.where(f.field, r.pick(["=", "!=", ">", "<", ">=", "<="]), r.pick(f.values)) as typeof out;

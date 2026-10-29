@@ -1,12 +1,17 @@
-// The schema the oracle fuzzes over. Fixed rather than generated: what the oracle is checking is that
-// an answer does not depend on where the data sits, and that needs a schema rich enough to reach
-// across vshards, not a different schema every seed.
+// The hand-written schema the oracle fuzzes over, as one Shape.
 //
-// It has a counted edge with an inverse, an uncounted one, a to-one edge, a field relationship and a
-// self edge, which between them cover every source kind an operator can read.
+// Fixed rather than generated, and kept alongside the generated ones: what the oracle checks is that
+// an answer does not depend on where the data sits, and a schema that changes every seed makes a
+// failure harder to read. This one is rich enough to reach across vshards — a counted edge with an
+// inverse, an uncounted one, a to-one edge, a field relationship and a self edge, which between them
+// cover every source kind an operator can read.
 
 import { Catalog, plan } from "../catalog/catalog.ts";
+import type { Fields } from "../query/types.ts";
+import type { Random } from "../runtime/runtime.ts";
 import { defineObject, edge, fieldRel, id, num, oneOf, str } from "../schema/define.ts";
+import type { FieldMap, ObjectType } from "../schema/define.ts";
+import type { Outgoing, Payload, Shape } from "./shape.ts";
 
 export const LOCK = plan({
   core: { objects: { "core.user": { fields: { name: "string", rank: "number" } } } },
@@ -58,34 +63,25 @@ export const userOwned = edge("issues.user_owned", at("issues.user_owned"), User
 export const commentAuthor = fieldRel("issues.comment_author", Comment, User, "authorId");
 
 /** Every object type, and every way out of it. The query generator walks this. */
-export const types = { User, Issue, Comment, Label };
+export const types: Record<string, ObjectType<FieldMap>> = { User, Issue, Comment, Label };
 
-export interface Outgoing {
-  name: string;
-  rel: unknown;
-  /** The type it lands on, so the generator can keep going. */
-  to: keyof typeof types;
-  /** Stored edges can be counted; a field relationship cannot. */
-  countable: boolean;
-}
-
-export const outgoing: Record<keyof typeof types, Outgoing[]> = {
+export const outgoing: Record<string, Outgoing[]> = {
   Issue: [
-    { name: "comments", rel: issueComments, to: "Comment", countable: true },
-    { name: "labels", rel: issueLabels, to: "Label", countable: true },
-    { name: "owner", rel: issueOwner, to: "User", countable: true },
-    { name: "related", rel: issueRelated, to: "Issue", countable: true },
+    { name: "comments", rel: issueComments, to: "Comment", atype: issueComments.atype },
+    { name: "labels", rel: issueLabels, to: "Label", atype: issueLabels.atype },
+    { name: "owner", rel: issueOwner, to: "User", atype: issueOwner.atype },
+    { name: "related", rel: issueRelated, to: "Issue", atype: issueRelated.atype },
   ],
   Comment: [
-    { name: "issue", rel: commentIssue, to: "Issue", countable: true },
-    { name: "author", rel: commentAuthor, to: "User", countable: false },
+    { name: "issue", rel: commentIssue, to: "Issue", atype: commentIssue.atype },
+    { name: "author", rel: commentAuthor, to: "User" },
   ],
-  User: [{ name: "owns", rel: userOwned, to: "Issue", countable: true }],
+  User: [{ name: "owns", rel: userOwned, to: "Issue", atype: userOwned.atype }],
   Label: [],
 };
 
-/** Fields that can be compared, per type, with a generator for a plausible value. */
-export const comparable: Record<keyof typeof types, { field: string; values: (string | number)[] }[]> = {
+/** Fields a filter can compare, per type, with the values that occur in payloads. */
+export const comparable: Shape["comparable"] = {
   Issue: [
     { field: "status", values: ["open", "closed"] },
     { field: "title", values: ["t0", "t1", "t2"] },
@@ -100,3 +96,26 @@ export const comparable: Record<keyof typeof types, { field: string; values: (st
   ],
   Label: [{ field: "name", values: ["l0", "l1"] }],
 };
+
+/** A payload from a small pool of values, so a generated filter matches some rows. */
+function payload(r: Random, type: string, ref: (target: string) => number | undefined): Payload {
+  const plain = (data: Fields): Payload => ({ data, refs: {} });
+  switch (type) {
+    case "Issue":
+      return plain({ title: r.pick(["t0", "t1", "t2"]), status: r.pick(["open", "closed"]) });
+    case "Comment": {
+      // authorId points at a user already made, so the field relationship has somewhere to land.
+      const author = ref("User");
+      return {
+        data: { body: r.pick(["b0", "b1", "b2"]), score: r.int(4), authorId: "0" },
+        refs: author === undefined ? {} : { authorId: author },
+      };
+    }
+    case "User":
+      return plain({ name: r.pick(["u0", "u1", "u2"]), rank: r.int(3) });
+    default:
+      return plain({ name: r.pick(["l0", "l1"]) });
+  }
+}
+
+export const FIXED: Shape = { lock: LOCK, types, outgoing, comparable, payload };
