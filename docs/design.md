@@ -61,7 +61,7 @@ If comments were allocated in the issue's vshard, this takes two network hops: o
 
 ## Data model and API
 
-The model is TAO's: typed objects with a JSON payload, and typed, ordered edges between them. Object types and edge types are separate entries in the schema catalog, and app code imports definitions generated for its own projection (see Schema catalog and projections). Names and signatures below are a sketch; the operations are the commitment. Fragments and named queries follow rindle's `apps/example-issue-tracker/shared/app-def.ts`.
+The model is TAO's: typed objects with a JSON payload, and typed, ordered edges between them. Object types and edge types are separate entries in the schema catalog, and app code imports definitions generated for its own projection (see Schema catalog and projections). Names and signatures below are a sketch; the operations are the commitment.
 
 **Objects** have an `id` (u64, as a string), an `otype`, a `version` and a JSON `data` payload of at most 2 MB.
 
@@ -113,7 +113,15 @@ const r = await Issue.gen(id)
 - Every `related` has a limit. A default applies when none is given.
 - `related` over an `edge` reads the newest edges first by `time`. Indexed `where` and `orderBy` are allowed only on edge fields; see Indexing.
 - The result is a normalized graph. Nesting into the query's shape happens last, so each object appears once.
-- Fragments (`defineFragment(Issue, …)` plus `include`) and named, validated queries (`defineQuery(name, validate, build)`) follow rindle's example app. The acting user comes from the server context, never from query arguments.
+- **Queries are built, not declared.** There is no `defineQuery` or `defineFragment`: a query is the builder's value, and reuse is an ordinary function over it. Rindle needs named, validated queries because an untrusted client sends them; hlekk's caller is a Worker, which is already the trusted boundary, so the wrapper would guard nothing. See Later for what brings it back.
+
+```ts
+const card = (q: Query<Issue>) => q.related('owner', issueOwner).related('labels', issueLabels);
+
+const r = await card(Issue.gen(id)).related('comments', issueComments, q => q.limit(50)).run();
+```
+
+- **The plan cache keys on structure, not a name.** A canonical AST and a stable hash identify a query, so hosts cache plans and spot identical concurrent requests whether or not anyone named it, and two structurally identical queries written in different places share an entry. An optional `label` rides along for explain and traces.
 
 ```ts
 type QueryResult = {
@@ -274,7 +282,6 @@ A database is three Cloudflare resources, so scoping a request to one takes a sm
 
 ```ts
 import { Hlekk } from 'hlekk';
-import { User, userAssignedIssues, issueOwner } from './schema.gen';
 
 const open = (env: Env) => Hlekk.from({
   directory: env.HLEKK_DIRECTORY, // DO namespace: one directory DO per database
@@ -282,13 +289,6 @@ const open = (env: Env) => Hlekk.from({
   map:       env.HLEKK_MAP,       // KV namespace: m/issues/<chunk>
   database:  'issues',            // names the directory DO; scopes host names and map keys
 });
-
-export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
-    const db = open(env);
-    // …
-  },
-};
 ```
 
 `database` is what scopes the other two, so many databases can share one pair of namespaces. A deployment that gives each database its own namespaces still works, and the names do not change.
@@ -301,25 +301,26 @@ Memoization rather than a module-scope constant is what makes this work at all, 
 
 ### Queries
 
-A query starts from IDs the caller already holds and follows edges from there.
+A query is built where it is used, from IDs the caller already holds, and follows edges from there. There is no query registry and nothing to declare up front.
 
 ```ts
-const r = await db.query(
-  User.gen(viewer)
-    .related('assigned', userAssignedIssues, q => q.related('owner', issueOwner).limit(50))
-    .countAs('assignedCount', userAssignedIssues)
-);
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const db = open(env);
+    const viewer = await authenticate(req);   // the app's job, not the database's
+
+    const r = await db.query(
+      User.gen(viewer)
+        .related('assigned', userAssignedIssues, q => q.related('owner', issueOwner).limit(50))
+        .countAs('assignedCount', userAssignedIssues)
+    );
+
+    return Response.json(r);
+  },
+};
 ```
 
-In production a query is named and validated, and the acting user comes from the server context rather than from arguments:
-
-```ts
-export const viewerInbox = defineQuery('viewerInbox',
-  v => ({ limit: v.int(1, 100) }),
-  (args, ctx) => User.gen(ctx.viewer).related('assigned', userAssignedIssues, q => q.limit(args.limit)));
-
-const r = await db.run(viewerInbox, { limit: 50 }, { viewer });
-```
+The acting user is an ID the Worker resolved from its own authenticated state, and the database treats it as any other ID. **Authorization is the application's**, as with any database reached from a trusted server: hlekk decides where an object lives, not who may read it. A caller that forwards an ID straight from a request has authorized nothing, which is the same mistake as interpolating one into SQL.
 
 Point reads and writes route the same way: `db.get`, `db.assoc.*`, `db.create`, `db.update` and `db.txn(anchorId, …)` all resolve a vshard from an ID and go to the one host that owns it. Every request carries the catalog version and projection hash the client was generated against.
 
@@ -876,6 +877,7 @@ CREATE INDEX obj_issue_status
 - [ ] Catalog version skew: how far hosts may lag the newest catalog, and how long a client's catalog version and projection hash stay accepted.
 - [ ] Schema authoring format: JSON files as shown, or a small DSL that compiles to the same JSON.
 - [ ] Whether a projection is only a code boundary, or the server also refuses reads and writes outside it.
+- [ ] Whether authorization stays entirely the application's, as v1 assumes, or the catalog grows a place to express it once a client can send queries.
 - [ ] Where a product outside the schema repo gets the lock for codegen: a published package, or the directory's catalog endpoint.
 
 ## Build plan
@@ -919,5 +921,6 @@ Operators move to the data. The host that owns an edge list runs the operator th
 - **Windows refill at the list's owner.** When a row leaves a limited window, the next row comes from the host holding the list, as with rindle's boundary windows. A filter that reads objects on other hosts makes the refill a cross-host fetch.
 - **A new row hydrates its subtree.** The coordinator runs the ordinary query below it, then subscribes to what that query read.
 - **The view lives in a DO.** A Worker can't receive pushes, so a live query's coordinator is a DO, which can also hold the client's WebSocket.
+- **A client that sends queries brings back named ones.** v1 has no `defineQuery` because its only caller is a trusted Worker. A browser holding a subscription is an untrusted caller, so a subscribable query would have to be defined and validated server-side and named for the client to refer to, which is what rindle's example app does and why.
 - **Open: consistency across hosts.** Changes from different hosts arrive in any order, so a view can briefly show combinations that never existed together. Tracking a write position per vshard and holding changes back would fix it, at a latency cost.
 - **Rindle material:** push paths, boundary windows, the scope directory (who watches what), query families, and how `exists` and flipped joins handle pushes.
