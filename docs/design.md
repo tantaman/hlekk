@@ -697,7 +697,7 @@ The directory says where a vshard probably is; the host that owns it decides. St
 
 - **The caller names the database; the ID names the vshard.** A request is scoped to a database by its binding, and the ID's top 24 bits give the vshard. Neither needs a lookup.
 - **One directory DO per database** maps each vshard to its host DO name, epoch, home region and jurisdiction.
-- **Stored as ranges.** A database's vshards are created in batches and placed together, so consecutive vshards usually share a host. A new database is one range pointing at one DO; moves break ranges up.
+- **Stored per vshard, published as ranges.** The directory holds one row per vshard, which is what keeps assignment from needing a split-and-merge protocol; runs are collapsed when a chunk is published, which is the only place their shape matters. vshards are created in batches and placed together, so consecutive ones usually share a host. A new database publishes as one range pointing at one DO; moves break ranges up.
 - **Cached in Workers.** Workers cache the map in isolate memory. It changes only on allocation of new vshards and on moves, so the directory stays out of the request path.
 - **Cold Workers read a snapshot.** A stale route costs only a `moved` reply, so the directory publishes versioned snapshots to Workers KV, and a cold isolate reads a chunk of one instead of asking the directory DO. The snapshot is a load shield for the directory's request ceiling, not a faster path: a cold read of classic KV is slower than asking the directory. Long-lived readers skip it and read the directory directly.
 - **Snapshots are chunked by vshard range**, so what a reader holds is bounded by the vshards it routes to, not by the size of the database. See Shard map.
@@ -761,11 +761,11 @@ v1 publishes to classic Workers KV, which is generally available. Its only clien
 One key per span of 4,096 vshards, at `m/<database>/<chunk>`, each chunk self-describing so a reader computes its key from the vshard it wants and does one read:
 
 ```
-header  : magic u32 | encVersion u16 | span u32 | chunk u32 | mapVersion u64 | nEntries u32
+header  : magic u32 | encVersion u16 | pad u16 | span u32 | chunk u32 | mapVersion u64 | nEntries u32 | pad u32
 entries : u32 starts[nEntries] | u32 hosts[nEntries] | u32 epochs[nEntries]
 ```
 
-An absent chunk means ask the directory. There is no head key: with classic KV a version check costs as much as the chunk, so a reader that wants to know whether its copy is current refetches it, and `moved` covers the rest.
+The header is padded to 32 bytes so the entry arrays start 4-byte aligned and a reader can view them as `Uint32Array`s over the bytes it already holds, rather than copying. A run's start is relative to the chunk's base and is clamped to it, so a chunk answers on its own; a vshard nothing owns is covered by a run whose host is a reserved sentinel, since otherwise the run before a gap would answer for it. An absent chunk means ask the directory. There is no head key: with classic KV a version check costs as much as the chunk, so a reader that wants to know whether its copy is current refetches it, and `moved` covers the rest.
 
 A 64-vshard database is one chunk of one entry, about 40 bytes. 1 TB is one chunk of 12 KB. 100 TB is 25 chunks of about 50 KB. The 24-bit ceiling is 4,096 chunks, each far below the value cap.
 
