@@ -1,0 +1,728 @@
+# Hlekk: Design
+
+Oct 28, 2026 · @Matt Wonlaw
+
+## Summary
+
+Hlekk, Old Norse for a chain link, is a TAO-style object-and-edge database built on actors. This design targets Cloudflare Durable Objects (DOs) first; the model fits any actor platform whose actors have durable local storage, such as Rivet. The infrastructure, not the application, owns partitioning, placement and capacity. Developers create objects in a logical database and never size, pick or reshard DOs.
+
+**Goals**
+
+- Stable 64-bit object IDs that survive moves between DOs and regions.
+- Graph reads (an object plus related objects, several levels deep) in as few network rounds as the data's locality allows.
+- A database grows from one DO to many with no application changes.
+- Transactions within a colocation group, and inverse edges that are guaranteed to arrive eventually.
+- A small database costs exactly one DO.
+- Teams add object and edge types independently, without a shared god class.
+
+**Non-goals for v1**
+
+- Arbitrary SQL, ad-hoc joins or scans.
+- Transactions across colocation groups.
+- Incremental view maintenance (IVM) and change subscriptions. These are parked, not rejected.
+- Regional read followers and R2 tiering. The design leaves room for both.
+
+D1 already offers SQL with read replicas, up to 10 GB per database. This system targets apps that outgrow one DO, read graph-shaped data, and should not have to shard by hand.
+
+## Principles
+
+1. **Identity, ownership, storage and read serving are separate.** An object's ID never changes. The DO that owns its writes can change. Where cached copies are served is a separate decision again.
+2. **Move, never split.** IDs embed one of many small, fixed logical shards (vshards). Capacity is managed by the allocator and by moving whole vshards between DOs. No split protocol, no log lineage, no transaction group cut in half.
+3. **The query rides, control stays central.** Each host DO resolves everything it holds and ships back what it read. One coordinator runs the query once and batches its reads per host.
+4. **Routing is a hint; the owner enforces.** Cached routes can be stale. The owning DO checks the epoch on every request and answers `moved` when it no longer owns a vshard.
+5. **One mutation, one local transaction.** The ownership check, the data write, counts and the outbox row commit together in one SQLite transaction on one host.
+6. **A restricted API.** Objects, edges (assocs), edge counts and ordered edge-list ranges. No scans, so every operation is cheap to route and cheap to cache.
+7. **Fail loudly.** Storage formats and protocols are chosen so mistakes raise errors instead of corrupting data, for example BLOB IDs and epoch-checked writes.
+8. **Small stays small.** A database that fits in one DO runs in one DO. Scaling out happens only under pressure.
+9. **The catalog is the source of truth.** Object types list only their fields, and edge types are separate entries owned by domains. Code is generated from the catalog, and each product generates a projection holding only the types and edges it uses.
+
+## Motivating examples
+
+An issue tracker exercises every part of the design.
+
+**1. Render an issue page.** One query loads an issue, its comments with their authors, its labels and its owner:
+
+```ts
+Issue.gen(id)
+  .related('comments', issueComments, q => q.related('author', commentAuthor))
+  .related('labels', issueLabels)
+  .related('owner', issueOwner);
+```
+
+If comments were allocated in the issue's vshard, this takes two network hops: one to the issue's host, then one parallel request per host holding labels or users. A coordinator that walked one hop at a time would need four.
+
+**2. Every task assigned to Alice, across projects.** No fan-out. Assigning a task writes `task -assignee-> alice` on the task's host and the inverse `alice -assigned_tasks-> task` on Alice's host. Listing Alice's tasks is one range read on one host.
+
+**3. Look up a user by email.** The coordinator can't know which host holds that user. This needs a global index sharded by `hash(email)`, maintained through the outbox, with reserve → create → confirm for uniqueness.
+
+**4. A popular issue with 50,000 comments.** `related('comments')` always carries a limit and reads the newest edges first from an ordered index. The comment count comes from a maintained counter, not `COUNT(*)`.
+
+**5. A tenant grows from 1 MB to 500 GB.** The application code doesn't change. The allocator keeps placing new objects in vshards with room, and full or busy hosts hand whole vshards to new DOs.
+
+## Data model and API
+
+The model is TAO's: typed objects with a JSON payload, and typed, ordered edges between them. Object types and edge types are separate entries in the schema catalog, and app code imports definitions generated for its own projection (see Schema catalog and projections). Names and signatures below are a sketch; the operations are the commitment. Fragments and named queries follow rindle's `apps/example-issue-tracker/shared/app-def.ts`.
+
+**Objects** have an `id` (u64, as a string), an `otype`, a `version` and a JSON `data` payload of at most 2 MB.
+
+**Edges** (assocs) are directed `(id1, atype, id2)` with a `time` sort key and an optional small JSON `data`. An edge lives on id1's vshard. An edge type can declare an inverse type, maintained automatically.
+
+### Edges are separate from objects
+
+No object type lists its edges, so no object becomes a god class. Each domain owns the edge types it declares, including edges between other domains' types.
+
+- **Edges are values.** Code imports the edges it traverses from its generated module. The output name is chosen where the edge is used, so two products can traverse the same edge under different names.
+- **Two kinds.** A stored edge is ordered by time, counted, and optionally paired with an inverse. A field relationship follows an ID in the source object's payload: no edge write, but no inverse, count or ordering either.
+- **One definition per name and integer.** The catalog rejects a duplicate or a conflicting inverse. Domain prefixes on names keep teams apart.
+
+### Mutations
+
+```ts
+// with: hard colocation (same vshard, transactional with the parent)
+// near: placement hint only
+const cid = await db.create(Comment, { body, authorId }, { with: issueId });
+await db.update(cid, { body: 'edited' });           // bumps version
+await db.delete(cid);                                // each edge type's onDelete applies
+
+await db.assoc.add(issueComments, issueId, cid, { time: Date.now() });
+await db.assoc.remove(issueComments, issueId, cid);
+
+// one local transaction; every touched id must share the anchor's vshard
+await db.txn(issueId, tx => { /* creates, updates, edge writes */ });
+```
+
+### Point reads
+
+```ts
+await db.get([id1, id2]);                                   // objects by id
+await db.assoc.get(issueLabels, issueId, [l1, l2]);         // which edges exist
+await db.assoc.range(issueComments, issueId, { limit: 50, after: cursor });
+await db.assoc.count(issueComments, issueId);
+```
+
+### Graph queries
+
+```ts
+const r = await Issue.gen(id)
+  .related('comments', issueComments, q => q.related('author', commentAuthor).limit(50))
+  .related('labels', issueLabels)
+  .related('owner', issueOwner)
+  .run();
+```
+
+- Every `related` has a limit. A default applies when none is given.
+- `related` over an `edge` reads the newest edges first by `time`. Indexed `where` and `orderBy` are allowed only on edge fields; see Indexing.
+- The result is a normalized graph. Nesting into the query's shape happens last, so each object appears once.
+- Fragments (`defineFragment(Issue, …)` plus `include`) and named, validated queries (`defineQuery(name, validate, build)`) follow rindle's example app. The acting user comes from the server context, never from query arguments.
+
+```ts
+type QueryResult = {
+  root: Id;
+  objects: Record<Id, { otype: string; version: number; data: unknown }>;
+  edges: Record<`${Id}:${string}`, { ids: Id[]; cursor?: string; count?: number }>;
+};
+```
+
+## Schema catalog and projections
+
+The catalog is the source of truth: a versioned, serialized schema, stored as data in each database's directory DO. Code is generated from it, never the other way around, and each product generates only its projection: the types and edges it uses.
+
+This is rindle's flow. In its example app, `server/schema-def.ts` declares the tables, the daemon applies them, and `rindle schema gen` writes `shared/schema.gen.ts` from what the daemon holds; the generated file is a mirror, never a second source. Hlekk differs in two ways. Its serialized form carries what SQL can't (enums, ID references, edge kinds, inverses), so most of rindle's hand-written refinements move into the schema. And generation is per projection, so no generated module holds every team's types.
+
+### Serialized form
+
+Every entry is named `<domain>.<name>`, and its domain owns it. People edit one file per domain, with no integers in it. `schema/issues.json`, owned by the issues team:
+
+```json
+{
+  "objects": {
+    "issues.issue":   { "fields": { "title": "string", "status": { "enum": ["open", "closed"] } } },
+    "issues.comment": { "fields": { "body": "string", "authorId": { "id": "core.user" } } },
+    "issues.label":   { "fields": { "name": "string" } }
+  },
+  "edges": {
+    "issues.issue_comment":  { "from": "issues.issue", "to": "issues.comment",
+                               "inverse": "issues.comment_issue", "onDelete": "cascade" },
+    "issues.issue_label":    { "from": "issues.issue", "to": "issues.label" },
+    "issues.issue_owner":    { "from": "issues.issue", "to": "core.user", "unique": true,
+                               "inverse": "issues.user_owned_issues" },
+    "issues.comment_author": { "from": "issues.comment", "to": "core.user", "field": "authorId" }
+  }
+}
+```
+
+- **Edges are their own entries.** `marketplace.listing_buyer`, from `marketplace.listing` to `core.user`, lives in `schema/marketplace.json` and changes nothing in `core.user`'s entry.
+- **An edge with `field` is a field relationship.** It follows an ID in the source object's payload. Nothing is stored, so it has no atype.
+- **The lock is the canonical form.** Planning a change writes `schema/catalog.lock.json`: every entry, its integer, and the version. Every database applies the same lock, so integers match across development, staging and production.
+
+### Projections
+
+A projection is a named selection of the catalog, declared for the product that uses it. It decides what that product's generated code contains and changes no data. `schema/projections/issues-web.json`:
+
+```json
+{
+  "name": "issues-web",
+  "include": ["issues.*", "core.user"],
+  "fields": { "core.user": ["name"] }
+}
+```
+
+- **Select by name.** A glob takes a whole domain; single entries can come from other domains.
+- **Unselected endpoints become references.** An included edge whose target type isn't selected yields a `Ref`: an ID you can hold, pass on and link to, with no fields.
+- **Fields can be narrowed.** `fields` limits what a type exposes. A create is generated only when the projection holds every required field; an update writes only projected fields.
+- **Isolation by selection.** issues-web's `User` has no listing purchases; the marketplace app's projection includes them. Selection, not imports, is what keeps any type from becoming a god class.
+- **Projections live beside the domain files**, so a plan sees who uses what, and refuses to remove a type that a projection still includes.
+
+### Generated code
+
+`hlekk gen issues-web` reads the lock and writes one module; app code imports from it alone.
+
+```ts
+// schema.gen.ts: generated from catalog v42 for projection issues-web. Do not edit.
+export const projection = { name: 'issues-web', catalog: 42, hash: '9f3c…' } as const;
+
+export const User    = defineObject('core.user', 4, { name: string() });   // narrowed to name
+export const Issue   = defineObject('issues.issue', 1, { title: string(), status: oneOf('open', 'closed') });
+export const Comment = defineObject('issues.comment', 2, { body: string(), authorId: id(User) });
+export const Label   = defineObject('issues.label', 3, { name: string() });
+
+export const issueComments = edge('issues.issue_comment', 1, Issue, Comment);
+export const issueLabels   = edge('issues.issue_label', 2, Issue, Label);
+export const issueOwner    = edge('issues.issue_owner', 3, Issue, User, { unique: true });
+export const commentAuthor = fieldRel('issues.comment_author', Comment, User, 'authorId');
+```
+
+- **Integers on the wire.** Requests name types by integer, so a rename never breaks a deployed client. Names serve people and error messages.
+- **Requests carry the catalog version and projection hash.** A change since that version that touches none of the projection's entries never invalidates the client.
+- **Refinements the schema can't express**, such as a JSON field's TypeScript shape, go in a hand-written module over the generated one, as with rindle's `refineTable`, so they survive regeneration.
+- **Other languages** get generators over the same lock and projection.
+
+### What the catalog holds
+
+| Entry | Holds |
+| --- | --- |
+| Domain | Name, owning team |
+| Object type | Name, otype integer, field schema |
+| Edge type | Name, atype integer (stored edges only), kind (stored or field), source and target types, inverse, data schema, onDelete |
+| Index | Expression indexes per object type; global lookup indexes |
+| Projection | Name, selection, hash |
+| Version | A monotonic number; each applied lock is the next |
+
+Integers are identity and are never reused. Names are labels. Hosts need the whole catalog even though each product sees only its projection: the outbox writes inverses, and deletes apply every team's `onDelete`.
+
+### Migrating
+
+1. **Edit.** A team changes its domain's file; a product changes its projection. Code review on those files is the ownership check.
+2. **Plan.** `hlekk schema plan` diffs the files against the lock, classes each change by its cost (below), allocates integers for new types, and writes lock version N + 1. The lock is reviewed with the files.
+3. **Apply.** Each database's directory compare-and-sets its catalog from version N to N + 1. It re-checks what it can: one definition per name and integer, no integer reused, every reference resolves, and no tombstoned name is reused before a purge.
+4. **Generate.** Products regenerate from the lock. A change outside a projection leaves its generated module unchanged.
+5. **Propagate.** Requests carry the catalog version they were built against. A host behind that version fetches the catalog from the directory before serving; a host ahead of it serves, since nothing is hidden while a registered projection still includes it.
+
+### What a change costs
+
+Objects are stored as JSON, so the catalog is a lens over stored data, not its layout. Most changes edit the lens and touch no rows; hosts pick them up with the next catalog version. Only two kinds of change touch data: a check that existing rows meet a stricter rule, and a build of derived rows such as inverses and indexes.
+
+| Change | Cost | What happens to stored data |
+| --- | --- | --- |
+| Add an object type, edge type or optional field | Catalog only | Nothing |
+| Remove a field | Catalog only | Stays in the JSON, hidden on read; an old client's write of it is dropped |
+| Remove an object or edge type | Catalog only | Writes refused, reads return nothing; rows stay until garbage collection |
+| Rename a field or type | Catalog only | A field aliases its stored key; a type keeps its integer |
+| Make a field optional, or required with a default | Catalog only | A missing value reads as null or the default |
+| Add an enum value, widen an edge's target types, change onDelete | Catalog only | Nothing; applies to later writes and deletes |
+| Change a projection | Catalog only | Nothing; regenerate |
+| Make a field required without a default, narrow a type or enum, add unique | Catalog + check | A background scan per vshard verifies existing rows; new writes follow the rule at once |
+| Add an inverse to an existing edge type, or a global lookup index | Catalog + build | Backfill per vshard; reads of the new data end short until it completes |
+| Add an expression index | Catalog + build | Each host runs one CREATE INDEX when it wakes |
+| Change a field's type or an edge's sort key | Not a schema change | Declare a new field or edge type and migrate in app code |
+
+**Checks commit last.** New writes follow a stricter rule as soon as it is applied; the catalog marks it in force once every vshard's scan passes, like Postgres's `NOT VALID` followed by `VALIDATE CONSTRAINT`. Checks and builds run like vshard moves: the directory drives them per vshard, resumably, with alarms.
+
+**Hidden data still exists.** A removed field's values stay in stored JSON, so its name is tombstoned: re-adding it would bring old values back. Garbage collection, which strips hidden fields and deletes rows of removed types, is optional housekeeping, except as a purge when data must be erased or a name reused.
+
+Deploys expand, then contract. Apply new types to every database before deploying code that uses them; stop using a type in code before removing it.
+
+## Architecture
+
+Three kinds of component: a Worker that coordinates, one directory DO per database that also holds the schema catalog, and many host DOs that own vshards. Reads and writes go from the Worker straight to hosts.
+
+```mermaid
+flowchart TB
+  W["<b>Worker</b><br/>API and query coordinator<br/>Caches routes; one batch per host"]
+  D["<b>Directory DO</b> · one per database<br/>vshard → host DO, epoch, region<br/>Schema catalog, placement, moves"]
+  subgraph H["Host DOs · many per database, each holding many vshards"]
+    A["<b>Host DO A</b><br/>SQLite: objects, assocs,<br/>counts, outbox, vshards<br/>exec(): local hops, frontier<br/>Alarm delivers the outbox"]
+    B["<b>Host DO B</b><br/>Same tables, other vshards<br/>Rejects stale epochs: moved<br/>Upserts delivered inverses"]
+    C["<b>Host DO C (new)</b><br/>Receives a moved vshard<br/>Created with locationHint<br/>or jurisdiction"]
+  end
+  W -->|routes on cache miss| D
+  W <-->|"exec rounds, writes + epochs ⇄ rows, frontier, or moved"| H
+  D -->|fence, install, retire during vshard moves| H
+  A -->|"inverse edges (outbox)"| B
+  B -->|vshard copy during a move| C
+```
+
+The directory is consulted only on a route-cache miss, and it drives vshard moves. When the data is far from the user, the coordinator loop can run on the root's host DO instead of the Worker.
+
+## IDs and sharding
+
+Every ID is an unsigned 64-bit integer whose high bits name its vshard. IDs are strings in the API and in JSON payloads, and 8-byte big-endian BLOBs in SQLite.
+
+IDs are unique within one database: one graph, with one ID space, catalog and directory. The mechanism is TAO's. Each vshard owns the slab of IDs under its prefix, so no two IDs collide. Separate databases number their vshards independently, so an ID means nothing without its database.
+
+| TAO paper | This doc | What it is |
+| --- | --- | --- |
+| Logical shard, each in its own MySQL logical database | vshard | Unit of placement; owns a slab of IDs |
+| Database server | host DO | Holds many vshards |
+| TAO itself, one per company | database | One graph: one ID space, catalog and directory |
+
+Separate ID spaces keep copies cheap: restoring a backup or branching staging off production is a byte copy. The cost is that an ID used against the wrong database resolves to whatever object has that number there, instead of failing.
+
+### Layout
+
+| Bits | Field | Notes |
+| --- | --- | --- |
+| 63–40 | vshard | 24 bits, about 16.7M vshards per database (proposed split) |
+| 39–0 | sequence | Allocated per vshard from `vshards.next_seq` |
+
+**Why 40 sequence bits.** Bytes and IDs are separate budgets: bytes count live data, while IDs count every object ever created, including deleted ones. A colocation group creating 10 objects a second with 2-day retention holds about 1.7M live rows but uses 315M IDs a year. A 2^27 slab would run out in about 5 months; 2^40 lasts about 3,500 years. Vshard bits aren't scarce either: 2^24 vshards at 1 GB each is 16 PB.
+
+**No timestamp.** IDs already ascend within a vshard, the only place they're stored together, so inserts append to the B-tree without a clock. Putting time first would break each vshard's contiguous key range, which moves copy. Putting it inside the sequence costs counter bits and suffers clock skew after a move. Ordering by time uses an edge's `time`, or a `created` field where a type needs one.
+
+### Why BLOB storage
+
+- SQLite coerces an integer string to INTEGER only up to 2^63−1. Above that it becomes a REAL, and two distinct IDs can compare equal. A local `sqlite3` test confirmed this.
+- The DO SQL API returns integers as JS numbers, which lose precision above 2^53.
+- Big-endian bytes sort in unsigned numeric order. One vshard's rows are therefore one contiguous key range.
+- A missed conversion yields an `ArrayBuffer`, which fails loudly, instead of a silently rounded number.
+
+```ts
+const SEQ_BITS = 40n;
+
+function toKey(id: string): ArrayBuffer {
+  const b = new ArrayBuffer(8);
+  new DataView(b).setBigUint64(0, BigInt(id)); // big-endian by default
+  return b;
+}
+const fromKey = (b: ArrayBuffer) => new DataView(b).getBigUint64(0).toString();
+const vshardOf = (id: string) => BigInt(id) >> SEQ_BITS;
+
+// inclusive bounds so the last vshard doesn't wrap past 2^64
+const vshardRange = (v: bigint) => [
+  toKey((v << SEQ_BITS).toString()),
+  toKey((((v + 1n) << SEQ_BITS) - 1n).toString()),
+]; // WHERE id BETWEEN ? AND ?
+```
+
+### vshards
+
+A vshard is the unit of placement, movement and transactions. Each has a soft size cap, proposed at about 1 GB, well under the 10 GB DO limit. The cap is set by move time, not storage: a stop-the-world move pauses the vshard's writes for the whole copy. One host DO holds many vshards.
+
+- **Allocation.** A new object goes to a vshard with room, homed near the creating request. `with: parentId` forces the parent's vshard. A vshard stops taking new root objects at about half its byte cap, keeping the rest for colocated children of objects already in it. It stops taking any once it is full, by bytes or by exhausted sequence.
+- **Region is metadata.** Each vshard records its home region and jurisdiction in the directory, not in the ID. DOs don't relocate after creation, so changing region means moving the vshard to a new host DO created with a `locationHint` or `jurisdiction`.
+- **Moves, never splits.** Hosts shed whole vshards to new hosts. A vshard is never divided: sequences follow creation order, so a split by ID range would cut colocation groups apart by age.
+
+A vshard can still grow from inside, in two ways:
+
+- **Colocation groups.** Objects created `with` a parent share its vshard so they can transact. Groups get a documented size limit. It is the only capacity limit developers see, and only if they opt in.
+- **Large edge lists.** A high-degree object's edges live on its vshard. Overflow storage keyed by `(id1, atype)` is deferred until needed.
+
+**If splits are ever needed**, allocation can make them safe. Each colocation group gets its own sub-slab of the sequence, say 2^16 IDs, with continuation slabs when it fills. A split along slab boundaries never cuts a group, and routing matches either the vshard or the vshard plus slab. New vshards could adopt this without touching old ones.
+
+## Host schema
+
+Each host DO stores its vshards in its built-in SQLite (`ctx.storage.sql`), not D1. Five tables cover v1; a sixth, `changes`, is deferred.
+
+```sql
+-- one row per vshard this host holds: fencing, ID allocation
+CREATE TABLE vshards (
+  vshard   INTEGER PRIMARY KEY,
+  epoch    INTEGER NOT NULL,
+  state    TEXT    NOT NULL,      -- 'owned' | 'fenced' | 'moved'
+  next_seq INTEGER NOT NULL
+);
+
+CREATE TABLE objects (
+  id      BLOB    PRIMARY KEY,    -- 8-byte big-endian u64
+  otype   INTEGER NOT NULL,       -- type name mapped to a small integer
+  version INTEGER NOT NULL,
+  data    TEXT    NOT NULL        -- JSON; rows cap at 2 MB
+) WITHOUT ROWID;
+
+CREATE TABLE assocs (
+  id1   BLOB    NOT NULL,
+  atype INTEGER NOT NULL,
+  id2   BLOB    NOT NULL,
+  time  INTEGER NOT NULL,         -- sort key for range reads
+  data  TEXT,
+  PRIMARY KEY (id1, atype, id2)
+) WITHOUT ROWID;
+CREATE INDEX assocs_range ON assocs (id1, atype, time);
+
+CREATE TABLE assoc_counts (       -- COUNT(*) on a 1M-edge list is O(n)
+  id1   BLOB    NOT NULL,
+  atype INTEGER NOT NULL,
+  n     INTEGER NOT NULL,
+  PRIMARY KEY (id1, atype)
+) WITHOUT ROWID;
+
+CREATE TABLE outbox (             -- inverse edges waiting for delivery
+  vshard        INTEGER NOT NULL, -- source vshard; rows move with it
+  seq           INTEGER NOT NULL,
+  target_vshard INTEGER NOT NULL,
+  op            TEXT    NOT NULL, -- JSON: add or remove an inverse edge
+  PRIMARY KEY (vshard, seq)
+) WITHOUT ROWID;
+```
+
+| Table | Purpose |
+| --- | --- |
+| `vshards` | Which vshards this host owns, at which epoch, and the next ID sequence |
+| `objects` | One row per object |
+| `assocs` | Outbound edges of objects on this host; `assocs_range` serves newest-first range reads |
+| `assoc_counts` | Edge counts maintained in the same transaction as edge writes |
+| `outbox` | Inverse-edge writes bound for other vshards, delivered by alarm |
+
+**Deferred: `changes`.** A per-vshard ordered log of mutations, keyed `(vshard, lsn)`. It lets a move copy a snapshot and then catch up on a tail, so writes pause only briefly. Regional followers would tail it too. v1 moves are stop-the-world per vshard, so nothing reads it yet.
+
+One vshard's rows in `objects`, `assocs` and `assoc_counts` form a single key range because the vshard sits in the IDs' high bits. Snapshotting a vshard for a move needs no extra column or index.
+
+## Write path
+
+Every mutation commits in one `transactionSync()` on the host that owns its vshard. The DO sends its response only after that commit is durable.
+
+Inside the transaction:
+
+1. Decode the vshard from the ID. Check its `vshards` row: state must be `owned` and the request's epoch must match. Otherwise reply `moved {to, epoch}` or `fenced`, and write nothing.
+2. Write the object or edge. Object writes bump `version`; creates take the next sequence from `vshards.next_seq`.
+3. Update `assoc_counts` for edge adds and removes.
+4. If the catalog gives the edge type an inverse:
+   - The inverse's vshard is on this host: write it inline, in the same transaction. Colocated edge pairs are atomic for free.
+   - It is on another host: append an `outbox` row.
+
+### Outbox delivery
+
+An alarm on the host delivers outbox rows and deletes each one when acknowledged. A crash after commit loses nothing: the row is still there on the next alarm.
+
+- **In order, one at a time, per (source vshard, target vshard).** Each inverse edge has exactly one writer, the vshard of its forward edge, so per-source ordering is enough.
+- **Idempotent apply.** Add is an upsert and remove is delete-if-present, so redelivering an op after a lost ack is a no-op.
+- **Moves are retries.** A `moved` reply from the target updates the route cache and the row is retried against the new owner. Outbox rows belong to their source vshard and move with it.
+
+The inverse of a cross-host edge is eventually consistent. A reader who needs it immediately must read the forward edge.
+
+### Transactions
+
+`db.txn(anchorId, …)` runs on the anchor's host. Every ID it touches must share the anchor's vshard; touching another vshard is an error. Transactions across vshards are a non-goal for v1.
+
+## Query execution
+
+The query runs once, at one coordinator, and its reads go to the hosts that own the data. A read the coordinator's gathered graph can't answer waits on the owning host. Reads issued in the same tick go to each host as one request, and each branch moves on as soon as its own data arrives.
+
+Latency is the longest chain of dependent cross-host reads, not the query's depth. Hops inside a host are in-process SQLite reads costing microseconds. A host asked for a row also runs the plan below it over its own data and ships back everything it read, so most of the coordinator's later reads hit its cache. Because the vshard is in the ID, a host knows whether it holds an ID without a lookup.
+
+```ts
+// One operator set on hosts and coordinator. A stream ends 'done', or 'short':
+// it stopped at data its store doesn't hold, so its rows are a prefix, not an answer.
+type Stream = AsyncGenerator<Node, 'done' | 'short'>;
+
+interface Store {  // Maybe<T> = T | UNKNOWN
+  object(id: Id, frame: number): Promise<Maybe<Obj | null>>;
+  edges(id1: Id, atype: number, after: Cursor | null, n: number, frame: number): Promise<Maybe<EdgePage>>;
+  count(id1: Id, atype: number): Promise<Maybe<number>>;
+}
+// host:        local DO SQLite; settles at once; UNKNOWN for vshards it doesn't own
+// coordinator: the gathered graph; on a gap, asks the owning host and waits
+
+// host DO: run each task over local data, prefetching below every row
+exec(plan, tasks: Miss[]): { reads: ReadSet; misses: Miss[] }
+
+// coordinator: same code in a Worker or a DO
+const store = new LoaderStore(plan, route);  // per host: gather a tick's gaps, send one request
+const rows = await materialize(frame(0).fetch(store, { ids: [root] }));
+```
+
+### Rules
+
+- **Fetch each gap once.** Objects dedupe by ID, edge pages by list and cursor. However many readers wait on a gap, one request carries it.
+- **Batch per host per tick.** Everything that can run without waiting runs first; then each host gets at most one request. Request count is the scarce resource, given the 1,000 requests/sec soft limit per DO.
+- **Hosts prefetch.** A host asked for a row runs that row's part of the plan over its own data (children, counts, what the filter reads) and ships back every read. The coordinator then asks only for what is still missing.
+- **A short answer is not a fact.** An answer counts only if every stream that fed it ended `done`. Hosts and the round driver rely on this; the async coordinator's store never answers UNKNOWN.
+- **Requeue moved.** Update the route cache and resend.
+- **Enforce budgets centrally.** Deadlines, retries, result-size limits and cancellation all live in the coordinator.
+
+### Same operators on hosts and coordinator
+
+Every operator is async, and only the store differs. On a host each read settles at once: DO SQLite is synchronous, and edge pages are read with `LIMIT n + 1` into arrays, so no cursor stays open across an `await`. A host request therefore runs in one turn of the event loop, as one snapshot. At the coordinator the same awaits wait on hosts, and independent reads start together: a page's targets, a filter's window, a node's relationships.
+
+### Why not forward the query from DO to DO
+
+- Requests multiply per level instead of adding, and sibling branches fetch the same objects twice.
+- A Worker can't be addressed, so results would travel back through every intermediate DO. Each one stays active, and billed, while it waits.
+- Failure handling, stale routes and budgets would be spread across the tree.
+- A popular root would coordinate every query that starts at it.
+
+The exception worth revisiting later is existence filters deep in the tree, where evaluating at the data avoids fetching parents that will be dropped.
+
+### Coordinator placement
+
+The loop is the same code in either place; only the transport differs.
+
+- **In the user's Worker** when the hosts are nearby, or when regional followers serve reads.
+- **On the root's host DO** when the data is far away. One long round trip, then short hops inside the data's region.
+
+### Worked example: rounds versus async
+
+The sketch in `hlekk/src/query/` has two coordinator drivers over the same operators. Rounds sends every outstanding read, waits for every host, and repeats; async lets each branch move on when its own data lands. The query is the issue page with comments filtered to Alice's (2 of 8) and limited to 2. Issues, comments, users and labels each sit on their own host; the labels host replies in 50 ms and the others in 10 ms, on a simulated clock.
+
+| Request | Host | Rounds (ms) | Async (ms) |
+| --- | --- | --- | --- |
+| i1 | issues | 0–10 | 0–10 |
+| c8, c7, c6, c5 | comments | 10–20 | 10–20 |
+| u1 | users | 10–20 | 10–20 |
+| l2, l1 | labels | 10–60 | 10–60 |
+| u2 | users | 60–70 | 20–30 |
+| Comment edges after c5, page of 8 | issues | 70–80 | 30–40 |
+| c4, c3, c2, c1 | comments | 80–90 | 40–50 |
+| Answer |  | 90 | 60 |
+
+Both drivers send the same 7 requests. With rounds, the fetch of u2 waits for the slow labels host; async sends it at 20 ms, so the comment chain is done at 50 ms and the answer waits only on labels. Async latency is the longest chain of dependent reads; round latency is the sum of each round's slowest host. Async can send more requests when branches become ready at different times, since a tick is its batching window. It also never replays the query, which the round driver does each time nothing is outstanding.
+
+### Filtered limits across hosts
+
+A `related` list with a filter and a limit is filled by evaluating a window of rows at once and yielding them in edge order. The window is what is still needed divided by the pass rate so far, so a selective filter reads further ahead.
+
+| The predicate reads | Its data reaches the coordinator | Extra cost |
+| --- | --- | --- |
+| Edge fields (time, edge data) | With the edge page | None |
+| Target fields, target on the list's host | In the same reply; that host prefetched it | None |
+| Target fields or a subquery, data on another host | From that host, once the target is known | One dependent request per window, batched across its rows |
+| A lambda | Like target fields, but it runs only at the coordinator | Hosts can't run it, so they can't prefetch for it |
+
+**Inside a host, pages.** A host reads an edge list a page at a time, `LIMIT n + 1` into an array, so it knows whether the list goes on. The first page is the window's size; later pages double up to `MAX_PAGE`.
+
+**The window.** `Where` keeps enough rows in flight to fill what is still needed at the pass rate seen so far, and yields in edge order:
+
+```ts
+const window = () => {
+  const rate = Math.max(MIN_RATE, (passed + 1) / (seen + 2));  // one in two before any evidence
+  return Math.min(MAX_AHEAD, Math.ceil(Math.max(1, need - passed) / rate));
+};
+for (;;) {
+  ahead.fill(window());          // pull rows and start their evaluations together
+  const s = await ahead.next();  // results come back in edge order
+  if ('end' in s) return s.end;
+  seen++;
+  if (s.v === UNKNOWN) return 'short';  // can't place this row, so nothing after it either
+  if (s.v) { passed++; yield s.node; }
+}
+```
+
+- **Correct by construction.** Rows come out in edge order, and a row is emitted only after every earlier row is decided. A row that can't be decided ends the stream short, never early.
+- **Exact cursors.** Edges are ordered by (time, id2); id2 is the tie-break.
+- **Bounded.** `MIN_RATE` stops a pass rate of zero from becoming an unbounded read, `MAX_AHEAD` caps rows in flight, and `MAX_PAGE` caps a page. A scan cap per query, returning a cursor, is not built yet.
+- **Speculation costs.** Rows in the window past the limit keep loading after the limit is met; cancellation is not built yet. Explain flags predicates on remote targets and lambdas.
+- **No sorting by target fields.** It needs the whole list, so it requires an explicit full-scan opt-in.
+
+### Prior art: Aphrodite's query runtime
+
+`vlcn-orm/packages/query-runtime-ts` built a query builder and engine over arbitrary backends. Several of its ideas carry over; a few don't fit a graph spread across hosts.
+
+**Carried over**
+
+- ChunkIterable's operators (filter, map, take), as async iterators on hosts and coordinator. Its growing chunks became edge pages that double.
+- Predicates as data with a `call()` fallback. The same object compiles to SQL or runs in JS, so it can travel with the query.
+- The hoist/residual split in `SQLExpression.hoist`, as the compile step that tags each operator with where it runs. Its output is the plan sent to hosts.
+- `what` projections. An unfiltered `count()` reads `assoc_counts`; `exists` is a single-edge lookup.
+- Explain, flagging the expensive paths.
+
+**Left behind**
+
+- The linear `HopPlan` chain. `related` fans out with a limit per branch, so the plan is a tree.
+- Hop hoisting decided at plan time by engine and database. Locality is now per row, at runtime.
+- Multi-hop SQL joins on the host. An inner join silently drops edges whose targets live on other hosts. One statement per hop, and a loop over parents for limits per parent.
+- `OrderedChunkIterable`'s full materialization.
+- Unbatched fetches per branch. Every network fetch goes through a per-host loader that batches a tick's reads.
+
+### Prior art: rindle
+
+Rindle (`rindle-ws/main/rust/rindle`) is a mature, synchronous dataflow engine that serves nested `related` trees from one machine's storage. It is a source of ideas here, not the engine. Its incremental-update machinery (push paths, boundary windows, the scope directory, query families) is out of scope.
+
+**Testing and correctness**
+
+- **A differential oracle.** Rindle's contract is "view-after-write == fresh-query", checked by its `testkit` oracle. Ours: a query across many hosts, or caught mid-move, must equal the same query against one host that holds every vshard. Fuzz random graphs and queries against it.
+- **A test double that controls where data lives.** `rindle-paged/src/miss.rs` lets a test choose which pages are resident and keeps `MissStats { hits, misses, rounds }`. Ours: a fake host transport where the test decides which vshards are on which host, and asserts round and request counts per query. `CountingSource` in `graph.rs` is the same idea for one source.
+
+**Fault model**
+
+- **A short answer is not a fact** (`lib.rs`). A host that is moved, unreachable or out of budget returns a typed incomplete answer. The coordinator never turns it into an empty list, `exists = false` or `count = 0`.
+- **Collecting misses** (`miss.rs`, `designs/paged/README.md`). Record every miss in a read, not just the first. Cap the number of rounds. Grow a read window when it runs out, not row by row.
+
+**Read protocol**
+
+- **One request shape for every read.** Rindle's `FetchRequest` is `{ constraint, start: { row, basis: At | After }, reverse }`. Our edge-list read is `{ id1, atype, start: { (time, id2), At | After }, reverse, limit }`.
+- **Orderings end with the primary key** (`complete_ordering` in `builder.rs`), applied recursively through every subquery, so every cursor is exact.
+- **Two comparators** (`docs/DESIGN.md` #3): null equals null for sorting, null equals nothing for join keys. `COMPARATOR_VERSION` versions them; we version the cursor encoding the same way.
+- **Predicates never crash on a type mismatch.** JSON payloads have no schema, so evaluation is total: mismatched types compare false.
+
+**Operators**
+
+- **Filter.** A `where` on a related list, such as `project.related('issues', q => q.where.ownerId(eq(userId)))`, checks each row against a predicate. Predicates are data and never fail on a type mismatch. A filter on a target object's field runs on the host when the target is local and at the coordinator otherwise. With a limit, it reads ahead in windows (see Filtered limits across hosts). There is no bare `Issue.where`: with no single collection per type, every query starts from an object and follows edges. Scanning a whole type waits for the index service (see Later).
+- **Limits per partition** (`op/take.rs`). Each parent key gets its own window `{ size, bound }`; the bound is the continuation cursor.
+- **`exists` as a bounded count** (`op/exists.rs`, `op/cap.rs`, `Source::count_up_to`). A host operation `count_up_to(id1, atype, pred, k)` stops early, with a per-query memo keyed by (parent, relationship).
+- **Counts are exact or `None`** (`Source::count`). Unfiltered edge counts come from `assoc_counts`; filtered ones return `None` and are counted by fetching. An I/O failure never reads as `None` or 0.
+- **The flipped join** (`op/flipped_join.rs`). Drive a selective `whereExists` from the child side: follow inverse edges from the matching children, then batch-load the parents in one `multi_constraints`-shaped request.
+- **One k-way merge with deduplication** (`kway.rs`, `UnionFanIn`), shared by `OR` branches, edge lists split across storage tiers, and continuation results.
+
+**Plan representation**
+
+- **An id-addressed plan** (`graph.rs`, `docs/DESIGN.md` #1). Each `related` level gets an id, so frontier tasks carry `(frameId, ids, cursor)` and a host receives the plan once per query or caches it by hash.
+- **A canonical AST** (`normalize_pipeline_ast`): merge nested same-operator AND/OR, drop TRUE, keep FALSE, unwrap single items. A stable hash feeds the plan cache and spots identical concurrent requests.
+- **Capture by value** (`docs/DESIGN.md` #5). Every frontier task carries its parent key, cursor and parameters, so it can be retried or rerouted after `moved` on its own.
+
+## Routing and vshard moves
+
+The directory says where a vshard probably is; the host that owns it decides. Stale routes cost one extra round, never a wrong write.
+
+### Directory
+
+- **The caller names the database; the ID names the vshard.** A request is scoped to a database by its binding, and the ID's top 24 bits give the vshard. Neither needs a lookup.
+- **One directory DO per database** maps each vshard to its host DO name, epoch, home region and jurisdiction.
+- **Stored as ranges.** The allocator fills one host before opening another, so consecutive vshards usually share a host. A small database is one range pointing at one DO; moves break ranges up.
+- **Cached in Workers.** Workers cache the map in isolate memory. It changes only on allocation of new vshards and on moves, so the directory stays out of the request path.
+- **Cold Workers read a snapshot.** A stale route costs only a `moved` reply, so the directory publishes versioned snapshots to Workers KV, and a cold isolate reads that instead of the directory DO.
+- **The owner enforces.** Every host request carries the epoch it routed with for each vshard. The host compares it with its own `vshards` row and answers `moved {to, epoch}` on a mismatch.
+
+### Moving a vshard (v1, stop-the-world)
+
+The directory DO drives each move as a resumable state machine, using alarms, so a crash mid-move resumes instead of leaving a vshard fenced.
+
+1. **Fence.** The source sets the vshard to `fenced`. Writes are rejected; reads continue.
+2. **Copy.** The target host, created with the right `locationHint` or `jurisdiction`, pulls the vshard's key range from `objects`, `assocs`, `assoc_counts`, its `outbox` rows and its `vshards` row.
+3. **Install.** The target marks the vshard `owned` at epoch + 1.
+4. **Flip.** The directory compare-and-sets the route to the target at epoch + 1.
+5. **Retire.** The source marks the vshard `moved`, answers `moved` from then on, and deletes the rows after a grace period.
+
+The source stays fenced from step 1 until step 5, so the two hosts never both accept writes. Writes to that one vshard pause for the duration of the copy; every other vshard is unaffected.
+
+**Later:** with the `changes` log, the target copies a snapshot while writes continue, catches up on the tail, and the fence covers only the last few entries.
+
+### When to move
+
+A placement controller in the directory DO watches each host's storage bytes and request rate. When a host crosses a threshold, it moves its largest or busiest vshards to a new or underused host. Thresholds are an open question.
+
+## Indexing
+
+There are no per-type object tables. Field indexes come in three kinds, and only one of them lives on a host's object table.
+
+| Need | Example | Mechanism |
+| --- | --- | --- |
+| Filter or order a `related` list | Issue's comments, newest first | Index on edge fields: `time` today, more sort fields later |
+| Global lookup by a field | User by email, issue by slug | Global index sharded by `hash(value)`, written through the outbox |
+| Host-local filter on an object field | Rare in this API | SQLite expression index on `objects` |
+
+### Edge fields only on `related`
+
+An edge list lives on id1's host, while its targets may live anywhere. Indexed `where` and `orderBy` on a `related` list are therefore allowed only on fields stored on the edge. A filter on a target object's field runs on the host when the target is local, and at the coordinator otherwise. Sorting by a target field needs the whole list, so it requires an explicit full-scan opt-in. Read-ahead windows, described under Filtered limits across hosts, still honor `limit`.
+
+### Global lookups and uniqueness
+
+A local index can't answer "user by email": the coordinator doesn't know which host to ask. Global indexes live in their own vshards, keyed by `hash(value)`, and are updated through the outbox like inverse edges. Uniqueness uses reserve → create → confirm, and unconfirmed reservations are cleaned up after a timeout.
+
+### Expression indexes
+
+The DO's SQLite includes the JSON extension, so a JSON field can be indexed on the generic table:
+
+```sql
+CREATE INDEX obj_issue_status
+  ON objects (json_extract(data, '$.status'))
+  WHERE otype = 7;
+```
+
+- A query uses it only if it repeats the same expression and `otype = 7` as a literal. Generated SQL inlines `otype`.
+- Index definitions live in the schema catalog. A host applies `CREATE INDEX IF NOT EXISTS` when it wakes and sees a new catalog version.
+- Building an index on a multi-GB host blocks the single-threaded DO until it finishes.
+
+## Limits, deferred work and open questions
+
+### Platform limits that shape the design
+
+| Limit | Value | Design consequence |
+| --- | --- | --- |
+| [Storage per SQLite-backed DO](https://developers.cloudflare.com/durable-objects/platform/limits/) | 10 GB (Workers Paid) | vshards capped well below it; hosts hold many |
+| [Requests per DO](https://developers.cloudflare.com/durable-objects/platform/limits/) | 1,000/sec soft limit | Caps one object's write rate and a host's density; batch per host |
+| [Row size](https://developers.cloudflare.com/durable-objects/platform/limits/) | 2 MB | Object payload cap |
+| [DO location](https://developers.cloudflare.com/durable-objects/reference/data-location/) | Fixed after creation; `locationHint` is best-effort | Region changes are vshard moves to new hosts |
+| [Integer precision](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/) | Imprecise above 2^53 in JS | IDs stored as BLOBs |
+
+### Design limits
+
+- **vshard size:** soft cap proposed at about 1 GB.
+- **Colocation group size:** a documented limit, value to be set.
+- **One object's write rate:** bounded by one DO. Commutative ops can help counts; otherwise it is a hard ceiling.
+
+### Deferred
+
+- `changes` log, snapshot-and-tail moves.
+- Regional read followers and read-your-writes session tokens.
+- IVM and change subscriptions; see Later.
+- R2 tiering for cold tails of large edge lists.
+- Transactions across vshards.
+
+### Open questions
+
+- [ ] Exact ID bit split between vshard and sequence (24/40 proposed; IDs are unsigned and use all 64 bits, with no reserved bit).
+- [ ] vshard size cap and the placement controller's move thresholds.
+- [ ] Colocation group limit, and what `with` does when the parent's vshard is full: error or spill.
+- [ ] Deletes: the default onDelete when an edge type declares none, and whether edges to missing objects are dropped at read time.
+- [ ] Heuristic for choosing coordinator placement per query.
+- [ ] Read-after-write guarantees to promise for cross-host inverse edges.
+- [ ] Directory DO load and failure: how long Worker route caches and KV snapshots may live.
+- [ ] Backfills for new inverses and global indexes: rate limits, and how progress is reported.
+- [ ] Catalog version skew: how far hosts may lag the newest catalog, and how long a client's catalog version and projection hash stay accepted.
+- [ ] Schema authoring format: JSON files as shown, or a small DSL that compiles to the same JSON.
+- [ ] Whether a projection is only a code boundary, or the server also refuses reads and writes outside it.
+- [ ] Where a product outside the schema repo gets the lock for codegen: a published package, or the directory's catalog endpoint.
+
+## Build plan
+
+Build the riskiest parts first: per-host performance, then moves under load. Everything after that builds on a host and a move protocol that are already proven.
+
+1. **One host DO.** Schema, ID helpers, object and edge ops, the write transaction, and `exec()`. Add a fake second host so the frontier path runs from day one. Measure per-DO throughput, since it sets vshard density and cost.
+2. **Directory, schema catalog and many hosts.** Epoch checks, `moved` replies, catalog migrations and projection codegen, Worker route caching, and the async coordinator end to end.
+3. **Stop-the-world vshard moves.** Driven by the directory, run under write load with a chaos harness that kills hosts mid-move. This is the part most likely to be subtly wrong.
+4. **Inverse edges through the outbox.** Same-host inline writes, ordered idempotent delivery, retries across moves.
+5. **Allocator and placement controller.** Automatic moves on storage and request pressure; colocation with `with`.
+6. **Global unique index.** User by email, with reserve → create → confirm.
+
+After v1: the `changes` log and snapshot-and-tail moves, then regional followers with session tokens.
+
+## Later: planning, services and incremental updates
+
+These are ideas for after v1, recorded so that v1 leaves room for them; none is committed. All three need the `changes` log, so it stops being optional once any of them starts. Rindle's incremental machinery is the main source material.
+
+### Index service
+
+- **A fourth source.** Besides root IDs, edge lists and ID fields, a query step can read IDs in order from an index service. The coordinator loads the objects through its usual loader, so filters, limits and nesting don't change. `Issue.where('status', '=', 'open').orderBy('updatedAt', 'desc').limit(50)` becomes a legal query.
+- **Declared in the catalog**, and maintained in the background from each vshard's `changes` log. A cursor per vshard lets maintenance resume and survive moves.
+- **Stale by design.** Rechecking the predicate on each loaded object drops stale matches, and the read-ahead window refills the limit. Finding just-written objects needs read-your-writes: the index reports how far it has caught up per vshard, and the coordinator waits or answers short.
+- **Fixed buckets, no splits.** Hash the leading equality key into many fixed buckets, sorted within a bucket by the range key, as in a DynamoDB global secondary index. A hot key is spread across k buckets and read back with a k-way merge.
+
+### Statistics and a planner
+
+- **Statistics:** object counts per type, edge-list lengths per edge type, value histograms for indexed fields, and pass rates observed by real queries. Hosts can report per-vshard totals from an alarm.
+- **Planner:** chooses, for each query step, an edge traversal, an index scan or a flipped join, and the starting pass rate for read-ahead windows. In the worked example, a known pass rate of one in four would cut the comment chain from five hops to three.
+- **Coordinator only.** Plans run only at the coordinator, so the planner is a compile step there and hosts don't change. Explain shows estimated against actual counts.
+- **One principle loosens.** "No scans" becomes "every query uses a declared index or an edge list; anything else needs the scan opt-in."
+
+### Incremental updates
+
+Operators move to the data. The host that owns an edge list runs the operator that traverses it and pushes changes to the coordinator, which keeps the result as a live view.
+
+- **The read set becomes the subscription.** A host already ships back everything a query read. For a live query it also remembers those reads, and a write to any of them pushes a change.
+- **Shared operators.** Everyone viewing an issue's comments shares that list's operator on its host, as in rindle's query families. One change fans out to every view.
+- **Object edits reach two places:** the views that show the object, and the list operators whose filters read it.
+- **Windows refill at the list's owner.** When a row leaves a limited window, the next row comes from the host holding the list, as with rindle's boundary windows. A filter that reads objects on other hosts makes the refill a cross-host fetch.
+- **A new row hydrates its subtree.** The coordinator runs the ordinary query below it, then subscribes to what that query read.
+- **The view lives in a DO.** A Worker can't receive pushes, so a live query's coordinator is a DO, which can also hold the client's WebSocket.
+- **Open: consistency across hosts.** Changes from different hosts arrive in any order, so a view can briefly show combinations that never existed together. Tracking a write position per vshard and holding changes back would fix it, at a latency cost.
+- **Rindle material:** push paths, boundary windows, the scope directory (who watches what), query families, and how `exists` and flipped joins handle pushes.
