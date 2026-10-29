@@ -56,15 +56,18 @@ export function canonical(v: unknown): string {
   return `{${entries.map(([k, x]) => `${JSON.stringify(k)}:${canonical(x)}`).join(",")}}`;
 }
 
-/** FNV-1a over the canonical form, as two 32-bit halves so it stays exact in JS. */
-export function sumOf(lock: Lock): string {
-  const text = canonical({ version: lock.version, objects: lock.objects, edges: lock.edges, tombstones: lock.tombstones });
+/** FNV-1a as two 32-bit halves, so it stays exact in JS. Not a security boundary; see Lock.sum. */
+export function fnv(text: string): string {
   const halves = [0x811c9dc5, 0x01000193];
   for (let i = 0; i < text.length; i++) {
     const c = text.charCodeAt(i);
     for (let h = 0; h < 2; h++) halves[h] = Math.imul(halves[h] ^ ((c >>> (h * 8)) & 0xff) ^ (c & 0xff), 0x01000193) >>> 0;
   }
   return halves.map((h) => h.toString(16).padStart(8, "0")).join("");
+}
+
+export function sumOf(lock: Lock): string {
+  return fnv(canonical({ version: lock.version, objects: lock.objects, edges: lock.edges, tombstones: lock.tombstones }));
 }
 
 export interface ObjectType {
