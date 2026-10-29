@@ -49,3 +49,6 @@ yarn-error.log*
 *.swp
 .DS_Store
 Thumbs.db
+
+# wrangler dev's local Durable Object storage
+.wrangler/state/

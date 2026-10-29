@@ -1,0 +1,11 @@
+{
+  "name": "hlekk-smoke",
+  // A smoke harness, not a deployment. It exists so the Durable Object adapter runs against real DO
+  // SQLite instead of only typechecking against it.
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [{ "name": "HLEKK_HOSTS", "class_name": "HlekkHost" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HlekkHost"] }]
+}
