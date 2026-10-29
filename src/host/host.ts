@@ -8,7 +8,7 @@ import { Catalog } from "../catalog/catalog.ts";
 import { hostExec } from "../query/driver.ts";
 import type { HostReply } from "../query/driver.ts";
 import type { Fields, Id, Miss, Plan } from "../query/types.ts";
-import { MAX_SEQ, makeId, toKey, vshardOf } from "./ids.ts";
+import { MAX_SEQ, fromKey, makeId, toKey, vshardOf, vshardRange } from "./ids.ts";
 import { MAX_PAYLOAD, migrate } from "./schema.ts";
 import type { Sql } from "./sql.ts";
 import { SqlStore } from "./store.ts";
@@ -93,6 +93,19 @@ export interface OutboxRow {
   seq: number;
   target_vshard: number;
   op: OutboxOp;
+}
+
+/** Everything a vshard holds, in domain terms so it survives any transport. One vshard's rows form a
+ *  single key range in objects, assocs and assoc_counts, because the vshard sits in the ids' high
+ *  bits, so taking this needs no extra column or index. */
+export interface Snapshot {
+  vshard: string;
+  epoch: number;
+  nextSeq: number;
+  objects: { id: Id; otype: number; version: number; data: string }[];
+  assocs: { id1: Id; atype: number; id2: Id; time: number; data: string | null }[];
+  counts: { id1: Id; atype: number; n: number }[];
+  outbox: { seq: number; target: number; op: string }[];
 }
 
 export interface ExecReply extends HostReply {
@@ -247,6 +260,104 @@ export class Host {
       if (op.kind === "add") this.#putEdge(op.atype, op.id1, op.id2, op.time, op.data);
       else if (op.kind === "remove") this.#dropEdge(op.atype, op.id1, op.id2);
       else this.#erase(op.id, new Set());
+    });
+  }
+
+  // ---- moves
+
+  /** Everything this vshard holds. Taken while the vshard is fenced, so the rows cannot change under
+   *  it; a snapshot of a vshard still taking writes would be torn. */
+  snapshot(vshard: string): Snapshot {
+    const v = BigInt(vshard);
+    const [lo, hi] = vshardRange(v);
+    const row = this.sql.all<VshardRow>("SELECT epoch, state, next_seq FROM vshards WHERE vshard = ?", Number(v))[0];
+    if (!row) throw new NotOwned({ vshard, state: "absent", epoch: -1 });
+    return {
+      vshard,
+      epoch: row.epoch,
+      nextSeq: row.next_seq,
+      objects: this.sql
+        .all<{ id: Uint8Array; otype: number; version: number; data: string }>(
+          "SELECT id, otype, version, data FROM objects WHERE id BETWEEN ? AND ?",
+          lo,
+          hi,
+        )
+        .map((r) => ({ ...r, id: fromKey(r.id) })),
+      assocs: this.sql
+        .all<{ id1: Uint8Array; atype: number; id2: Uint8Array; time: number; data: string | null }>(
+          "SELECT id1, atype, id2, time, data FROM assocs WHERE id1 BETWEEN ? AND ?",
+          lo,
+          hi,
+        )
+        .map((r) => ({ ...r, id1: fromKey(r.id1), id2: fromKey(r.id2) })),
+      counts: this.sql
+        .all<{ id1: Uint8Array; atype: number; n: number }>(
+          "SELECT id1, atype, n FROM assoc_counts WHERE id1 BETWEEN ? AND ?",
+          lo,
+          hi,
+        )
+        .map((r) => ({ ...r, id1: fromKey(r.id1) })),
+      // Outbox rows belong to their source vshard and move with it.
+      outbox: this.sql
+        .all<{ seq: number; target_vshard: number; op: string }>(
+          "SELECT seq, target_vshard, op FROM outbox WHERE vshard = ? ORDER BY seq",
+          Number(v),
+        )
+        .map((r) => ({ seq: r.seq, target: r.target_vshard, op: r.op })),
+    };
+  }
+
+  /** Takes ownership of a snapshotted vshard at the next epoch, in one transaction. Idempotent, so a
+   *  move that crashed after copying can simply copy again. */
+  install(snap: Snapshot, epoch: number): void {
+    const v = BigInt(snap.vshard);
+    this.sql.txn(() => {
+      for (const o of snap.objects) {
+        this.sql.run("INSERT OR REPLACE INTO objects (id, otype, version, data) VALUES (?, ?, ?, ?)", toKey(o.id), o.otype, o.version, o.data);
+      }
+      for (const a of snap.assocs) {
+        this.sql.run(
+          "INSERT OR REPLACE INTO assocs (id1, atype, id2, time, data) VALUES (?, ?, ?, ?, ?)",
+          toKey(a.id1),
+          a.atype,
+          toKey(a.id2),
+          a.time,
+          a.data,
+        );
+      }
+      for (const c of snap.counts) {
+        this.sql.run("INSERT OR REPLACE INTO assoc_counts (id1, atype, n) VALUES (?, ?, ?)", toKey(c.id1), c.atype, c.n);
+      }
+      for (const o of snap.outbox) {
+        this.sql.run(
+          "INSERT OR REPLACE INTO outbox (vshard, seq, target_vshard, op) VALUES (?, ?, ?, ?)",
+          Number(v),
+          o.seq,
+          o.target,
+          o.op,
+        );
+      }
+      // next_seq comes with it, or the new owner would hand out ids the old one already used.
+      this.sql.run(
+        "INSERT INTO vshards (vshard, epoch, state, next_seq) VALUES (?, ?, 'owned', ?)" +
+          " ON CONFLICT (vshard) DO UPDATE SET epoch = excluded.epoch, state = 'owned', next_seq = excluded.next_seq",
+        Number(v),
+        epoch,
+        snap.nextSeq,
+      );
+    });
+  }
+
+  /** Drops a retired vshard's rows, after the grace period that lets stale readers find out. */
+  purge(vshard: string): void {
+    const v = BigInt(vshard);
+    const [lo, hi] = vshardRange(v);
+    this.sql.txn(() => {
+      this.sql.run("DELETE FROM objects WHERE id BETWEEN ? AND ?", lo, hi);
+      this.sql.run("DELETE FROM assocs WHERE id1 BETWEEN ? AND ?", lo, hi);
+      this.sql.run("DELETE FROM assoc_counts WHERE id1 BETWEEN ? AND ?", lo, hi);
+      this.sql.run("DELETE FROM outbox WHERE vshard = ?", Number(v));
+      this.sql.run("DELETE FROM vshards WHERE vshard = ?", Number(v));
     });
   }
 
