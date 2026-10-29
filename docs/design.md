@@ -35,6 +35,7 @@ D1 already offers SQL with read replicas, up to 10 GB per database. This system 
 7. **Fail loudly.** Storage formats and protocols are chosen so mistakes raise errors instead of corrupting data, for example BLOB IDs and epoch-checked writes.
 8. **Small stays small.** A database that fits in one DO runs in one DO. Scaling out happens only under pressure.
 9. **The catalog is the source of truth.** Object types list only their fields, and edge types are separate entries owned by domains. Code is generated from the catalog, and each product generates a projection holding only the types and edges it uses.
+10. **The caller is a trusted server.** Nothing untrusted reaches hlekk. No browser routes to it, and anything client-facing is a layer above. So queries are built rather than declared and validated, IDs are taken at face value, and authorization belongs to the application.
 
 ## Motivating examples
 
@@ -113,7 +114,7 @@ const r = await Issue.gen(id)
 - Every `related` has a limit. A default applies when none is given.
 - `related` over an `edge` reads the newest edges first by `time`. Indexed `where` and `orderBy` are allowed only on edge fields; see Indexing.
 - The result is a normalized graph. Nesting into the query's shape happens last, so each object appears once.
-- **Queries are built, not declared.** There is no `defineQuery` or `defineFragment`: a query is the builder's value, and reuse is an ordinary function over it. Rindle needs named, validated queries because an untrusted client sends them; hlekk's caller is a Worker, which is already the trusted boundary, so the wrapper would guard nothing. See Later for what brings it back.
+- **Queries are built, not declared.** There is no `defineQuery` or `defineFragment`: a query is the builder's value, and reuse is an ordinary function over it. Rindle needs named, validated queries because an untrusted client sends them; hlekk's caller is a trusted server, so the wrapper would guard nothing. By principle 10 that does not change, so this is not a v1 simplification.
 
 ```ts
 const card = (q: Query<Issue>) => q.related('owner', issueOwner).related('labels', issueLabels);
@@ -275,6 +276,8 @@ The directory is consulted only on a route-cache miss, and it drives vshard move
 ## Client API
 
 An app reaches a database from an ordinary Worker. Nothing about placement appears in the API: the caller holds IDs, and the client resolves hosts.
+
+The caller is always a trusted server. Nothing untrusted reaches hlekk, so there is nothing here to validate and no authorization to express; a client-facing surface is a layer above this one.
 
 ### Bindings
 
@@ -912,7 +915,6 @@ CREATE INDEX obj_issue_status
 - [ ] Catalog version skew: how far hosts may lag the newest catalog, and how long a client's catalog version and projection hash stay accepted.
 - [ ] Schema authoring format: JSON files as shown, or a small DSL that compiles to the same JSON.
 - [ ] Whether a projection is only a code boundary, or the server also refuses reads and writes outside it.
-- [ ] Whether authorization stays entirely the application's, as v1 assumes, or the catalog grows a place to express it once a client can send queries.
 - [ ] Where a product outside the schema repo gets the lock for codegen: a published package, or the directory's catalog endpoint.
 
 ## Build plan
@@ -951,11 +953,10 @@ These are ideas for after v1, recorded so that v1 leaves room for them; none is 
 Operators move to the data. The host that owns an edge list runs the operator that traverses it and pushes changes to the coordinator, which keeps the result as a live view.
 
 - **The read set becomes the subscription.** A host already ships back everything a query read. For a live query it also remembers those reads, and a write to any of them pushes a change.
-- **Shared operators.** Everyone viewing an issue's comments shares that list's operator on its host, as in rindle's query families. One change fans out to every view.
+- **Shared operators.** Subscribers watching an issue's comments share that list's operator on its host, as in rindle's query families. One change fans out to every view. The sharing matters less here than in rindle, since the layer above has already collapsed many end users into one subscription.
 - **Object edits reach two places:** the views that show the object, and the list operators whose filters read it.
 - **Windows refill at the list's owner.** When a row leaves a limited window, the next row comes from the host holding the list, as with rindle's boundary windows. A filter that reads objects on other hosts makes the refill a cross-host fetch.
 - **A new row hydrates its subtree.** The coordinator runs the ordinary query below it, then subscribes to what that query read.
-- **The view lives in a DO.** A Worker can't receive pushes, so a live query's coordinator is a DO, which can also hold the client's WebSocket.
-- **A client that sends queries brings back named ones.** v1 has no `defineQuery` because its only caller is a trusted Worker. A browser holding a subscription is an untrusted caller, so a subscribable query would have to be defined and validated server-side and named for the client to refer to, which is what rindle's example app does and why.
+- **The view lives in a DO.** A Worker can't receive pushes, so a live query's coordinator is a DO, which holds the subscriber's connection. By principle 10 that subscriber is the application's own layer, never an end user, so hlekk pushes to few long-lived trusted subscribers and that layer fans out to its own clients.
 - **Open: consistency across hosts.** Changes from different hosts arrive in any order, so a view can briefly show combinations that never existed together. Tracking a write position per vshard and holding changes back would fix it, at a latency cost.
 - **Rindle material:** push paths, boundary windows, the scope directory (who watches what), query families, and how `exists` and flipped joins handle pushes.
