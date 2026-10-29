@@ -274,14 +274,22 @@ describe("the invariants", () => {
 
   it("catch an inverse edge whose other half never arrived", async () => {
     const run = await both(5, FIXED, 3, workload(5, FIXED));
-    // Drop one half directly, as a lost outbox row would have.
-    for (const host of run.c.hosts.values()) {
-      const row = host.sql.all<{ id1: Uint8Array; atype: number; id2: Uint8Array }>(
-        "SELECT id1, atype, id2 FROM assocs LIMIT 1",
-      )[0];
-      if (!row || run.c.directory.catalog().inverseOf(row.atype) === undefined) continue;
-      host.sql.run("DELETE FROM assocs WHERE id1 = ? AND atype = ? AND id2 = ?", row.id1, row.atype, row.id2);
-      host.sql.run("UPDATE assoc_counts SET n = n - 1 WHERE id1 = ? AND atype = ?", row.id1, row.atype);
+    const got = gather(run.c);
+    const catalog = run.c.directory.catalog();
+    // A pair between two objects that both still exist, which is where symmetry is a property: once
+    // one end is deleted its list cannot be reached and the invariant stops asking.
+    for (const [k, held] of got.edges) {
+      const cut = k.lastIndexOf(":");
+      const id1 = k.slice(0, cut);
+      const atype = Number(k.slice(cut + 1));
+      if (catalog.inverseOf(atype) === undefined || !got.objects.has(id1)) continue;
+      const edge = held.find((h) => got.objects.has(h.id2));
+      if (!edge) continue;
+
+      // Drop one half directly, as a lost outbox row would have left it.
+      const host = run.c.host(run.c.directory.resolve(vshardOf(id1))!.host);
+      host.sql.run("DELETE FROM assocs WHERE id1 = ? AND atype = ? AND id2 = ?", toKey(id1), atype, toKey(edge.id2));
+      host.sql.run("UPDATE assoc_counts SET n = n - 1 WHERE id1 = ? AND atype = ?", toKey(id1), atype);
       const bad = check(run.c, { quiesced: true });
       assert.ok(
         bad.some((v) => v.what.startsWith("a paired edge type")),
@@ -289,6 +297,6 @@ describe("the invariants", () => {
       );
       return;
     }
-    assert.fail("the workload held no paired edge to break");
+    assert.fail("the workload held no paired edge between two live objects to break");
   });
 });

@@ -10,7 +10,7 @@
 // Nothing here is a script, because nothing replays it. The oracles are the invariant checker and the
 // collapse at the end, and both hold whatever order the schedule happened to take.
 
-import { Hlekk } from "../client/client.ts";
+import { Hlekk, VersionConflict } from "../client/client.ts";
 import { LocalCluster } from "../client/local.ts";
 import type { Thresholds } from "../directory/placement.ts";
 import type { MoveHosts } from "../directory/move.ts";
@@ -38,6 +38,7 @@ const WEIGHTS = {
   resumeMoves: 2,
   rebalance: 3,
   grow: 2,
+  migrate: 2,
   unique: 3,
   lookup: 2,
   sweep: 1,
@@ -53,6 +54,9 @@ export const EVENTS = Object.keys(WEIGHTS) as Event[];
 
 export interface SimOptions {
   shape: Shape;
+  /** Later versions of it, in order, each planned on top of the last. The schedule applies them as it
+   *  goes, and the settle applies whatever is left: a database does eventually finish migrating. */
+  migrations?: readonly Shape[];
   seed: number;
   /** Hosts the database starts spread over, before anything is written. */
   hosts?: number;
@@ -79,6 +83,8 @@ export interface SimReport {
   moves: number;
   /** The most rows waiting in any one outbox during the run. */
   queuedPeak: number;
+  /** The catalog version it ended on. */
+  catalog: number;
   reads: { ran: number; rows: number };
   checks: number;
 }
@@ -90,12 +96,17 @@ export interface Simulated {
   roots: { id: Id; type: string }[];
   /** The client the workload used, with the route cache the run left it holding. */
   db: Hlekk;
+  /** The schema version the run ended on, which is what a query over the result is built from. */
+  shape: Shape;
 }
 
 const UNIQUE_INDEX = 1;
 
 export async function simulate(opts: SimOptions): Promise<Simulated> {
-  const { shape } = opts;
+  // The schema the workload is written against. A migration swaps it, so everything below reads it
+  // rather than closing over the one the caller passed.
+  let shape = opts.shape;
+  const pending = [...(opts.migrations ?? [])];
   const steps = opts.steps ?? 200;
   const runtime = deterministic(opts.seed);
   const c = new LocalCluster({
@@ -117,7 +128,6 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
   const transport = unreliable(c.transport, { clock: runtime.clock, random: faultRandom }, opts.faults ?? {});
   const db = Hlekk.from(transport, runtime.clock);
 
-  const names = Object.keys(shape.types);
   const live: { id: Id; type: string }[] = [];
   const written: { atype: number; id1: Id; id2: Id }[] = [];
   const sides = new Sides();
@@ -129,6 +139,7 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
     hosts: 0,
     moves: 0,
     queuedPeak: 0,
+    catalog: 0,
     reads: { ran: 0, rows: 0 },
     checks: 0,
   };
@@ -151,7 +162,13 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
       .flatMap((h) => c.directory.vshardsOn(h))
       .filter((v) => !reserved.has(v.toString()));
   };
-  const pickLive = () => (live.length === 0 ? undefined : r.pick(live));
+  /** An object to work on. Biased towards the ones just made, because a workload spread uniformly
+   *  over everything it has ever created never touches one object twice, and a race needs two
+   *  writers: no conflict, no contended edge, no delete of something with edges on it. */
+  const pickLive = () => {
+    if (live.length === 0) return undefined;
+    return r.chance(0.6) ? r.pick(live.slice(-8)) : r.pick(live);
+  };
   const liveOf = (type: string) => live.filter((o) => o.type === type);
   const body = (type: string): { data: Fields; refs: Record<string, number> } =>
     shape.payload(r, type, (target) => {
@@ -165,7 +182,7 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
   };
 
   const create = async (): Promise<void> => {
-    const type = r.pick(names);
+    const type = r.pick(Object.keys(shape.types));
     const w = body(type);
     const parent = pickLive();
     const vshards = placeable();
@@ -183,17 +200,31 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
     live.push({ id, type });
   };
 
+  /** The version this caller last saw for an object, as an application holding a read would. It goes
+   *  stale the moment anything else writes, which is what a conditional update is for. */
+  const seen = new Map<Id, number>();
+
   const update = async (): Promise<void> => {
     const o = pickLive();
     if (!o) return;
-    // Half the time it carries the version it read, which is the read-modify-write a conflict is
-    // meant to protect; the other half writes unconditionally.
+    // Half the time it carries the version it holds — read now if it has none, which is a real query
+    // on the read path — and the other half writes unconditionally and leaves every other caller's
+    // version behind.
     let expect: number | undefined;
     if (r.chance(0.5)) {
-      const rows = (await shape.types[o.type].gen(o.id).run(db)) as { $version?: number }[];
-      expect = rows[0]?.$version;
+      if (!seen.has(o.id)) {
+        const rows = (await shape.types[o.type].gen(o.id).run(db)) as { $version?: number }[];
+        if (rows[0]?.$version !== undefined) seen.set(o.id, rows[0].$version);
+      }
+      expect = seen.get(o.id);
     }
-    await db.update(o.id, fill(body(o.type)), expect === undefined ? {} : { expect });
+    try {
+      seen.set(o.id, await db.update(o.id, fill(body(o.type)), expect === undefined ? {} : { expect }));
+    } catch (e) {
+      // A conflict says what the version actually is, which is what the caller re-reads with.
+      if (e instanceof VersionConflict) seen.set(o.id, e.actual);
+      throw e;
+    }
   };
 
   const erase = async (): Promise<void> => {
@@ -296,8 +327,16 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
         c.allocator.grow();
         await c.publish();
       }),
+    migrate: () =>
+      attempt(async () => {
+        const next = pending.shift();
+        if (!next) return;
+        c.directory.applyLock(next.lock);
+        c.spreadCatalog();
+        shape = next;
+      }),
     unique: async () => {
-      const type = r.pick(names);
+      const type = r.pick(Object.keys(shape.types));
       const value = `v${r.int(12)}`;
       await attempt(async () => {
         const id = await db.createUnique(UNIQUE_INDEX, value, shape.types[type].otype, fill(body(type)), {});
@@ -341,13 +380,22 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
   c.heal();
   unwedge(c);
   await attempt(() => c.mover.resume());
+  // Whatever the schedule did not get round to migrating. A host that lags the catalog does not
+  // maintain an edge type it has not heard of, so a cluster the invariants are about to be read
+  // against has to be on one version — which is a database that finished its migration, not a
+  // convenience. What a lagging host costs is its own test.
+  for (const next of pending.splice(0)) {
+    c.directory.applyLock(next.lock);
+    shape = next;
+  }
   c.spreadCatalog();
   await c.publish();
   for (let pass = 0; pass < 32 && c.queued() > 0; pass++) await c.deliverAll();
 
   report.live = live.length;
   report.hosts = c.directory.hostIndexes().length;
-  return { cluster: c, report, roots: [...live], db };
+  report.catalog = c.directory.catalog().version;
+  return { cluster: c, report, roots: [...live], db, shape };
 }
 
 /** Clears the attempt counters on moves the schedule wedged. The mover gives up on a step that keeps

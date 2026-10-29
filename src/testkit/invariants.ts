@@ -165,12 +165,31 @@ export function check(c: LocalCluster, opts: Options = {}): Violation[] {
 
   // ---- every inverse edge has its other half
 
+  // Between objects that both still exist. A delete makes the other side a writer of this one's row:
+  // erasing y withdraws the inverse y put on x, so x's edge is removed from y's vshard while x's own
+  // vshard may still be writing it. Once y is gone that race is not observable — an edge to a missing
+  // object is dropped at read time, and an edge list belonging to one cannot be reached at all, since
+  // the only way in is through the object. Demanding symmetry there would be demanding an ordering
+  // that buys nothing. Between two live objects there is one writer per row and symmetry is a
+  // property, which is how the inline-apply bug was caught.
   if (opts.quiesced) {
+    const alive = new Set<Id>();
     const all = new Map<string, Set<Id>>();
-    for (const host of c.hosts.values()) {
-      for (const r of host.sql.all<{ id1: Uint8Array; atype: number; id2: Uint8Array }>("SELECT id1, atype, id2 FROM assocs")) {
-        const k = listKey(fromKey(r.id1), r.atype);
-        (all.get(k) ?? all.set(k, new Set()).get(k)!).add(fromKey(r.id2));
+    for (const index of c.directory.hostIndexes()) {
+      for (const vshard of c.directory.vshardsOn(index)) {
+        const host = c.host(index);
+        const [lo, hi] = vshardRange(vshard);
+        for (const r of host.sql.all<{ id: Uint8Array }>("SELECT id FROM objects WHERE id BETWEEN ? AND ?", lo, hi)) {
+          alive.add(fromKey(r.id));
+        }
+        for (const r of host.sql.all<{ id1: Uint8Array; atype: number; id2: Uint8Array }>(
+          "SELECT id1, atype, id2 FROM assocs WHERE id1 BETWEEN ? AND ?",
+          lo,
+          hi,
+        )) {
+          const k = listKey(fromKey(r.id1), r.atype);
+          (all.get(k) ?? all.set(k, new Set()).get(k)!).add(fromKey(r.id2));
+        }
       }
     }
     const catalog = c.directory.catalog();
@@ -179,11 +198,12 @@ export function check(c: LocalCluster, opts: Options = {}): Violation[] {
       const id1 = k.slice(0, cut);
       const atype = Number(k.slice(cut + 1));
       const inverse = catalog.inverseOf(atype);
-      if (inverse === undefined) continue;
+      if (inverse === undefined || !alive.has(id1)) continue;
       for (const id2 of targets) {
+        if (!alive.has(id2)) continue;
         if (!all.get(listKey(id2, inverse))?.has(id1)) {
           say(
-            "a paired edge type has both halves once the outbox is empty",
+            "a paired edge type has both halves between two live objects, once the outbox is empty",
             `${id1} -${atype}-> ${id2} has no ${id2} -${inverse}-> ${id1}`,
           );
         }
