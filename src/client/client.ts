@@ -11,6 +11,8 @@ import type { Refusal, Reply } from "../host/host.ts";
 import type { HostClient, HostReply } from "../query/driver.ts";
 import { runAsync, runRounds } from "../query/driver.ts";
 import type { Answer } from "../query/driver.ts";
+import { normalize as normalizeAnswer } from "../query/normalize.ts";
+import type { QueryResult } from "../query/normalize.ts";
 import type { Stats } from "../query/driver.ts";
 import type { ReadSet } from "../query/stores.ts";
 import { missOwner } from "../query/types.ts";
@@ -103,6 +105,24 @@ export class Hlekk {
   ): Promise<unknown[]> {
     if (a instanceof Query) return a.run(this, (b as QueryOptions) ?? {});
     return (await this.answer(a, b as Id[], c)).rows;
+  }
+
+  /** The same answer, normalized: every object once with its version, and the structure separately.
+   *  Not the default — nesting is what a caller renders from. This is for a response that leaves the
+   *  Worker, where a shared object would otherwise be duplicated once per path. */
+  async normalized<S>(query: Query<FieldMap, S>, opts?: QueryOptions): Promise<QueryResult>;
+  async normalized(plan: Plan, rootIds: Id[], opts?: QueryOptions): Promise<QueryResult>;
+  async normalized(
+    a: Plan | Query<FieldMap, unknown>,
+    b?: Id[] | QueryOptions,
+    c: QueryOptions = {},
+  ): Promise<QueryResult> {
+    const built = a instanceof Query;
+    const plan: Plan = built ? a.compile().plan : a;
+    const roots: Id[] = built ? [...a.roots] : (b as Id[]);
+    const opts: QueryOptions = built ? ((b as QueryOptions) ?? {}) : c;
+    const answer = await this.answer(plan, roots, opts);
+    return normalizeAnswer(plan, roots, answer.rows, answer.graph);
   }
 
   /** The answer and the graph it was read from. The builder uses the graph for cursors; `normalized`

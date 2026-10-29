@@ -119,7 +119,7 @@ const r = await Issue.gen(id)
 - **Each `related` level is its own frame**, so two aliases over one edge type with different limits or filters do not share a slot.
 - **A query is a value and is immutable.** Extending one returns another, so a half-built query can be finished two different ways, which is what makes a plain function enough for reuse.
 - `related` over an `edge` reads the newest edges first by `time`. Indexed `where` and `orderBy` are allowed only on edge fields; see Indexing.
-- The result is a normalized graph. Nesting into the query's shape happens last, so each object appears once.
+- The result is nested into the query's shape, which is what a caller renders from. A normalized form is available alongside it, for the two things nesting cannot do: a response leaving the Worker, where a shared object would otherwise be duplicated once per path, and a live view, which has to know which nodes are the same object before it can patch one. Inside the Worker it is a JS object graph, so duplication costs little; it starts costing at the boundary.
 - **Queries are built, not declared.** There is no `defineQuery` or `defineFragment`: a query is the builder's value, and reuse is an ordinary function over it. Rindle needs named, validated queries because an untrusted client sends them; hlekk's caller is a trusted server, so the wrapper would guard nothing. By principle 10 that does not change, so this is not a v1 simplification.
 
 ```ts
@@ -132,11 +132,22 @@ const r = await card(Issue.gen(id)).related('comments', issueComments, q => q.li
 
 ```ts
 type QueryResult = {
-  root: Id;
-  objects: Record<Id, { otype: string; version: number; data: unknown }>;
-  edges: Record<`${Id}:${string}`, { ids: Id[]; cursor?: string; count?: number }>;
+  roots: Id[];                                        // a query can start from several
+  objects: Record<Id, { otype: number; version: number; data: Fields }>;
+  lists: Record<`${number}:${Id}`, {                  // `${frame}:${parentId}`
+    ids: Id[];
+    edges?: ({ time: number; data: Fields | null } | null)[]; // positional; absent for a field hop
+    cursor: string | null;
+    more: boolean;
+  }>;
+  counts: Record<`${number}:${Id}`, Record<string, number>>;  // by the alias asked for
+  shape: Record<number, Record<string, number>>;      // per frame, which alias leads to which frame
 };
 ```
+
+- **Lists key by frame, not by edge type.** `related('recent', issueComments, q => q.limit(5))` beside `related('all', issueComments, q => q.limit(500))` are two answers over one edge list, and one slot per edge type cannot hold both. The plan already gives every `related` level an id.
+- **The shape travels with it**, so a consumer that does not hold the plan can walk the lists.
+- **It is a serializer, not a second mechanism.** The coordinator gathers exactly this; nesting is what throws it away.
 
 ## Schema catalog and projections
 
