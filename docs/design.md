@@ -899,14 +899,14 @@ CREATE INDEX obj_issue_status
 ### Open questions
 
 - [ ] Exact ID bit split between vshard and sequence (24/40 proposed; IDs are unsigned and use all 64 bits, with no reserved bit). The vshard bits also cap the shard map.
-- [ ] vshard size cap and the placement controller's move thresholds. The cap trades a move's write pause against the size of the shard map.
+- [ ] vshard size cap and the placement controller's move thresholds. The mechanism is built, with a 1 GB cap and per-host byte and request thresholds; the values are guesses until step 1's throughput measurement. The cap trades a move's write pause against the size of the shard map.
 - [ ] Initial vshard count `N` (64 proposed), and whether it is fixed or a creation-time parameter.
-- [ ] Whether the placement controller prefers shedding a contiguous run of vshards, keeping the shard map compact, over shedding the single largest or busiest one.
+- [x] The placement controller sheds a contiguous **prefix** of one of a host's runs, so the vshards left behind stay contiguous and the map gains no entry beyond the one the move itself costs. Among the prefixes that bring the host back under threshold it takes the fewest vshards, since each is a stop-the-world pause, and then the least excess. Never the whole host. A single heavy vshard therefore beats three light ones adding to the same weight, which is the opposite of what "prefer a run" first suggested.
 - [ ] Whether to adopt Workers KV Instant for the published snapshot once it is generally available, and whether a namespace per database is workable against 1,000 namespaces per account.
 - [ ] How often a reader polls the map version once there is a head key cheap enough to poll.
-- [ ] The affinity key a root object hashes into the active set, and what to use when a request has none.
+- [ ] The affinity key a root object hashes into the active set. It is the caller's to supply, as a tenant, an owning user or the request's own root; with none given, placement is random within the active set, which spreads but gives up locality. Whether the client should derive one instead is open.
 - [ ] Chunk span for KV shard-map snapshots.
-- [ ] Colocation group limit, and what `with` does when the parent's vshard is full: error or spill.
+- [ ] Colocation group limit, and what `with` does when the parent's vshard is full. As built it still takes the parent's vshard, since the alternative is to break the guarantee the caller asked for: error or spill is undecided.
 - [x] Deletes: an edge type that declares no onDelete detaches, dropping its own edges and leaving the targets alone, since cascading by default would let another team's edge delete your objects. Edges to missing objects are dropped at read time, which is also what covers the window before a cross-vshard inverse is withdrawn, and the hole the ent section names where an edge type has no inverse. A maintained count still counts them, so a count can exceed what a read of the same list yields.
 - [ ] Whether a cascade that crosses a vshard should travel as an outbox op, as built, or wait for cross-vshard transactions.
 - [ ] Heuristic for choosing coordinator placement per query, and whether the choice is exposed to the caller or decided for it.

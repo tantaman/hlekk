@@ -7,6 +7,7 @@
 import { Catalog } from "../catalog/catalog.ts";
 import { hostExec } from "../query/driver.ts";
 import type { HostReply } from "../query/driver.ts";
+import { missOwner } from "../query/types.ts";
 import type { Fields, Id, Miss, Plan } from "../query/types.ts";
 import { MAX_SEQ, fromKey, makeId, toKey, vshardOf, vshardRange } from "./ids.ts";
 import { MAX_PAYLOAD, migrate } from "./schema.ts";
@@ -108,6 +109,17 @@ export interface Snapshot {
   outbox: { seq: number; target: number; op: string }[];
 }
 
+/** What a vshard costs this host, for the placement controller. Bytes are the stored payloads, which
+ *  is what a move has to copy; the page overhead SQLite adds on top of them is not something a DO can
+ *  see. Requests are counted since the last read, so the controller polling on a fixed interval reads
+ *  a rate. */
+export interface VshardStats {
+  vshard: string;
+  bytes: number;
+  objects: number;
+  requests: number;
+}
+
 export interface ExecReply extends HostReply {
   /** Vshards the caller routed to that this host no longer serves at that epoch. */
   refusals: Refusal[];
@@ -123,6 +135,8 @@ interface VshardRow {
 export class Host {
   readonly sql: Sql;
   #catalog: Catalog;
+  /** Requests per vshard since the controller last looked. */
+  readonly #requests = new Map<string, number>();
 
   private constructor(sql: Sql, catalog: Catalog) {
     this.sql = sql;
@@ -182,6 +196,7 @@ export class Host {
   /** Runs each task over local data, prefetching below every row it is asked for. A vshard the caller
    *  routed to that this host no longer serves comes back as a refusal, never as an empty answer. */
   async exec(plan: Plan, tasks: Miss[], routed: Routed | null = null): Promise<ExecReply> {
+    for (const t of tasks) this.#count(vshardOf(missOwner(t)));
     const store = this.store(routed);
     const reply = await hostExec(store, plan, tasks);
     return { ...reply, refusals: [...store.refused.values()] };
@@ -261,6 +276,35 @@ export class Host {
       else if (op.kind === "remove") this.#dropEdge(op.atype, op.id1, op.id2);
       else this.#erase(op.id, new Set());
     });
+  }
+
+  // ---- what it holds, for the placement controller
+
+  /** Per-vshard size and request rate. Reading it resets the request counters, so two readers would
+   *  each see part of the traffic; one controller polls it. */
+  stats(): VshardStats[] {
+    return this.vshards().map((row) => {
+      const vshard = row.vshard.toString();
+      const [lo, hi] = vshardRange(BigInt(row.vshard));
+      const objects = this.sql.all<{ n: number; bytes: number }>(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(data)), 0) AS bytes FROM objects WHERE id BETWEEN ? AND ?",
+        lo,
+        hi,
+      )[0] ?? { n: 0, bytes: 0 };
+      const assocs = this.sql.all<{ bytes: number }>(
+        "SELECT COALESCE(SUM(LENGTH(COALESCE(data, '')) + 24), 0) AS bytes FROM assocs WHERE id1 BETWEEN ? AND ?",
+        lo,
+        hi,
+      )[0] ?? { bytes: 0 };
+      const requests = this.#requests.get(vshard) ?? 0;
+      this.#requests.delete(vshard);
+      return { vshard, bytes: objects.bytes + assocs.bytes, objects: objects.n, requests };
+    });
+  }
+
+  #count(vshard: bigint): void {
+    const k = vshard.toString();
+    this.#requests.set(k, (this.#requests.get(k) ?? 0) + 1);
   }
 
   // ---- moves
