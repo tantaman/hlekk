@@ -15,7 +15,7 @@ import type { Random } from "../runtime/runtime.ts";
 import type { Query } from "../schema/query.ts";
 import type { EdgeType, FieldMap } from "../schema/define.ts";
 import type { Shape } from "./shape.ts";
-import { storedOut } from "./shape.ts";
+import { Sides, storedOut } from "./shape.ts";
 
 /** A payload, and which of the script's objects its id fields point at. */
 interface Written {
@@ -89,6 +89,8 @@ export function generateGraph(r: Random, shape: Shape, opts: GraphOptions = {}):
   /** Edges the script has written, so a remove mostly lands on one rather than on nothing. */
   const written: { atype: number; from: number; to: number }[] = [];
   const positionsOf = (type: string) => byType.get(type) ?? [];
+  // Positions, not ids, since the ids do not exist yet; the rule is the same either way.
+  const sides = new Sides();
 
   for (let i = 0; i < edges; i++) {
     const from = r.int(made.length);
@@ -98,6 +100,8 @@ export function generateGraph(r: Random, shape: Shape, opts: GraphOptions = {}):
     const candidates = positionsOf(rel.to);
     if (candidates.length === 0) continue;
     const to = r.pick(candidates);
+    if (!sides.allows(rel, String(from), String(to))) continue;
+    sides.claim(rel, String(from), String(to));
     ops.push({
       kind: "assoc",
       atype: rel.atype!,

@@ -107,6 +107,30 @@ describe("delivering an inverse to another host", () => {
     assert.equal(await assignedTo(c, 1, alice), 0);
   });
 
+  // Found by the simulation, which writes lazily and so lets two sources interleave. The design says
+  // "each inverse edge has exactly one writer, the vshard of its forward edge, so per-source ordering
+  // is enough". That holds while a caller writes one side of a pair. Write both between the same two
+  // objects and there are two writers for the same two rows, with no ordering between them — so what
+  // survives is decided by whichever source is delivered last. Recorded as an open question; the
+  // generators keep to one side per pair of objects so the rest of the suite is not asking it.
+  it("is left holding half a pair when both its sides are written, which the design records as open", async () => {
+    const { c, db, alice } = await split();
+    const task = await db.create(TASK, { title: "t" }, { vshard: "5" });
+
+    await db.assocAdd(ASSIGNEE, task, alice, 1);
+    await db.assocRemove(ASSIGNEE, task, alice); // task's vshard: add, then withdraw
+    await db.assocAdd(ASSIGNED, alice, task, 1); // Alice's vshard, maintaining the other half
+    await c.deliverAll();
+    assert.equal(c.queued(), 0, "everything was delivered");
+
+    assert.equal(await assignedTo(c, 1, alice), 0, "the withdrawal through the task's vshard landed");
+    assert.equal(
+      await c.host(0).store().count(task, ASSIGNEE),
+      1,
+      "and the add through Alice's put the other half back, which nothing asked for",
+    );
+  });
+
   it("stops a pair at its first failure, so nothing overtakes it, and other pairs carry on", async () => {
     const { c, db, alice } = await split();
     const task = await db.create(TASK, { title: "t" }, { vshard: "5" });
