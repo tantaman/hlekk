@@ -26,6 +26,20 @@ export class NotOwned extends Error {
   }
 }
 
+/** An update whose expected version no longer matches. */
+export class Conflict extends Error {
+  readonly id: Id;
+  readonly expected: number;
+  readonly actual: number;
+  constructor(id: Id, expected: number, actual: number) {
+    super(`${id} is at version ${actual}, not the ${expected} this write expected`);
+    this.name = "Conflict";
+    this.id = id;
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
 /** A value a unique index already holds. `by` names the object holding it, or null while another
  *  caller's reservation is still live. */
 export class Taken extends Error {
@@ -57,7 +71,8 @@ export type Reply<T> =
   | { ok: true; value: T }
   | { ok: false; refused: Refusal }
   | { ok: false; restricted: { id: Id; edge: string } }
-  | { ok: false; taken: { idx: number; key: string; by: Id | null } };
+  | { ok: false; taken: { idx: number; key: string; by: Id | null } }
+  | { ok: false; conflict: { id: Id; expected: number; actual: number } };
 
 export interface IndexReserveOp extends RoutedAt {
   vshard: string;
@@ -103,6 +118,9 @@ export interface CreateOp extends RoutedAt {
 export interface UpdateOp extends RoutedAt {
   id: Id;
   data: Fields;
+  /** The version the caller read. Given one, the write lands only if the object is still at it, so a
+   *  read-modify-write cannot silently lose someone else's. */
+  expect?: number;
 }
 
 export interface DeleteOp extends RoutedAt {
@@ -268,10 +286,14 @@ export class Host {
   update(op: UpdateOp): Reply<number> {
     return this.#write(() => {
       this.#claim(vshardOf(op.id), op.epoch);
+      const before = this.sql.all<{ version: number }>("SELECT version FROM objects WHERE id = ?", toKey(op.id))[0];
+      if (!before) throw new Error(`no such object: ${op.id}`);
+      // Checked in the same transaction as the write, so nothing can land between them.
+      if (op.expect !== undefined && before.version !== op.expect) {
+        throw new Conflict(op.id, op.expect, before.version);
+      }
       this.sql.run("UPDATE objects SET data = ?, version = version + 1 WHERE id = ?", payload(op.data), toKey(op.id));
-      const row = this.sql.all<{ version: number }>("SELECT version FROM objects WHERE id = ?", toKey(op.id))[0];
-      if (!row) throw new Error(`no such object: ${op.id}`);
-      return row.version;
+      return before.version + 1;
     });
   }
 
@@ -584,6 +606,7 @@ export class Host {
       if (e instanceof NotOwned) return { ok: false, refused: e.refusal };
       if (e instanceof Restricted) return { ok: false, restricted: { id: e.id, edge: e.edge } };
       if (e instanceof Taken) return { ok: false, taken: { idx: e.idx, key: e.key, by: e.by } };
+      if (e instanceof Conflict) return { ok: false, conflict: { id: e.id, expected: e.expected, actual: e.actual } };
       throw e;
     }
   }

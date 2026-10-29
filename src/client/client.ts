@@ -10,6 +10,7 @@ import { vshardOf } from "../host/ids.ts";
 import type { Refusal, Reply } from "../host/host.ts";
 import type { HostClient, HostReply } from "../query/driver.ts";
 import { runAsync, runRounds } from "../query/driver.ts";
+import type { Answer } from "../query/driver.ts";
 import type { Stats } from "../query/driver.ts";
 import type { ReadSet } from "../query/stores.ts";
 import { missOwner } from "../query/types.ts";
@@ -101,11 +102,15 @@ export class Hlekk {
     c: QueryOptions = {},
   ): Promise<unknown[]> {
     if (a instanceof Query) return a.run(this, (b as QueryOptions) ?? {});
-    const rootIds = b as Id[];
-    const opts = c;
+    return (await this.answer(a, b as Id[], c)).rows;
+  }
+
+  /** The answer and the graph it was read from. The builder uses the graph for cursors; `normalized`
+   *  turns it into a result that holds each object once. */
+  async answer(plan: Plan, rootIds: Id[], opts: QueryOptions = {}): Promise<Answer> {
     const route = await this.#router(rootIds.map(vshardOf));
     const driver = opts.driver === "rounds" ? runRounds : runAsync;
-    return driver(a, rootIds, route, opts.stats);
+    return driver(plan, rootIds, route, opts.stats);
   }
 
   /** One client per host, so a driver batching by client identity sends one request per host. */
@@ -189,6 +194,7 @@ export class Hlekk {
       if (reply.ok) return reply.value;
       if ("restricted" in reply) throw new WriteRefused(m, reply.restricted);
       if ("taken" in reply) throw new ValueTaken(reply.taken.idx, reply.taken.key, reply.taken.by);
+      if ("conflict" in reply) throw new VersionConflict(reply.conflict.id, reply.conflict.expected, reply.conflict.actual);
 
       if (reply.refused.state === "fenced") {
         // Mid-move. The route is not wrong, so re-resolving would find the same host; the write waits
@@ -218,8 +224,10 @@ export class Hlekk {
     return this.write<Id>({ kind: "create", otype, data, vshard });
   }
 
-  update(id: Id, data: Record<string, Json>): Promise<number> {
-    return this.write<number>({ kind: "update", id, data });
+  /** Updates an object, bumping its version. Pass the version you read as `expect` and the write
+   *  lands only if the object is still at it, so a read-modify-write cannot lose someone else's. */
+  update(id: Id, data: Record<string, Json>, opts: { expect?: number } = {}): Promise<number> {
+    return this.write<number>({ kind: "update", id, data, expect: opts.expect });
   }
 
   delete(id: Id): Promise<void> {
@@ -304,6 +312,20 @@ export function normalize(value: string): string {
 /** How long an unconfirmed reservation holds a value. Long enough to cover a create and a confirm,
  *  short enough that a crash does not strand the value for long. */
 export const RESERVATION_TTL_MS = 30_000;
+
+/** An update whose expected version no longer held. The caller re-reads and decides. */
+export class VersionConflict extends Error {
+  readonly id: Id;
+  readonly expected: number;
+  readonly actual: number;
+  constructor(id: Id, expected: number, actual: number) {
+    super(`${id} is at version ${actual}, not the ${expected} this write expected`);
+    this.name = "VersionConflict";
+    this.id = id;
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
 
 export class ValueTaken extends Error {
   readonly idx: number;

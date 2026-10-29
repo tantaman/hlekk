@@ -94,6 +94,9 @@ export interface Frame {
   source: Source;
   where?: Cond;
   limit?: number;
+  /** Where to start an edge list. A page's cursor comes back here to read the next rows; a request
+   *  may override it, which is how the coordinator continues a list mid-query. */
+  after?: Cursor;
   children: { alias: string; frame: number }[];
   counts: { alias: string; atype: number }[];
 }

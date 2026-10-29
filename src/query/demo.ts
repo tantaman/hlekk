@@ -165,8 +165,8 @@ async function run(label: string, placement: Placement, driver: "rounds" | "asyn
   const stats: Stats = { rounds: 0, requests: 0 };
   const out =
     driver === "rounds"
-      ? await runRounds(plan, ["i1"], route, stats)
-      : await runAsync(plan, ["i1"], route, stats, (f) => clock.defer(f));
+      ? (await runRounds(plan, ["i1"], route, stats)).rows
+      : (await runAsync(plan, ["i1"], route, stats, (f) => clock.defer(f))).rows;
   const answeredAt = clock.now;
   await clock.idle(); // let any speculative request finish, so the log shows it
 

@@ -316,7 +316,7 @@ describe("the same query over one host and two", () => {
 
     const go = async (driver: typeof runRounds, root: Id, route: (id: Id) => HostClient): Promise<Run> => {
       const stats: Stats = { rounds: 0, requests: 0 };
-      return { out: await driver(plan, [root], route, stats), stats };
+      return { out: (await driver(plan, [root], route, stats)).rows, stats };
     };
     return [
       await go(runRounds, root1, route1),

@@ -46,6 +46,14 @@ async function runTask(p: Pass, store: LocalStore, t: Miss): Promise<void> {
 
 export const MAX_ROUNDS = 16;
 
+/** A query's answer, and the normalized graph it was read from. The graph carries what the nested
+ *  rows cannot: every object once with its version, and each edge list's completeness, which is where
+ *  a cursor comes from. */
+export interface Answer {
+  rows: Json[];
+  graph: Cache;
+}
+
 export interface Stats {
   rounds: number;
   requests: number;
@@ -61,7 +69,7 @@ export async function runRounds(
   rootIds: Id[],
   route: (id: Id) => HostClient,
   stats: Stats = { rounds: 0, requests: 0 },
-): Promise<Json[]> {
+): Promise<Answer> {
   const cache = new Cache();
   let tasks: Miss[] = rootIds.map((id) => ({ kind: "object", id, frame: 0 }));
   for (;;) {
@@ -69,7 +77,7 @@ export async function runRounds(
     if (tasks.length === 0) {
       const p = new Pass(new CacheStore(cache), plan);
       const out = await materialize(p.frameOp(0).fetch(p, { ids: rootIds }));
-      if (out !== UNKNOWN) return out;
+      if (out !== UNKNOWN) return { rows: out, graph: cache };
       await p.settle();
       tasks = outstanding(p.misses, cache);
       if (tasks.length === 0) throw new Error("pass missed data the cache already holds");
@@ -113,11 +121,12 @@ export async function runAsync(
   route: (id: Id) => HostClient,
   stats: Stats = { rounds: 0, requests: 0 },
   defer: (f: () => void) => void = (f) => setTimeout(f, 0),
-): Promise<Json[]> {
-  const p = new Pass(new LoaderStore(plan, route, defer, stats), plan);
+): Promise<Answer> {
+  const store = new LoaderStore(plan, route, defer, stats);
+  const p = new Pass(store, plan);
   const out = await materialize(p.frameOp(0).fetch(p, { ids: rootIds }));
   if (out === UNKNOWN) throw new Error("ended short over a store that never answers UNKNOWN");
-  return out;
+  return { rows: out, graph: store.cache };
 }
 
 /** The async driver's store: reads the gathered graph and, on a gap, asks the owning host and waits.

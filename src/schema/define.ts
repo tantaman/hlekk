@@ -32,8 +32,19 @@ export interface FieldMap {
   [name: string]: Field<unknown>;
 }
 
-/** What one object reads as: its id, then its projected fields. */
-export type RowOf<F extends FieldMap> = { id: Id } & { [K in keyof F]: F[K]["value"] };
+/** The edge that reached a row. Absent on a root and on a field hop, since no edge reached those. */
+export interface EdgeInfo {
+  time: number;
+  data: Json | null;
+}
+
+/** What one object reads as: the payload's fields, plus what the result carries alongside them. A
+ *  field under one of these names is refused by the catalog rather than shadowed here. */
+export type RowOf<F extends FieldMap> = {
+  id: Id;
+  $version: number;
+  $edge?: EdgeInfo;
+} & { [K in keyof F]: F[K]["value"] };
 
 export interface ObjectOptions {
   /** False where the projection cannot supply every required field, so no create is generated. */

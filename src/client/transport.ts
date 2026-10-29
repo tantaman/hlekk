@@ -9,7 +9,7 @@ import type { Fields, Id, Miss, Plan } from "../query/types.ts";
 /** A mutation as the caller states it. The client fills in the epoch it routed with. */
 export type Mutation =
   | { kind: "create"; otype: number; data: Fields; with?: Id; vshard?: string }
-  | { kind: "update"; id: Id; data: Fields }
+  | { kind: "update"; id: Id; data: Fields; expect?: number }
   | { kind: "delete"; id: Id }
   | { kind: "assocAdd"; atype: number; id1: Id; id2: Id; time?: number; data?: Fields | null }
   | { kind: "assocRemove"; atype: number; id1: Id; id2: Id }

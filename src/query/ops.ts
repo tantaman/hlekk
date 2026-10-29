@@ -91,7 +91,7 @@ export function buildFrame(plan: Plan, id: number, mode: "full" | "rows"): Op {
       f.source.kind === "ids"
         ? new ObjectsById(id)
         : f.source.kind === "edge"
-          ? new EdgeHop(id, f.source.atype)
+          ? new EdgeHop(id, f.source.atype, f.after ?? null)
           : new FieldHop(id, f.source.field);
     if (f.where) op = new Where(op, f.where);
     op = new Take(op, f.limit ?? DEFAULT_LIMIT); // every frame has a limit
@@ -134,16 +134,19 @@ export class ObjectsById implements Op {
 export class EdgeHop implements Op {
   readonly frame: number;
   readonly atype: number;
+  /** Where the plan says to start, when the request names no cursor of its own. */
+  readonly from: Cursor | null;
 
-  constructor(frame: number, atype: number) {
+  constructor(frame: number, atype: number, from: Cursor | null = null) {
     this.frame = frame;
     this.atype = atype;
+    this.from = from;
   }
 
   async *fetch(p: Pass, req: Req): Stream {
     if (!req.parent) return "done";
     const id1 = req.parent.obj.id;
-    let after = req.after ?? null;
+    let after = req.after ?? this.from;
     for (let n = req.want ?? DEFAULT_LIMIT; ; n = Math.min(MAX_PAGE, n * 2)) {
       const page = await p.store.edges(id1, this.atype, after, n, this.frame);
       if (page === UNKNOWN) {
@@ -477,7 +480,12 @@ async function materializeNode(n: Node): Promise<Maybe<Json>> {
     Promise.all(n.counts.map((c) => c.n())),
   ]);
   if (!allKnown(rels) || !allKnown(counts)) return UNKNOWN;
-  const o: Fields = { id: n.row.obj.id, ...n.row.obj.data };
+  // Reserved keys go after the payload, so they are authoritative: a `$`-prefixed field name is
+  // refused by the catalog, but stored JSON is not re-validated on read.
+  const o: Fields = { ...n.row.obj.data, id: n.row.obj.id, $version: n.row.obj.version };
+  // The edge that reached this row. Without it an edge's own time and data can be filtered on and
+  // never read, and a limited list has no cursor to continue from.
+  if (n.row.edge) o.$edge = { time: n.row.edge.time, data: n.row.edge.data };
   n.rels.forEach((r, i) => (o[r.alias] = rels[i]));
   n.counts.forEach((c, i) => (o[c.alias] = counts[i]));
   return o;
