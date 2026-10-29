@@ -14,6 +14,8 @@ import type { Stats } from "../query/driver.ts";
 import type { ReadSet } from "../query/stores.ts";
 import { missOwner } from "../query/types.ts";
 import type { Id, Json, Miss, Plan } from "../query/types.ts";
+import { Query } from "../schema/query.ts";
+import type { FieldMap } from "../schema/define.ts";
 import { Routes } from "./routes.ts";
 import { anchorOf } from "./transport.ts";
 import type { Mutation, Transport } from "./transport.ts";
@@ -90,10 +92,20 @@ export class Hlekk {
 
   // ---- reads
 
-  async query(plan: Plan, rootIds: Id[], opts: QueryOptions = {}): Promise<Json[]> {
+  /** Runs a built query, or a plan with the roots to start it from. */
+  async query<S>(query: Query<FieldMap, S>, opts?: QueryOptions): Promise<S[]>;
+  async query(plan: Plan, rootIds: Id[], opts?: QueryOptions): Promise<Json[]>;
+  async query(
+    a: Plan | Query<FieldMap, unknown>,
+    b?: Id[] | QueryOptions,
+    c: QueryOptions = {},
+  ): Promise<unknown[]> {
+    if (a instanceof Query) return a.run(this, (b as QueryOptions) ?? {});
+    const rootIds = b as Id[];
+    const opts = c;
     const route = await this.#router(rootIds.map(vshardOf));
     const driver = opts.driver === "rounds" ? runRounds : runAsync;
-    return driver(plan, rootIds, route, opts.stats);
+    return driver(a, rootIds, route, opts.stats);
   }
 
   /** One client per host, so a driver batching by client identity sends one request per host. */
