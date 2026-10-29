@@ -7,8 +7,10 @@
 import { Directory } from "../directory/directory.ts";
 import { chunkKey } from "../directory/map.ts";
 import type { Route } from "../directory/map.ts";
+import { Mover } from "../directory/move.ts";
+import type { MoveHosts } from "../directory/move.ts";
 import { Host } from "../host/host.ts";
-import type { ExecReply, Reply, Routed } from "../host/host.ts";
+import type { ExecReply, Reply, Routed, Snapshot } from "../host/host.ts";
 import { nodeSql } from "../host/sql.node.ts";
 import type { Catalog } from "../catalog/catalog.ts";
 import type { Miss, Plan } from "../query/types.ts";
@@ -54,12 +56,70 @@ export class LocalCluster {
   readonly calls = { exec: 0, write: 0, resolve: 0 };
   readonly database: string;
 
+  readonly mover: Mover;
+  /** Hosts a chaos test has knocked over. Every move operation against one throws. */
+  readonly down = new Set<number>();
+
   constructor(opts: LocalOptions = {}) {
     this.database = opts.database ?? "db";
     this.directory = Directory.open(nodeSql(), { database: this.database, batch: opts.batch });
     for (const h of this.directory.hostIndexes()) this.host(h);
     this.adoptAll();
     this.transport = this.#transport();
+    this.mover = new Mover(this.directory, this.#moveHosts());
+  }
+
+  /** Move operations a chaos test has made fail, by name. */
+  readonly failing = new Set<keyof MoveHosts>();
+
+  /** Knocks a host over, so the move driving it fails partway and has to resume. */
+  kill(host: number): void {
+    this.down.add(host);
+  }
+
+  revive(host: number): void {
+    this.down.delete(host);
+  }
+
+  /** Fails one step of the move protocol, wherever it runs, so a test can crash at a chosen point. */
+  failAt(...steps: (keyof MoveHosts)[]): void {
+    for (const s of steps) this.failing.add(s);
+  }
+
+  heal(): void {
+    this.failing.clear();
+    this.down.clear();
+  }
+
+  #live(host: number, step: keyof MoveHosts): Host {
+    if (this.failing.has(step)) throw new Error(`${step} is failing`);
+    if (this.down.has(host)) throw new Error(`host ${host} is down`);
+    return this.host(host);
+  }
+
+  #moveHosts(): MoveHosts {
+    const c = this;
+    return {
+      async ensure(host: number): Promise<void> {
+        // A new host DO is created empty and receives whole vshards. It never mints them.
+        c.#live(host, "ensure");
+      },
+      async fence(host: number, vshard: string): Promise<void> {
+        c.#live(host, "fence").setState(vshard, "fenced");
+      },
+      async snapshot(host: number, vshard: string): Promise<Snapshot> {
+        return c.#live(host, "snapshot").snapshot(vshard);
+      },
+      async install(host: number, snapshot: Snapshot, epoch: number): Promise<void> {
+        c.#live(host, "install").install(snapshot, epoch);
+      },
+      async retire(host: number, vshard: string): Promise<void> {
+        c.#live(host, "retire").setState(vshard, "moved");
+      },
+      async purge(host: number, vshard: string): Promise<void> {
+        c.#live(host, "purge").purge(vshard);
+      },
+    };
   }
 
   /** The host at an index, created empty if it is new. A host receives vshards; it never mints them. */

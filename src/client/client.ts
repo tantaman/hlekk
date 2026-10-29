@@ -29,6 +29,19 @@ export class Unroutable extends Error {
   }
 }
 
+/** How long a write waits for a vshard that is mid-move. The source is fenced for the length of the
+ *  copy, so the write pauses rather than failing; past this it gives up and says why. */
+export const WRITE_DEADLINE_MS = 5_000;
+
+export class StillFenced extends Error {
+  readonly vshard: bigint;
+  constructor(vshard: bigint, waited: number) {
+    super(`vshard ${vshard} was still fenced after ${waited} ms: a move is taking longer than the write could wait`);
+    this.name = "StillFenced";
+    this.vshard = vshard;
+  }
+}
+
 export class TooManyReroutes extends Error {
   readonly refusals: Refusal[];
   constructor(refusals: Refusal[]) {
@@ -36,6 +49,13 @@ export class TooManyReroutes extends Error {
     this.name = "TooManyReroutes";
     this.refusals = refusals;
   }
+}
+
+export interface WriteOptions {
+  /** How long to wait out a move before giving up. */
+  deadlineMs?: number;
+  /** Injectable for tests, so a paused write does not depend on wall-clock timing. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface QueryOptions {
@@ -142,16 +162,32 @@ export class Hlekk {
 
   // ---- writes
 
-  async write<T = unknown>(m: Mutation): Promise<T> {
+  async write<T = unknown>(m: Mutation, opts: WriteOptions = {}): Promise<T> {
     const anchor = anchorOf(m);
     const vshard = anchor.kind === "id" ? vshardOf(anchor.id) : BigInt(anchor.vshard);
-    for (let depth = 0; ; depth++) {
+    const budget = opts.deadlineMs ?? WRITE_DEADLINE_MS;
+    const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    const until = Date.now() + budget;
+    let reroutes = 0;
+    let wait = 1;
+    for (;;) {
       const route = await this.routes.route(vshard);
       if (!route) throw new Unroutable(vshard);
       const reply = (await this.#transport.write(route.host, m, route.epoch)) as Reply<T>;
       if (reply.ok) return reply.value;
       if (!("refused" in reply)) throw new WriteRefused(m, reply.restricted);
-      if (depth >= MAX_REROUTES) throw new TooManyReroutes([reply.refused]);
+
+      if (reply.refused.state === "fenced") {
+        // Mid-move. The route is not wrong, so re-resolving would find the same host; the write waits
+        // for the copy and the flip, which is what "writes pause for the duration" means.
+        if (Date.now() >= until) throw new StillFenced(vshard, budget);
+        await sleep(wait);
+        wait = Math.min(wait * 2, 50);
+        await this.routes.reroute([vshard]); // in case the flip landed while we waited
+        continue;
+      }
+      // Retired, absent, or an epoch we no longer hold: the route is stale, not busy.
+      if (++reroutes > MAX_REROUTES) throw new TooManyReroutes([reply.refused]);
       await this.routes.reroute([vshard]);
     }
   }
