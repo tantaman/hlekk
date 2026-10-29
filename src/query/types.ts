@@ -62,9 +62,17 @@ export interface Cursor {
   id2: Id;
 }
 
+/** Numeric order over canonical decimal ids: length first, then lexicographic. A host orders by the
+ *  8-byte big-endian blob, which sorts numerically, so the coordinator has to agree with it or a
+ *  tie-broken cursor lands in the wrong place. Plain string compare would put "10" before "9". */
+export function cmpId(a: Id, b: Id): number {
+  if (a.length !== b.length) return a.length < b.length ? -1 : 1;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export function edgeOrder(a: Cursor, b: Cursor): number {
   if (a.time !== b.time) return b.time - a.time;
-  return a.id2 < b.id2 ? 1 : a.id2 > b.id2 ? -1 : 0;
+  return -cmpId(a.id2, b.id2);
 }
 
 export const listKey = (id1: Id, atype: number) => `${id1}:${atype}`;

@@ -4,7 +4,7 @@
 
 import { hostExec, runAsync, runRounds } from "./driver.ts";
 import type { HostClient, Stats } from "./driver.ts";
-import { HostData } from "./stores.ts";
+import { HostData, HostStore } from "./stores.ts";
 import type { Edge, Id, Json, Miss, Obj, Plan } from "./types.ts";
 
 const [ISSUE, COMMENT, LABEL, USER] = [1, 2, 3, 4]; // otypes
@@ -154,7 +154,7 @@ async function run(label: string, placement: Placement, driver: "rounds" | "asyn
     hosts.set(name, {
       async exec(plan, tasks) {
         const start = clock.now;
-        const reply = await hostExec(data, plan, tasks);
+        const reply = await hostExec(new HostStore(data), plan, tasks);
         await clock.sleep(LATENCY[name]);
         log.push({ start, end: clock.now, host: name, tasks });
         return reply;
