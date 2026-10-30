@@ -189,10 +189,42 @@ for page 1 is `April`, ns 0, with 414 outlinks, 156 backlinks and 2 categories. 
 category affinity key; the other 48% have no categories at all and fall back to `ns:`, which is
 worth knowing before treating category affinity as the only knob.
 
-**One figure to carry forward: the intermediate is large.** 1.9 GB of JSONL for 1% of enwiki
-extrapolates to roughly 130 GB — about half the database it describes, in a verbose format, written
-and then read once. Streaming it into the loader rather than materializing it is the obvious answer
-and the seam does not forbid it.
+### The intermediate should not be a file
+
+`records.jsonl` is 1.9 GB for 1% of enwiki, which extrapolates to **~164 GB** — the file is ~94%
+edge bytes at a measured **46.9 bytes per edge**, and enwiki should carry ~3.5 billion edges once
+red links are dropped. (An earlier draft said ~130 GB by scaling page counts; the file scales with
+edges.)
+
+Three reasons it should be a generator the loader pulls from rather than a file, in decreasing order
+of how much they settle:
+
+- **The checkpoint already exists one step earlier.** The one good reason to materialize is
+  resumability, which this doc's demo counterpart rightly puts above throughput. But `edges.tsv` has
+  to exist regardless — the external sort produces it — and it holds the same information at 33.7
+  bytes/edge. Pass 5 is a deterministic three-way merge over already-sorted files: **measured at 58
+  seconds** to regenerate all 42,817,596 simplewiki records from the existing intermediates,
+  touching no dump and re-sorting nothing. So `records.jsonl` is a second copy of a checkpoint that
+  already exists, 1.4× larger, buying no resumability the first one does not.
+- **The affinity comparison invalidates it anyway.** Loading twice to show the affinity knob varies a
+  per-page field and leaves every edge alone — verified over 300,000 records: 100% identical edge
+  lists, 100% changed affinity keys. A materialized `records.jsonl` is an artifact the second load
+  discards, while `edges.tsv`, the expensive thing, survives both. `--passes 0b,5` is the re-run.
+- **JSON spends most of the file on a constant.** 25 of those 46.9 bytes per edge are the literal
+  `"type":"wiki.linked_from"`, repeated per edge, to carry an atype with four possible values. TSV
+  with an integer atype holds the same 3.5 billion edges in ~49 GB. If a materialized form is wanted
+  — to hand someone the file, say — it should be that one.
+
+What makes this less trivial than "just stream it": the loader needs records grouped by
+`(host, vshard)`, not by `page_id`, so it cannot consume a stream and write directly. But at 128
+vshards that is 128 open buffers in one pass, not a sort. **And the seam does not move** — the
+contract is the record shape, not a file, so this is a choice on the import side rather than a
+renegotiation of it.
+
+**Peak disk is the figure this rolls up into.** At enwiki scale: `edges-raw` ~118 GB, `edges.tsv`
+another ~118 GB, `sort`'s own temp space ~118 GB while it merges, `records.jsonl` ~164 GB, and ~20 GB
+for everything else — **~540 GB of intermediate to build a ~250–300 GB database.** Dropping the
+JSONL takes that under 400 GB; an integer atype in `edges.tsv` takes it further.
 
 ### The bug the guard caught
 
@@ -337,7 +369,9 @@ hold. Two findings worth keeping, both design gaps rather than loading problems:
 - [ ] Whether the 100 KB SQL statement limit is per statement or per `exec` string.
 - [ ] Which affinity functions the demo compares, given the import takes it as a parameter. Note
       that 48% of simplewiki pages have no category, so `category` is half a fallback to `namespace`.
-- [ ] Whether `records.jsonl` is streamed into the loader rather than materialized, given it is
-      ~130 GB at enwiki scale.
+- [x] `records.jsonl` should be a generator, not a file: ~164 GB at enwiki scale, a duplicate of a
+      checkpoint `edges.tsv` already provides, and discarded by the second affinity load anyway. The
+      loader partitions by `(host, vshard)` in one pass over 128 buffers. Not yet implemented — the
+      script still writes the file.
 - [ ] enwiki's red-link share, which sets the real edge count. simplewiki's is 24.5% of links and
       0.6% of category targets; a complete wiki should be lower on both.
