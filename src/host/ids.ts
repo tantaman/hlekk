@@ -4,33 +4,56 @@
 
 import type { Id } from "../query/types.ts";
 
-// 20 vshard bits, 40 sequence bits, and the top 4 RESERVED and required to be zero.
+// 20 vshard bits, 43 sequence bits, and the top bit RESERVED and required to be zero.
 //
-// It was 24/40/0. The vshard field narrowed because a vshard's size is no longer bounded by what a
-// stop-the-world move can copy: 24 bits reached 16.7 PB only at the ~1 GB cap that bound set, and
-// 2^20 vshards reach ~105 PB at 100 GB each — a higher ceiling from a narrower field. Even if the
-// cap never moves, 2^20 × 1 GB is 1 PB, so this is not a bet on that change landing.
+// It was 24/40/0, and briefly 20/40/4. Two asymmetries decide the split, and both point the same
+// way.
 //
-// The spare bits are at the TOP, and that is the whole point of doing this before any id exists.
-// The vshard field stays anchored at bit 40, so every id ever minted has zeros above bit 59 and
-// `id >> SEQ_BITS` decodes identically under a wider field: widening back to 24 bits later needs no
-// migration. Narrowing later would need one. So this direction is free and reversible, and what it
-// buys today is the refusal below — nothing can mint a vshard id above 2^20 and quietly spend the
-// reservation.
+// 1. SEQ_BITS can never change. The vshard field is anchored at bit SEQ_BITS, so widening the
+//    sequence MOVES it: an id minted as (vshard 5, seq 100) is 5*2^40 + 100, and re-reading that
+//    number at SEQ_BITS = 44 yields vshard 0. Every id would have to be re-minted, which edges
+//    make impossible. Widening VSHARD_BITS upward into reserved bits is the only free move, since
+//    every existing id has zeros up there and `id >> SEQ_BITS` is unchanged. So spare bits only
+//    ever help the vshard field.
+//
+// 2. The pressure moved the other way. The vshard field narrowed BECAUSE a vshard can be larger,
+//    so fewer are needed; reserving bits to relieve vshard pressure while arguing that pressure is
+//    falling makes no sense. Meanwhile the byte cap is what used to retire a vshard early, and
+//    removing it means vshards live longer and accumulate more ids — the sequence is what becomes
+//    the binding lifetime bound. The bits follow the pressure.
+//
+// The failure modes are not symmetric either. Running out of vshards stops new roots but has two
+// outs: widen the field, or shard above hlekk into a second logical database. Running out of
+// sequence in one vshard means that vshard can never take a colocated child again, and there is no
+// out — `with: parent` is a guarantee the caller asked for, and an object cannot be re-identified
+// without breaking every edge that names it.
+//
+// What 43 bits buys: a vshard's creates are bounded by one DO at ~1,000/sec, which is 3.15e10 ids a
+// year, so 2^43 is ~279 years at that ceiling and ~27,900 at the 10/sec the design doc's worked
+// example uses. 2^40 was ~35 years at the ceiling, which is where the doc's "3,500 years" came
+// from — that figure assumed 10/sec, one percent of what one vshard can serve.
+//
+// The one reserved bit is NOT option value; it is the sign bit, and it is load-bearing. Keeping it
+// clear puts every id below 2^63, which is the threshold where SQLite coerces an integer to REAL
+// and two distinct ids can compare equal (design.md, "Why BLOB storage" — a local sqlite3 test
+// confirmed it). Blob keys are the defence; this makes the collision unrepresentable rather than
+// merely avoided, which is principle 7 applied to the layout. It also means the vshard field is now
+// effectively fixed at 20 bits, since widening it would spend that bit: 2^20 vshards is ~1 PB at
+// the current ~1 GB cap and ~105 PB at 100 GB each, and the escape hatch above is a second database.
 //
 // Deliberately NOT carved up further. A fixed sub-slab field for the split scheme (design.md,
-// "If splits are ever needed") would have to come out of the sequence, and 16 slab bits leaves 24
-// for the sequence — 16.7M objects per vshard, where a 100 GB vshard of 1 KB objects wants ~10^8.
+// "If splits are ever needed") would have to come out of the sequence, and 16 slab bits leaves 27
+// for the sequence — 134M objects per vshard, where a 100 GB vshard of 1 KB objects wants ~10^8.
 // Slabs are allocated dynamically out of the sequence space, with continuation slabs when one
 // fills, which is what makes them work at any vshard size.
 export const VSHARD_BITS = 20n;
-export const SEQ_BITS = 40n;
+export const SEQ_BITS = 43n;
 export const RESERVED_BITS = 64n - VSHARD_BITS - SEQ_BITS;
 
 export const MAX_VSHARD = (1n << VSHARD_BITS) - 1n;
 export const MAX_SEQ = (1n << SEQ_BITS) - 1n;
-// Also the reserved-bits check: an id with any bit above 59 set is out of range, so a reservation
-// cannot be spent by accident on the read path either.
+// Also the sign-bit check: an id at or above 2^63 is out of range, so the one value SQLite would
+// coerce to REAL cannot reach storage even if a caller hands one in.
 const MAX_ID = (1n << (VSHARD_BITS + SEQ_BITS)) - 1n;
 
 /** Parses a decimal id. Throws on anything else, rather than letting it reach SQLite. */

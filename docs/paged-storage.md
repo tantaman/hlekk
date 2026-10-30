@@ -251,23 +251,29 @@ bound above, since vshards are what parallelism is bought with.
 ## The id layout
 
 Changed ahead of the storage decision, because every id ever minted encodes it and no id exists yet.
-**4 reserved / 20 vshard / 40 sequence**, from 24/40 with nothing spare. `design.md`'s *Layout* has
+**1 reserved / 20 vshard / 43 sequence**, from 24/40 with nothing spare. `design.md`'s *Layout* has
 the full reasoning; the parts that belong here:
 
 - **The old 16 PB ceiling was a product of the cap**, not of the field. 2^24 × 1 GB is 16 PB; 2^20 ×
   100 GB is ~105 PB. A narrower field with a larger vshard reaches further.
 - **It is not a bet on paged storage landing.** 2^20 × 1 GB is still 1 PB.
-- **Reserving at the top is what makes it reversible.** The vshard field stays anchored at bit 40,
-  so every id has zeros above bit 59 and `id >> 40` decodes identically under a wider field:
-  widening back needs no migration, narrowing later would.
-- **Sequence bits did not need to grow.** A 100 GB vshard of 1 KB objects is 10^8 objects against
-  2^40 — four orders of magnitude spare. Larger vshards do not pressure the sequence.
-- **Nothing was spent.** A type tag was considered and rejected: it makes type immutable per object,
+- **The freed bits went to the sequence**, which is the half of this that paged storage drives. The
+  byte cap is what used to retire a vshard early; removing it means vshards live longer and spend
+  more ids, so the sequence becomes the binding lifetime bound. `SEQ_BITS` can never be changed
+  afterwards — widening it moves the vshard field and re-decodes every id — whereas the vshard
+  field can be widened into spare bits, so a reservation only ever helps the field whose pressure
+  this change *reduces*. Stated against what a vshard can actually serve rather than a sample rate:
+  one DO at ~1,000 creates/sec is 3.15e10 ids a year, so 2^43 is ~279 years and 2^40 would have
+  been ~35.
+- **Nothing was spent on a new field.** A type tag was rejected: it makes type immutable per object,
   pins type ids across catalog edits that teams make independently, and `design.md`'s indexing
   measurement uses "an id names a vshard but not a type" as a reason the shared object table is
-  right. A fixed sub-slab field was considered and rejected on arithmetic: 16 slab bits leaves 24
-  for the sequence, or 16.7M objects per vshard, where a 100 GB vshard wants ~10^8. Slabs stay
-  dynamic.
+  right. A fixed sub-slab field was rejected on arithmetic: 16 slab bits leaves 27 for the
+  sequence, against a lifetime budget measured in centuries. Slabs stay dynamic.
+- **The one reserved bit is the sign bit.** Every id stays below 2^63, the threshold where SQLite
+  coerces an integer to REAL and two distinct ids can compare equal. Blob keys are the defence;
+  this makes the collision unrepresentable. The cost is that the vshard field is now effectively
+  fixed at 20 bits, with a second logical database as the escape hatch above ~1 PB.
 - **One unforeseen benefit.** At 24 bits a fully fragmented shard map was 16.7M entries and 200 MB,
   which a 25 MiB KV value could not hold at all. At 20 bits the same worst case is ~12.6 MB and
   fits one value, so chunking becomes an optimization rather than the only route to the ceiling.
