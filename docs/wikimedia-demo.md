@@ -22,6 +22,12 @@ Branch: `claude/focused-pascal-cli6hi`. Relevant commits are cited inline.
   link graph* is the natural shape and needs nothing new.
 - **The data is a real Wikimedia import**, prepared on its own branch, not a synthetic generator.
   That fixes the loader's input seam as the thing to agree on first; see *What the loader owes*.
+  [`wikimedia-import.md`](wikimedia-import.md) is that side: which dumps, their measured row counts,
+  the catalog they map onto, and the record stream `scripts/import-enwiki.mjs` emits. It answers five
+  of the open questions below with measurements — redirects are **15,551,165**, not ~10M, and should
+  be pages; `MAX_PAYLOAD` does not bind because no wikitext is stored — and raises two live bugs on
+  this side: `normalize` lowercases index keys, so a `${ns}:${title}` key still collides `Ash` with
+  `ASH`, and `categorylinks` has dropped `cl_to` for a `linktarget` reference.
 
 ## What already carries the demo
 
@@ -104,7 +110,10 @@ Four constraints the loader has to respect:
 ### What the import branch needs to emit
 
 Per record: an **affinity key**, a **type**, a **field map**, and **outbound edges expressed in the
-source's own identifiers**. The loader owns everything downstream of that — vshard choice, id
+source's own identifiers**. This is what `scripts/import-enwiki.mjs` writes, as JSONL — see
+[`wikimedia-import.md`](wikimedia-import.md#what-the-import-emits) for the shape and the passes that
+produce it, including that both directions of both relations are materialized rather than declared
+as inverses, exactly because the outbox is out of scope here. The loader owns everything downstream of that — vshard choice, id
 minting, reference resolution, batching per `(host, vshard)`, both halves of each edge, counts, index
 entries. Keeping the parse step behind that seam is what lets the ingest path be proven at 3 GB
 before 300 GB is committed to it.
@@ -212,10 +221,18 @@ demo later wants it.
 
 ## Open
 
-- [ ] What `MAX_PAYLOAD` forces for oversized articles: truncate, metadata-only, or split.
-- [ ] Redirects as pages or as a field.
-- [ ] The affinity function, and whether the demo loads twice to show the knob.
-- [ ] Whether the loader is one pass with buffered references or two passes over the dump.
+- [x] What `MAX_PAYLOAD` forces for oversized articles: nothing, because the import stores a ~300
+      character lead extract rather than wikitext. It binds only if article text is wanted, and
+      `page.page_len` gives the maximum without parsing anything.
+- [x] Redirects as pages, 15,551,165 of them (counted, not estimated). A redirect has its own title,
+      its own `page` row and its own outbound link, and `pagelinks` resolves through `linktarget` to
+      *titles* — so demoting one to a field breaks link resolution for every link pointing at it.
+- [ ] Which affinity functions the demo compares. The import takes it as a parameter already
+      (`--affinity category|namespace|initial|hash`, `hash` being the no-locality control), so
+      loading twice is a decision rather than a rebuild.
+- [x] Two passes over the dump, not one with buffered references: ids must exist before edges can
+      reference them, and the alternative buffers 1.78 billion unresolved references. Both dumps
+      sort cheaply on their join keys.
 - [ ] Whether the demo needs any read the unique-index entry point cannot reach — which would mean
       the deferred non-unique global index, and is the one thing here that is real added scope.
 - [ ] The query editor's limits policy: maximum depth, maximum limit per frame, and the budget a
