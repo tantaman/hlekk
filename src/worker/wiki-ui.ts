@@ -100,6 +100,10 @@ select.hw-input{font-family:var(--font-mono);font-size:13px}
 .hw-note code,.hw-note kbd{font-family:var(--font-mono);font-size:12.5px}
 .hw-note kbd{border:1px solid var(--line2);border-radius:5px;padding:1px 5px;background:var(--white)}
 .hw-note a{color:var(--cobalt);text-decoration:none}
+/* Each hint is one unit: wrapping is allowed between hints and never inside one, so a key never
+   ends up on a different line from the verb it belongs to. */
+.hw-keys{display:flex;flex-wrap:wrap;gap:6px 14px;margin:0 0 2vh}
+.hw-keys span{white-space:nowrap}
 .hw-err{background:color-mix(in srgb,var(--orange) 8%,var(--panel));border:1px solid color-mix(in srgb,var(--orange) 40%,var(--line2));
   border-radius:10px;padding:11px 14px;font-size:13.5px;color:var(--ink);margin:0 0 2vh}
 
@@ -154,7 +158,10 @@ select.hw-input{font-family:var(--font-mono);font-size:13px}
 .hw-t-n{color:#d49bce}
 /* The completion popup lives on the dark surface, so it is the dark surface's menu -- and an option
    wears the token colour it will become. */
-.qcomp{position:absolute;z-index:20;min-width:270px;max-height:198px;overflow-y:auto;
+/* width:max-content so it hugs its options, capped at the editor's own width: the inline left the
+   script sets is 16px, so a fixed min-width of 270px overflowed the surface on a 320px screen. */
+.qcomp{position:absolute;z-index:20;width:max-content;min-width:0;max-width:calc(100% - 32px);
+  max-height:198px;overflow-y:auto;
   background:#221d16;border:1px solid #3a3328;border-radius:10px;padding:5px;
   box-shadow:0 24px 50px -28px rgba(20,14,4,.8);font-family:var(--font-mono);font-size:12px}
 .qopt{display:flex;justify-content:space-between;gap:16px;padding:5px 9px;border-radius:7px;cursor:pointer;color:#cabfa8}
@@ -170,7 +177,18 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
 .hw-foot{margin-top:7vh;padding:4vh 0;text-align:center;font-family:var(--font-mono);font-size:11px;
   color:var(--ink-f);letter-spacing:.06em;line-height:1.9}
 .hw-foot a{color:var(--ink-f)}
-@media (max-width:620px){.hw-kv{grid-template-columns:repeat(auto-fit,minmax(104px,1fr))}}
+@media (max-width:620px){
+  .hw-kv{grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:16px 18px}
+  /* Full-width controls, because a half-width control beside a wrapped one reads as a mistake. */
+  .hw-entry{gap:8px}
+  .hw-entry .hw-input[type=search]{flex:1 1 100%}
+  .hw-entry select.hw-input,.hw-entry .hw-btn,.qbar .hw-input,.qbar .hw-btn{width:100%}
+  /* Finger-sized: 6px of padding is a comfortable mouse target and a poor thumb one. */
+  .hw-mini{padding:9px 13px}
+  .hw-chips a{padding:6px 12px}
+  .qedit{min-height:150px}
+  .hw-hero{padding-top:3.4vh}
+}
 </style>
 </head>
 <body>
@@ -229,8 +247,8 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
 
     <p class="hw-err" id="qerr" hidden></p>
     <div class="qcost" id="cost"></div>
-    <p class="hw-note" style="margin-bottom:2vh"><kbd>ctrl</kbd>+<kbd>space</kbd> opens the popup
-      anywhere · <kbd>tab</kbd> accepts · <kbd>⌘</kbd>+<kbd>↩</kbd> runs</p>
+    <p class="hw-note hw-keys"><span><kbd>ctrl</kbd>+<kbd>space</kbd> opens the popup anywhere</span>
+      <span><kbd>tab</kbd> accepts</span> <span><kbd>⌘</kbd>+<kbd>↩</kbd> runs</span></p>
     <div id="qout"></div>
   </section>
 </main>
