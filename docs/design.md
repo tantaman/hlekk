@@ -964,7 +964,23 @@ Build the riskiest parts first: per-host performance, then moves under load. Eve
 5. **Allocator and placement controller.** Initial sharding, batch growth of the active set, automatic moves on storage and request pressure, and colocation with `with`. — *built*
 6. **Global unique index.** User by email, with reserve → create → confirm. — *built*
 
-What is not built, and is not the deferred work below: a Workers deployment. `npm run smoke` runs a host on real Durable Object SQLite through the DO adapter, which is what says the adapter is right — blobs arrive as `ArrayBuffer` and are normalized, `transactionSync` commits and rolls back, and an 8-byte big-endian key really does sort in unsigned numeric order up to 2^64−1 in the engine the design rests on. What it does not cover is the directory, KV, routing between real DOs, alarms, eviction or request gates, and it is one host, so it still measures no throughput. Non-unique global index maintenance through the outbox is also not built.
+`npm run smoke` runs a host on real Durable Object SQLite through the DO adapter, which is what says the adapter is right — blobs arrive as `ArrayBuffer` and are normalized, `transactionSync` commits and rolls back, and an 8-byte big-endian key really does sort in unsigned numeric order up to 2^64−1 in the engine the design rests on.
+
+`npm run app` runs a database: a host Durable Object, a directory Durable Object, a KV namespace for the published map, and `src/do/transport.ts`, which is the whole of what the platform costs — eight methods, below which nothing above it changes. It asserts what it did rather than that the requests succeeded: that the rows landed on more than one host DO, that a maintained inverse edge arrived from the host that wrote its other half and that those objects really are elsewhere, that a graph read assembled its answer from several hosts, that both drivers agree, that a vshard moves to a host that has never held anything and the same read still answers the same, and that the placement controller sheds a run when a host crosses its threshold.
+
+### What a deployment still owes
+
+- **A deployment.** `npm run app` runs on local workerd: real DO SQLite, real DO-to-DO calls, KV simulated. Nothing is deployed by the suite.
+- **Throughput.** Still unmeasured, and still what sets vshard density and cost. `npm run app` writes tens of objects, not thousands.
+- **Eviction.** A host's request counter is in memory, so an eviction resets it and `stats()` under-reports request pressure to the placement controller. Byte pressure is unaffected. Nothing here notices.
+- **Request gates**, and non-unique global index maintenance through the outbox.
+
+Four things the platform charged for that the in-process cluster did not:
+
+- **A Durable Object may not touch its storage while it is being constructed.** Opening a database assigns its first batch of vshards in one transaction, so the directory had to build its pieces on first use instead. It failed as an opaque internal error with a reference number and nothing else, which is why the DO layer builds its handler table inside its own error handling and logs what it catches: a Durable Object that cannot say what went wrong cannot be operated.
+- **A vshard has to be adopted on its host before a write to it can land**, and the allocator opens vshards synchronously while adopting one is a round trip. The adoptions it asks for are collected and flushed by whichever call asked for them.
+- **A host a move creates has never seen the lock**, and a host without one applies no `onDelete` and maintains no inverse. `ensure` is where it is given one, before it is given any rows.
+- **A vshard is a bigint in memory and has to be a decimal string on the wire**, for the same reason an id is. `Shed` carried bigints and `JSON.stringify` refused them.
 
 ### What the suite tests
 

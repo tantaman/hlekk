@@ -5,6 +5,7 @@
 // frame, addressed by index, so a frontier task can carry its frame and a host can cache the plan.
 
 import { DEFAULT_LIMIT } from "../query/ops.ts";
+import type { Stats } from "../query/driver.ts";
 import type { Cond, CmpOp, Id, Json, Plan, Source } from "../query/types.ts";
 import type { EdgeType, FieldMap, FieldRel, IsSingle, ObjectType, Relation, RowOf, TargetOf } from "./define.ts";
 
@@ -206,6 +207,9 @@ export class Query<F extends FieldMap, Shape> {
 
 export interface RunOptions {
   driver?: "async" | "rounds";
+  /** Filled in with what the read cost: rounds, and requests to hosts. The runner has always
+   *  reported it; a query built through the builder had no way to ask. */
+  stats?: Stats;
 }
 
 /** What a query needs from a database: the answer, and the graph it was read from. The graph is where

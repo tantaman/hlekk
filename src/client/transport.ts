@@ -2,7 +2,8 @@
 // In production these are DO stubs and a KV binding; in tests they are the objects themselves.
 
 import type { Catalog } from "../catalog/catalog.ts";
-import type { ExecReply, OutboxOp, Reply, Routed } from "../host/host.ts";
+// Type-only, and erased, so naming the host here makes no runtime cycle with it.
+import type { ExecReply, Host, OutboxOp, Reply, Routed } from "../host/host.ts";
 import type { Route } from "../directory/map.ts";
 import type { Fields, Id, Miss, Plan } from "../query/types.ts";
 
@@ -35,6 +36,34 @@ export function anchorOf(m: Mutation): { kind: "vshard"; vshard: string } | { ki
     case "indexConfirm":
     case "indexRelease":
       return { kind: "vshard", vshard: m.vshard };
+  }
+}
+
+/** Applies a mutation to a host, at the epoch the caller routed with.
+ *
+ *  Shared by every transport. A mutation names an operation and a host exposes one method per
+ *  operation, so the two have to be matched up somewhere; doing it twice is how an in-process test
+ *  ends up proving something the deployment does not do. */
+export function applyTo(host: Host, m: Mutation, epoch: number): Reply<unknown> {
+  switch (m.kind) {
+    case "create":
+      return host.create({ otype: m.otype, data: m.data, with: m.with, vshard: m.vshard, epoch });
+    case "update":
+      return host.update({ id: m.id, data: m.data, expect: m.expect, epoch });
+    case "delete":
+      return host.delete({ id: m.id, epoch });
+    case "assocAdd":
+      return host.assocAdd({ atype: m.atype, id1: m.id1, id2: m.id2, time: m.time, data: m.data, epoch });
+    case "assocRemove":
+      return host.assocRemove({ atype: m.atype, id1: m.id1, id2: m.id2, epoch });
+    case "apply":
+      return host.apply(m.op);
+    case "indexReserve":
+      return host.indexReserve({ vshard: m.vshard, idx: m.idx, key: m.key, now: m.now, ttlMs: m.ttlMs, epoch });
+    case "indexConfirm":
+      return host.indexConfirm({ vshard: m.vshard, idx: m.idx, key: m.key, id: m.id, epoch });
+    case "indexRelease":
+      return host.indexRelease({ vshard: m.vshard, idx: m.idx, key: m.key, epoch });
   }
 }
 
