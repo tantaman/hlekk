@@ -384,10 +384,17 @@ Separate ID spaces keep copies cheap: restoring a backup or branching staging of
 
 | Bits | Field | Notes |
 | --- | --- | --- |
-| 63–40 | vshard | 24 bits, about 16.7M vshards per database (proposed split) |
+| 63–60 | reserved | 4 bits, required to be zero. `parseId` refuses an id that sets one |
+| 59–40 | vshard | 20 bits, about 1.05M vshards per database |
 | 39–0 | sequence | Allocated per vshard from `vshards.next_seq` |
 
-**Why 40 sequence bits.** Bytes and IDs are separate budgets: bytes count live data, while IDs count every object ever created, including deleted ones. A colocation group creating 10 objects a second with 2-day retention holds about 1.7M live rows but uses 315M IDs a year. A 2^27 slab would run out in about 5 months; 2^40 lasts about 3,500 years. Vshard bits aren't scarce either: 2^24 vshards at 1 GB each is 16 PB.
+**Why 40 sequence bits.** Bytes and IDs are separate budgets: bytes count live data, while IDs count every object ever created, including deleted ones. A colocation group creating 10 objects a second with 2-day retention holds about 1.7M live rows but uses 315M IDs a year. A 2^27 slab would run out in about 5 months; 2^40 lasts about 3,500 years. Nothing about a larger vshard changes this: a 100 GB vshard of 1 KB objects is 10^8 objects against 2^40, four orders of magnitude of headroom.
+
+**Why 20 vshard bits, and 4 reserved.** It was 24/40 with nothing spare, on the arithmetic that 2^24 vshards at 1 GB each is 16 PB. That ceiling was a product of the ~1 GB cap, which is set by stop-the-world move time and not by the model ([`paged-storage.md`](paged-storage.md#what-the-vshard-cap-actually-bounds)). 2^20 vshards reach ~105 PB at 100 GB each — a higher ceiling from a narrower field — and 1 PB even if the cap never moves, so the narrowing is not a bet on that change landing.
+
+**The spare bits are at the top, and that is what makes this safe to do before any id exists.** The vshard field stays anchored at bit 40, so every id ever minted has zeros above bit 59 and `id >> 40` decodes identically under a wider field: widening back to 24 bits later needs no migration, where narrowing later would. What the reservation buys today is the refusal — nothing can mint a vshard above 2^20, or hand one in, and quietly spend it.
+
+**They are deliberately not carved up further.** A fixed sub-slab field for the split scheme below would have to come out of the sequence, and 16 slab bits leaves 24 for the sequence — 16.7M objects per vshard, where a 100 GB vshard wants ~10^8. Slabs stay dynamic allocations out of the sequence space, with continuation slabs when one fills, which is what makes them work at any vshard size.
 
 **No timestamp.** IDs already ascend within a vshard, the only place they're stored together, so inserts append to the B-tree without a clock. Putting time first would break each vshard's contiguous key range, which moves copy. Putting it inside the sequence costs counter bits and suffers clock skew after a move. Ordering by time uses an edge's `time`, or a `created` field where a type needs one.
 
@@ -419,6 +426,8 @@ const vshardRange = (v: bigint) => [
 ### vshards
 
 A vshard is the unit of placement, movement and transactions. Each has a soft size cap, proposed at about 1 GB, well under the 10 GB DO limit. One host DO holds many vshards.
+
+**The 1 GB figure is a placeholder for a measurement, not a result** — it is whatever a tolerable write pause allows, and build plan step 1 is what sets it. Under paged storage the pause scales with dirty bytes, so the byte cap's reason goes away and what remains is a *concurrency* bound: a vshard is one lease holder is one DO's single thread, so its size is limited by the write rate one owner can serve rather than by gigabytes, and the trigger for opening more vshards becomes load rather than bytes. That change also introduces a fixed cost per vshard, because lease handoff requires the unit of lease to be the unit of move: see [`paged-storage.md`](paged-storage.md#what-the-vshard-cap-actually-bounds) for what the cap bounds instead, and [*One paged store per vshard*](paged-storage.md#one-paged-store-per-vshard) for the cost.
 
 **The cap is set by move time, not storage.** A stop-the-world move pauses the vshard's writes for the whole copy, so the cap is the largest unit that can be relocated in a tolerable pause, not the largest unit that fits. Sizing a vshard at the DO limit instead would leave a full one with no legal destination: a move relocates a vshard without shrinking it, splits are ruled out below, and a host could hold at most one full vshard, leaving the placement controller nothing to shed and no headroom for the growth from inside described below.
 
@@ -452,7 +461,7 @@ A second reason matters more in practice. With one vshard every `db.txn(anchorId
 A new host DO is created empty and receives whole vshards. **It never mints them.** Minting a vshard is a database-level act by the allocator, and the two events are independent: a database spreads from 1 host to 64 without creating a single new vshard, and it opens vshard 64 whether or not a new host exists to hold it.
 
 - **The active set.** When the active set empties, the allocator opens the next `N` vshards, not the next one. Opening a single vshard would funnel every create in the database onto one vshard on one host, against the 1,000 requests/sec ceiling: the same mistake as starting with one. For the same reason a batch is spread across hosts, lightest first, rather than placed on the emptiest one: a batch on one host sends every new root there.
-- **Total count is bytes-bound.** Each vshard caps at about 1 GB, so a database ends up with roughly one vshard per gigabyte of live data however it got there. `N` sets the floor for a small database and stops mattering above `N` GB.
+- **Total count is bytes-bound** *while a host owns its storage*. Each vshard caps at about 1 GB, so a database ends up with roughly one vshard per gigabyte of live data however it got there. `N` sets the floor for a small database and stops mattering above `N` GB. Over paged object storage this stops holding in both directions: the count becomes load-bound rather than bytes-bound, and each vshard carries a fixed overhead that makes "one per gigabyte" the wrong shape ([`paged-storage.md`](paged-storage.md#one-paged-store-per-vshard)).
 - **Allocation within the active set.** A root object hashes an affinity key, the tenant or owning user or the creating request's root, into the active set. `with: parentId` overrides it. Spreading costs nothing while the active set is co-resident: reads batch per host, so vshards on one host are one request, and an inverse edge between two vshards on the same host is written inline in that host's transaction. It buys a placement controller that has something to move on day one.
 
 Hosts and vshards grow on separate curves. The host column below assumes 5 GB of live data per DO, half the limit; build plan step 1 measures the density that actually holds.
@@ -463,7 +472,9 @@ Hosts and vshards grow on separate curves. The host column below assumes 5 GB of
 | 64 GB | 64 | 13 |
 | 1 TB | ~1,000 | ~200 |
 | 100 TB | ~100,000 | ~20,000 |
-| 16 PB | 16.7M, the 24-bit ceiling | ~3.4M |
+| 1 PB | 1.05M, the 20-bit ceiling | ~210,000 |
+
+**The host column is the figure paged storage changes most, and by far.** A host would no longer hold the data — it holds the write overlay, the tree's level-1 branch pages and a leaf cache — so its capacity is set by branch-page residency rather than by live bytes. At 16 KiB pages that is roughly **1.6 TB of base per host** against half the 10 GB tier, about 300× the 5 GB assumed above: 1 TB would need about one host rather than 200, and 100 TB about 60 rather than 20,000. [`paged-storage.md`](paged-storage.md#what-a-host-can-hold) has the arithmetic.
 
 ## Host schema
 
@@ -775,12 +786,13 @@ An entry packs to 12 bytes, a start vshard, a host index and an epoch as three p
 | 64 GB | 64 | 64 | 768 B |
 | 1 TB | ~1,000 | ~1,000 | 12 KB |
 | 100 TB | ~100,000 | ~100,000 | 1.2 MB |
-| 2 PB | ~2M | ~2M | 24 MB |
-| 16 PB | 16.7M | 16.7M | 200 MB |
+| 1 PB | 1.05M, the 20-bit ceiling | 1.05M | ~12.6 MB |
 
-Persistence is not what constrains this. Even the fully fragmented ceiling is 16.7M rows in the directory's SQLite, one to two gigabytes against a 10 GB limit, where a lookup is a four-page B-tree descent and republishing one chunk is a range scan of a few thousand rows. What cannot hold 200 MB is a Worker isolate, a 25 MiB KV value, and a cold start's fetch. All three are properties of readers, which is why readers hold chunks and the directory holds the map.
+Persistence is not what constrains this. Even the fully fragmented ceiling is 1.05M rows in the directory's SQLite, well under a 10 GB limit, where a lookup is a four-page B-tree descent and republishing one chunk is a range scan of a few thousand rows.
 
-**The vshard cap is the map-size knob.** At a 1 GB cap the map carries one entry per gigabyte of live data. A 4 GB cap quarters the map and quadruples the write pause of a stop-the-world move. The deferred `changes` log removes that pressure by making moves snapshot-and-tail, so it is also what would let the cap rise and the map shrink.
+**The 20-bit field removed the hard ceiling here, which the 24-bit one had.** At 24 bits the fully fragmented map was 16.7M entries and 200 MB, and a 25 MiB KV value simply could not hold it. At 20 bits the same worst case is ~12.6 MB and fits one value. Chunking stays, because the remaining pressures are real and are properties of readers — a Worker isolate holding and parsing 12.6 MB on a cold start, and republishing incrementally rather than wholesale — but it is now an optimization rather than the only way the ceiling is reachable at all.
+
+**The vshard cap is the map-size knob.** At a 1 GB cap the map carries one entry per gigabyte of live data. A 4 GB cap quarters the map and quadruples the write pause of a stop-the-world move. The deferred `changes` log removes that pressure by making moves snapshot-and-tail, so it is also what would let the cap rise and the map shrink — and paged object storage removes it by another route, since a lease handoff's pause scales with dirty bytes. Either way the map shrinks because the cap rises, which is the same direction the narrowed vshard field pulls.
 
 ### Publishing the shard map
 
@@ -963,7 +975,7 @@ What it costs is one extra b-tree hop per indexed read, index maintenance in hos
 
 ### Design limits
 
-- **vshard size:** soft cap proposed at about 1 GB, set by move time under host-owned storage; see Later.
+- **vshard size:** soft cap proposed at about 1 GB, set by move time under host-owned storage; see Later. The figure is a placeholder for build plan step 1's measurement rather than a derived number, and under paged storage the constraint becomes write rate per lease holder rather than bytes.
 - **Colocation group size:** a documented limit, value to be set.
 - **One object's write rate:** bounded by one DO. Commutative ops can help counts; otherwise it is a hard ceiling.
 
@@ -977,10 +989,10 @@ What it costs is one extra b-tree hop per indexed read, index maintenance in hos
 
 ### Open questions
 
-- [ ] Exact ID bit split between vshard and sequence (24/40 proposed; IDs are unsigned and use all 64 bits, with no reserved bit). The vshard bits also cap the shard map.
+- [x] Exact ID bit split. **4 reserved / 20 vshard / 40 sequence**, settled before any id existed because every id ever minted encodes it. The vshard field narrowed from 24 because its 16 PB ceiling was a product of the ~1 GB cap, and 2^20 vshards reach ~105 PB at 100 GB each (1 PB even if the cap never moves). The 4 spare bits sit at the top and are required to be zero, so widening back needs no migration while narrowing later would; they are reserved rather than spent, and not carved into a sub-slab field, because that would have to come out of the sequence and leave too few ids for a large vshard. See Layout for the full reasoning. Two consequences recorded elsewhere: the fully fragmented shard map now fits one KV value, and the growth table's ceiling row is 1 PB rather than 16 PB.
 - [ ] vshard size cap and the placement controller's move thresholds. The mechanism is built, with a 1 GB cap and per-host byte and request thresholds; the values are guesses until step 1's throughput measurement. The cap trades a move's write pause against the size of the shard map — the pause wants a small cap, the map a large one. Only the pause is an artifact of the storage engine: under paged storage over object storage ([`paged-storage.md`](paged-storage.md)) it scales with dirty bytes rather than total bytes, which removes the pressure toward a small cap and leaves only the pressure toward a large one.
 - [ ] Initial vshard count `N` (64 proposed), and whether it is fixed or a creation-time parameter.
-- [ ] Page size, **if** the paged store is adopted — conditional on a decision that is itself open, but listed here because a store keeps the size it was created with and changing it needs a rebuild, so it cannot be deferred past the first store. 16 KiB is the recommendation and 4 KiB the trap: against motivating example 5, a 500 GB tenant at 4 KiB has already spent 59% of a DO's 10 GB tier on level-1 branch pages alone. [`paged-storage.md`](paged-storage.md) §6 has the table.
+- [ ] Page size, **if** the paged store is adopted — conditional on a decision that is itself open, but listed here because a store keeps the size it was created with and changing it needs a rebuild, so it cannot be deferred past the first store. 16 KiB is the recommendation and 4 KiB the trap: against motivating example 5, a 500 GB tenant at 4 KiB has already spent 59% of a DO's 10 GB tier on level-1 branch pages alone. [`paged-storage.md`](paged-storage.md#residency-and-the-one-decision-that-cannot-be-deferred) has the table.
 - [x] The placement controller sheds a contiguous **prefix** of one of a host's runs, so the vshards left behind stay contiguous and the map gains no entry beyond the one the move itself costs. Among the prefixes that bring the host back under threshold it takes the fewest vshards, since each is a stop-the-world pause, and then the least excess. Never the whole host. A single heavy vshard therefore beats three light ones adding to the same weight, which is the opposite of what "prefer a run" first suggested.
 - [ ] Whether to adopt Workers KV Instant for the published snapshot once it is generally available, and whether a namespace per database is workable against 1,000 namespaces per account.
 - [ ] How often a reader polls the map version once there is a head key cheap enough to poll.

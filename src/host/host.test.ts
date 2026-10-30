@@ -8,7 +8,19 @@ import type { Id, Json, Maybe, Plan } from "../query/types.ts";
 import { Catalog, plan } from "../catalog/catalog.ts";
 import { Host } from "./host.ts";
 import type { Reply } from "./host.ts";
-import { MAX_SEQ, fromKey, makeId, parseId, toKey, vshardOf, vshardRange } from "./ids.ts";
+import {
+  MAX_SEQ,
+  MAX_VSHARD,
+  RESERVED_BITS,
+  SEQ_BITS,
+  VSHARD_BITS,
+  fromKey,
+  makeId,
+  parseId,
+  toKey,
+  vshardOf,
+  vshardRange,
+} from "./ids.ts";
 import { nodeSql } from "./sql.node.ts";
 
 // The issue tracker from the design, planned the way a real one would be: domain files with no
@@ -74,7 +86,7 @@ const known = <T>(v: Maybe<T>): T => {
 
 describe("ids", () => {
   it("round-trips through the 8-byte key", () => {
-    for (const id of ["0", "1", makeId(0n, MAX_SEQ), makeId(1n, 0n), makeId((1n << 24n) - 1n, MAX_SEQ)]) {
+    for (const id of ["0", "1", makeId(0n, MAX_SEQ), makeId(1n, 0n), makeId(MAX_VSHARD, MAX_SEQ)]) {
       assert.equal(fromKey(toKey(id)), id);
     }
   });
@@ -95,8 +107,12 @@ describe("ids", () => {
     assert.throws(() => parseId("1e3"), TypeError);
     assert.throws(() => parseId("-1"), TypeError);
     assert.throws(() => parseId("01"), TypeError);
-    assert.throws(() => makeId(1n << 24n, 0n), RangeError);
+    assert.throws(() => makeId(MAX_VSHARD + 1n, 0n), RangeError);
     assert.throws(() => makeId(0n, MAX_SEQ + 1n), RangeError);
+    // The reserved high bits: an id that spends one is out of range on the way in, so the
+    // reservation cannot be consumed by a caller handing us a wide id either.
+    assert.throws(() => parseId((1n << (VSHARD_BITS + SEQ_BITS)).toString()), RangeError);
+    assert.equal(RESERVED_BITS, 4n);
   });
 
   it("orders ids numerically, as the blob keys do", () => {
