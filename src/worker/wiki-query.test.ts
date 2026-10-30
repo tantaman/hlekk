@@ -6,9 +6,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { LIMITS, QueryRefused, build, check, planOf, price, schemaView } from "./wiki-query.ts";
+import { LIMITS, QueryRefused, build, check, parseQuery, planOf, price, schemaView, unparse } from "./wiki-query.ts";
 import type { QuerySpec } from "./wiki-query.ts";
-import { linkedFrom, pageCategories, pageLinks } from "./wiki.ts";
+import { categoryPages, linkedFrom, pageCategories, pageLinks } from "./wiki.ts";
 
 const from = { ns: 0, title: "France" };
 const refusal = (spec: unknown): QueryRefused => {
@@ -214,5 +214,171 @@ describe("the holes that are unrepresentable rather than guarded", () => {
     const compiled = build(spec, "123").compile();
     const aliases = compiled.root.children.map((c) => c.alias);
     assert.deepEqual(aliases, ["outbound", "linked_from"]);
+  });
+});
+
+describe("the query language the editor submits", () => {
+  const parse = (text: string) => parseQuery(text);
+  const bad = (text: string): QueryRefused => {
+    try {
+      parseQuery(text);
+    } catch (e) {
+      assert.ok(e instanceof QueryRefused, `expected QueryRefused, got ${String(e)}`);
+      return e;
+    }
+    throw new Error("expected the text to be refused");
+  };
+
+  it("reads the demo's own page card", () => {
+    const spec = parse(`page(0, "Country")
+      .countAs("linkCount", page_links)
+      .countAs("backlinkCount", linked_from)
+      .related("links", page_links, q => q.limit(25))
+      .related("categories", page_categories, q => q.limit(25))`);
+    assert.deepEqual(spec.from, { ns: 0, title: "Country" });
+    // The aliases the author wrote are kept, so the result is keyed by them.
+    assert.deepEqual(spec.counts, [
+      { as: "linkCount", edge: pageLinks.name },
+      { as: "backlinkCount", edge: linkedFrom.name },
+    ]);
+    assert.equal(spec.hops!.length, 2);
+    assert.deepEqual(spec.hops![0], { edge: pageLinks.name, as: "links", limit: 25 });
+    // And it is a query the guard permits, which is the point of the example.
+    assert.equal(check(spec).nodes, 51);
+  });
+
+  it("defaults the namespace, so page(\"X\") is an article", () => {
+    assert.deepEqual(parse('page("Earth")').from, { ns: 0, title: "Earth" });
+    assert.deepEqual(parse('page(14, "Stubs")').from, { ns: 14, title: "Stubs" });
+  });
+
+  it("nests a lambda, and nests inside it", () => {
+    const spec = parse(`page("Country")
+      .related("links", page_links, q => q
+        .limit(10)
+        .where("len", ">", 20000)
+        .related("via", linked_from, q => q.limit(3)))`);
+    const hop = spec.hops![0];
+    assert.equal(hop.limit, 10);
+    assert.deepEqual(hop.where, [{ field: "len", op: ">", value: 20000 }]);
+    assert.equal(hop.hops![0].edge, linkedFrom.name);
+    assert.equal(hop.hops![0].limit, 3);
+  });
+
+  it("takes a hop with no lambda at all", () => {
+    assert.deepEqual(parse('page("X").related("c", page_categories)').hops, [
+      { edge: pageCategories.name, as: "c" },
+    ]);
+  });
+
+  it("reads string, number and boolean values", () => {
+    const where = parse(`page("X").related("l", page_links, q => q
+      .where("title", "=", "France")
+      .where("ns", "=", 0)
+      .where("redirect", "=", false))`).hops![0].where!;
+    assert.deepEqual(where.map((w) => w.value), ["France", 0, false]);
+  });
+
+  it("ignores comments and whitespace", () => {
+    const spec = parse(`// the busiest page
+      page("Country")   // start here
+        .related("links", page_links, q => q.limit(5))`);
+    assert.equal(spec.hops![0].limit, 5);
+  });
+
+  it("points at the offset of a mistake, not just the fact of it", () => {
+    const text = 'page("X").related("l", page_haters, q => q.limit(5))';
+    const e = bad(text);
+    assert.match(e.message, /no edge "page_haters"/);
+    assert.equal(text.slice(e.offset!, e.offset! + 11), "page_haters");
+  });
+
+  it("refuses an unknown method, naming the ones there are", () => {
+    const e = bad('page("X").orderBy("title")');
+    assert.match(e.message, /no method "orderBy"/);
+    assert.match(e.message, /related/);
+  });
+
+  it("refuses a lambda whose body is not its own parameter", () => {
+    assert.match(bad('page("X").related("l", page_links, q => z.limit(5))').message, /starts from q/);
+  });
+
+  it("refuses an unterminated string, and a stray character", () => {
+    assert.match(bad('page("Coun').message, /unterminated string/);
+    assert.match(bad('page("X") # nope').message, /unexpected "#"/);
+  });
+
+  it("refuses a limit on the root, which would silently do nothing", () => {
+    assert.match(bad('page("X").limit(10)').message, /applies to a related list/);
+  });
+
+  it("refuses text that is not a query at all", () => {
+    assert.match(bad("").message, /starts with page/);
+    assert.match(bad("SELECT * FROM page").message, /starts with page/);
+    assert.match(bad('page("X") page("Y")').message, /unexpected/);
+  });
+
+  it("still goes through the guard, so the editor cannot spend more than the form could", () => {
+    const text = `page("Country").related("a", page_links, q => q.limit(100)
+      .related("b", page_links, q => q.limit(100)
+        .related("c", page_links, q => q.limit(100)
+          .related("d", page_links, q => q.limit(100)))))`;
+    const spec = parseQuery(text); // parses fine — it is well-formed, just ruinous
+    assert.match(refusal(spec).message, /answer nodes/);
+  });
+
+  it("round-trips: unparsing a spec and parsing it back gives the same spec", () => {
+    const spec: QuerySpec = {
+      from: { ns: 14, title: "France_geography_stubs" },
+      counts: [{ as: "memberCount", edge: categoryPages.name }],
+      hops: [
+        {
+          edge: categoryPages.name,
+          as: "members",
+          limit: 20,
+          where: [{ field: "len", op: ">=", value: 1000 }],
+          counts: [{ as: "out", edge: pageLinks.name }],
+          hops: [{ edge: pageLinks.name, as: "out", limit: 3 }],
+        },
+      ],
+    };
+    assert.deepEqual(parseQuery(unparse(spec)), spec);
+  });
+});
+
+describe("a count keeps the alias it was written with", () => {
+  it("names the count as the author asked, not after its edge", () => {
+    const spec = parseQuery('page("X").countAs("backlinkCount", linked_from)');
+    assert.deepEqual(spec.counts, [{ as: "backlinkCount", edge: linkedFrom.name }]);
+    // And the compiled query carries that alias, which is what the result is keyed by.
+    const aliases = build(spec, "1").compile().root.counts.map((c) => c.alias);
+    assert.deepEqual(aliases, ["backlinkCount"]);
+  });
+
+  it("falls back to the edge's short name when no alias is given", () => {
+    const spec = parseQuery('page("X").countAs(linked_from)');
+    assert.deepEqual(spec.counts, [linkedFrom.name]);
+    assert.deepEqual(build(spec, "1").compile().root.counts.map((c) => c.alias), ["linked_from"]);
+  });
+
+  it("keeps aliases on a nested hop too", () => {
+    const spec = parseQuery('page("X").related("l", page_links, q => q.countAs("n", linked_from))');
+    assert.deepEqual(spec.hops![0].counts, [{ as: "n", edge: linkedFrom.name }]);
+  });
+
+  it("round-trips an aliased count", () => {
+    const spec: QuerySpec = {
+      from: { ns: 0, title: "X" },
+      counts: [{ as: "backlinkCount", edge: linkedFrom.name }, pageLinks.name],
+    };
+    assert.deepEqual(parseQuery(unparse(spec)), {
+      from: { ns: 0, title: "X" },
+      // unparse always writes an explicit alias, so the bare form comes back aliased to its short name.
+      counts: [{ as: "backlinkCount", edge: linkedFrom.name }, { as: "page_links", edge: pageLinks.name }],
+    });
+  });
+
+  it("still refuses a count on an edge that does not exist", () => {
+    assert.match(refusal({ from: { ns: 0, title: "X" }, counts: [{ as: "n", edge: "wiki.nope" }] }).message, /no edge/);
   });
 });

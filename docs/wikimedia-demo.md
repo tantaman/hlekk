@@ -219,6 +219,32 @@ numbers are stated in one place and served to the client, so the editor prices a
 and shows the same figure the server would refuse it with. The demo doc's own case — depth 4 at limit
 100 — is refused as *101,010,101 answer nodes* before any I/O. 20 tests cover it.
 
+**The editor is a text editor, not a form.** It is the overlay pattern: one tokenizer paints a `pre`
+sitting behind a transparent-text `textarea`, so the glyphs an author types are the glyphs that get
+coloured, and a pure `completionContext(text, caret)` drives the popup. The grammar is **hlekk's own
+builder chain**, so what an author writes is what this repo's own code says:
+
+```
+page(0, "Country")
+  .countAs("backlinkCount", linked_from)
+  .related("links", page_links, q => q
+    .limit(25)
+    .where("len", ">", 20000)
+    .related("via", linked_from, q => q.limit(3)))
+```
+
+Text does not widen the surface, and that is the only reason it is allowed. `parseQuery` is a
+parser, not an `eval` — the text arrives at a Worker, and evaluating a stranger's text there would
+hand them the isolate — and it produces the same nested description the form produced, which is then
+checked by the same guard. So the holes stay closed by construction and the budget stays the budget.
+Errors carry a character offset, so the editor puts the caret on the mistake instead of describing
+it. 39 tests cover the language, including that a well-formed but ruinous query still gets refused.
+
+Every name the popup offers is read from `/schema` at runtime, so it cannot offer a relation the
+catalog lacks. What it completes is not tested, though, and that is worth knowing: the editor ships
+as one inline string with no build step, so there is no module for a test to import. The grammar is
+tested on the server; the caret-context logic is not.
+
 **What is still true and unfixed:** a selective filter walks its whole edge list, so `where` on a
 high-degree page reads the whole list — `len > 20000` over `Country` took 1,393 ms and 12 host
 requests on the pilot. `maxLimit` is not a bound on that, and *A scan cap per query, returning a

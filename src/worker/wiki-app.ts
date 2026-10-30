@@ -26,7 +26,7 @@ import type { Env } from "../do/bindings.ts";
 import { call } from "../do/rpc.ts";
 import { cloudflareTransport } from "../do/transport.ts";
 import { WIKI_UI } from "./wiki-ui.ts";
-import { QueryRefused, build as buildQuery, check as checkQuery, price as priceQuery, schemaView } from "./wiki-query.ts";
+import { QueryRefused, build as buildQuery, check as checkQuery, parseQuery, schemaView, unparse } from "./wiki-query.ts";
 import type { QuerySpec } from "./wiki-query.ts";
 import {
   LOCK,
@@ -315,20 +315,32 @@ export default {
       if (path === "/schema") return json(schemaView());
 
       /** The cost of a query without running it, so an editor can price what is being typed —
-       *  including something over budget, which `check` refuses but an author still wants to see. */
+       *  including something over budget, which `check` refuses but an author still wants to see,
+       *  and text that does not parse, where the offset is what puts the caret on the mistake. */
       if (path === "/price" && request.method === "POST") {
-        return json(priceQuery(await body<QuerySpec>()));
+        const sent = await body<{ text?: string } & QuerySpec>();
+        try {
+          const spec = typeof sent.text === "string" ? parseQuery(sent.text) : sent;
+          return json({ ...checkQuery(spec), spec, text: unparse(spec) });
+        } catch (e) {
+          if (e instanceof QueryRefused) return json({ error: e.message, at: e.at, offset: e.offset });
+          throw e;
+        }
       }
 
       /** Runs an authored query. Checked before any I/O, then entered by title like every other read
        *  here, then compiled through the typed builder. */
       if (path === "/query" && request.method === "POST") {
-        const spec = await body<QuerySpec>();
+        const sent = await body<{ text?: string } & QuerySpec>();
+        let spec: QuerySpec;
         let cost;
         try {
+          // Text is parsed into the same spec the form submitted, and then checked. A text front
+          // end does not widen what a query may say, and nothing here evaluates what was sent.
+          spec = typeof sent.text === "string" ? parseQuery(sent.text) : sent;
           cost = checkQuery(spec);
         } catch (e) {
-          if (e instanceof QueryRefused) return json({ refused: e.message, at: e.at }, 400);
+          if (e instanceof QueryRefused) return json({ refused: e.message, at: e.at, offset: e.offset }, 400);
           throw e;
         }
         const id = await db.lookupUnique(TITLE_IDX, titleKey(spec.from.ns, spec.from.title));

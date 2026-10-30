@@ -9,6 +9,15 @@
 // One self-contained document with no build step and no CDN: the Worker serves it as a string, so
 // the demo has nothing to build and no asset host to depend on.
 //
+// One cost of that, stated rather than left to be discovered: `completionContext` below is a pure
+// function of (text, caret) and is deliberately written to be testable, but it is not tested,
+// because shipping the editor as one inline string leaves no module for a test to import. The
+// grammar it completes against *is* tested, on the server, in wiki-query.test.ts -- and every name
+// it offers is read from /schema at runtime rather than listed here, so the popup cannot drift out
+// of step with the catalog. What is untested is the caret-context logic: which position offers
+// what. Extracting these two functions into a module the UI inlines at build time is the fix, and
+// it needs a build step this demo does not otherwise have.
+//
 // Attribution is not decoration. docs/wikimedia-import.md chose this dataset partly because
 // mirroring is its intended use, under CC BY-SA 4.0 and GFDL, and records that a public mirror has
 // to identify itself as a mirror of a dated dump. The footer is that identification.
@@ -89,6 +98,52 @@ export const WIKI_UI = String.raw`<!doctype html>
     font-family: var(--mono); font-size: 11.5px; padding: 3px 7px;
     background: var(--chip); color: var(--chipfg); border-radius: 6px;
   }
+  /* ---- the editor: a highlighted pre behind a transparent-text textarea.
+     The two layers must agree on every metric — same font block, same padding, same wrap rule, and
+     the pre carries a transparent border where the textarea has a real one — or the caret drifts
+     away from the glyph it is sitting on. */
+  .qwrap { position: relative; background: var(--raised); border-radius: 9px; margin-bottom: 10px; }
+  .qwrap .qedit, .qwrap .qhl {
+    font-family: var(--mono); font-size: 13px; line-height: 1.6; padding: 12px 13px;
+    border: 1px solid transparent; overflow-wrap: break-word; white-space: pre-wrap; margin: 0;
+    tab-size: 2;
+  }
+  .qwrap .qedit {
+    display: block; width: 100%; min-height: 150px; resize: vertical; position: relative; z-index: 1;
+    background: transparent; color: transparent; caret-color: var(--fg);
+    border-color: var(--line); border-radius: 9px;
+  }
+  .qwrap .qedit:focus { outline: none; border-color: var(--accent); }
+  .qwrap.qbad .qedit { border-color: var(--bad); }
+  .qwrap .qedit::selection { background: rgba(120, 170, 220, 0.3); }
+  .qwrap .qhl { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+  .qhl i { font-style: normal; }
+  .t-str { color: var(--ok); }
+  .t-num { color: #b5761f; }
+  .t-m { color: var(--accent); }
+  .t-fn { color: var(--accent); font-weight: 600; }
+  .t-edge { color: #8a5cc4; }
+  .t-comment { color: var(--muted); font-style: italic; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .t-num { color: #d9a85c; }
+    :root:not([data-theme="light"]) .t-edge { color: #c3a0ea; }
+  }
+  :root[data-theme="dark"] .t-num { color: #d9a85c; }
+  :root[data-theme="dark"] .t-edge { color: #c3a0ea; }
+  /* The completion popup, hung under the caret's line; options wear the highlighter's colours, so
+     an option looks like the token it becomes. */
+  .qcomp {
+    position: absolute; z-index: 20; min-width: 260px; max-height: 190px; overflow-y: auto;
+    background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+    box-shadow: 0 8px 22px rgba(0,0,0,0.18); font-family: var(--mono); font-size: 12.5px;
+  }
+  .qcomp .qopt { display: flex; justify-content: space-between; gap: 14px; padding: 4px 10px; cursor: pointer; }
+  .qcomp .qopt span { color: var(--muted); font-size: 10.5px; align-self: center; }
+  .qcomp .qopt.sel, .qcomp .qopt:hover { background: var(--raised); }
+  .qerr { color: var(--bad); font-family: var(--mono); font-size: 12.5px; margin: 0 0 10px; }
+  .qbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .qbar .ex { font-family: var(--mono); font-size: 12px; }
+
   /* ---- the builder */
   .hop { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 10px; background: var(--raised); }
   .hop .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
@@ -146,25 +201,25 @@ export const WIKI_UI = String.raw`<!doctype html>
   </section>
 
   <section id="pane-query" hidden>
-    <form class="entry" id="qf">
-      <input type="search" id="qtitle" placeholder="Start from this title" autocomplete="off" value="Country">
-      <select id="qns" aria-label="Namespace"></select>
-      <button class="go" type="submit" id="run">Run</button>
-    </form>
-    <p class="hint">Build a query by adding hops along the schema's edges. Fields and edge names
-       autocomplete from <code>/schema</code>. The cost below is the product of the limits down each
-       path — the thing no storage budget can see — and the server refuses the same number it shows.</p>
+    <p class="hint" style="margin-top:0">Write a query in hlekk's own builder chain. Edge and field
+       names complete from <code>/schema</code>, so the popup cannot offer a name the engine would not
+       resolve. <kbd>ctrl</kbd>+<kbd>space</kbd> opens it anywhere, <kbd>tab</kbd> accepts,
+       <kbd>⌘</kbd>+<kbd>↩</kbd> runs. The cost below is the product of the limits down each path —
+       the thing no storage budget can see — and the server refuses the same number it shows you.</p>
 
-    <div class="card">
-      <h3>Count at the root <span class="n">— from maintained counters, not a scan</span></h3>
-      <div class="cbs" id="rootcounts"></div>
-      <h3 style="margin-top:18px">Hops</h3>
-      <div id="hops"></div>
-      <button class="ghost" id="addhop" type="button">+ add hop</button>
-
-      <div class="cost" id="cost"></div>
+    <div class="qbar">
+      <button class="go" id="run" type="button">Run ⌘↩</button>
+      <select id="example" class="ex" aria-label="Load an example"></select>
     </div>
 
+    <div class="qwrap" id="qwrap">
+      <pre class="qhl" id="qhl" aria-hidden="true"></pre>
+      <textarea class="qedit" id="qedit" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+      <div class="qcomp" id="qcomp" hidden></div>
+    </div>
+
+    <p class="qerr" id="qerr" hidden></p>
+    <div class="cost" id="cost"></div>
     <div id="qout"></div>
   </section>
 
@@ -177,8 +232,6 @@ export const WIKI_UI = String.raw`<!doctype html>
   </footer>
 </div>
 
-<datalist id="dl-edges"></datalist>
-<datalist id="dl-fields"></datalist>
 
 <script>
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
@@ -326,83 +379,214 @@ document.addEventListener("click", (e) => {
 });
 
 // ---------------------------------------------------------------- the query editor
+//
+// The classic overlay: one tokenizer paints a 'pre' sitting behind a transparent-text textarea, so
+// the glyphs the author types line up with the glyphs that get coloured. Completions come from a
+// pure function of (text, caret) so the popup can be reasoned about without the DOM, and every name
+// it offers is read off '/schema' rather than a word list.
+//
+// Nothing here evaluates the query. The text is parsed on the server into the same description the
+// guard checks, which is what keeps a text box from being a wider surface than a form.
 
-// hop = { edge, as, limit, where: [{field, op, value}], counts: [], hops: [] }
-const spec = { counts: [], hops: [{ edge: "wiki.page_links", limit: 10, where: [], counts: [], hops: [] }] };
+const METHODS = ["limit", "where", "countAs", "related"];
+const KEYWORDS = new Set(["q", "page", "true", "false"]);
+let EDGE_SHORT = [];
+let FIELDS = [];
 
-const hopsEl = document.getElementById("hops");
-const costEl = document.getElementById("cost");
-const runBtn = document.getElementById("run");
+const TOKEN_RE = /\/\/[^\n]*|"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?|[A-Za-z_$][A-Za-z0-9_$]*|=>/g;
 
-function hopHtml(hop, path, depth) {
-  const edges = SCHEMA.edges.map((e) => e.name);
-  const canNest = depth < SCHEMA.limits.maxDepth;
-  return '<div class="hop" data-path="' + path + '">'
-    + '<div class="row">'
-      + '<label>edge</label>'
-      + '<input class="edge" list="dl-edges" value="' + esc(hop.edge) + '" data-k="edge" placeholder="wiki.page_links">'
-      + '<label>as</label><input class="alias" value="' + esc(hop.as || "") + '" data-k="as" placeholder="auto">'
-      + '<label>limit</label><input class="lim" type="number" min="1" max="' + SCHEMA.limits.maxLimit
-        + '" value="' + esc(hop.limit) + '" data-k="limit">'
-      + '<button class="ghost" type="button" data-act="rmhop">remove</button>'
-      + (canNest ? '<button class="ghost" type="button" data-act="addkid">+ nested hop</button>' : "")
-    + "</div>"
-    + '<div class="filters">'
-      + hop.where.map((w, i) =>
-          '<div class="filter" data-i="' + i + '">'
-          + '<label>where</label>'
-          + '<input class="field" list="dl-fields" value="' + esc(w.field) + '" data-k="field" placeholder="ns">'
-          + '<select data-k="op">' + SCHEMA.limits.ops.map((o) =>
-              '<option' + (o === w.op ? " selected" : "") + ">" + o + "</option>").join("") + "</select>"
-          + '<input class="val" value="' + esc(w.raw !== undefined ? w.raw : w.value) + '" data-k="value" placeholder="0">'
-          + '<button class="ghost" type="button" data-act="rmfilter">×</button>'
-          + "</div>").join("")
-      + '<button class="ghost" type="button" data-act="addfilter">+ filter</button>'
-    + "</div>"
-    + '<div class="cbs"><span>count here:</span>' + edges.map((e) =>
-        '<label><input type="checkbox" data-act="count" value="' + e + '"'
-        + (hop.counts.includes(e) ? " checked" : "") + ">" + e.replace(/^wiki\./, "") + "</label>").join("") + "</div>"
-    + (hop.hops.length ? '<div class="kids">' + hop.hops.map((k, i) => hopHtml(k, path + "." + i, depth + 1)).join("") + "</div>" : "")
-    + "</div>";
+/** Tokenize the RAW text and escape per piece: escaping first would re-tokenize the entities, and
+ *  the overlay needs output glyphs to match input glyphs one-for-one or the caret drifts. */
+function highlight(code) {
+  let out = "";
+  let last = 0;
+  for (const m of code.matchAll(TOKEN_RE)) {
+    out += esc(code.slice(last, m.index));
+    const tok = m[0];
+    const cls =
+      tok.startsWith("//") ? "t-comment"
+      : tok.startsWith('"') ? "t-str"
+      : /^-?\d/.test(tok) ? "t-num"
+      : EDGE_SHORT.includes(tok) ? "t-edge"
+      : KEYWORDS.has(tok) ? "t-fn"
+      : code[m.index - 1] === "." && METHODS.includes(tok) ? "t-m"
+      : "";
+    out += cls ? '<i class="' + cls + '">' + esc(tok) + "</i>" : esc(tok);
+    last = m.index + tok.length;
+  }
+  return out + esc(code.slice(last));
 }
 
-const at = (path) => path.split(".").reduce((node, i) => (node.hops ? node.hops[Number(i)] : node), spec);
+/**
+ * What the text could say next at 'caret', or null when there is nothing useful to offer —
+ * including "the prefix already is the only match", so accepting never rewrites nothing. 'force'
+ * (ctrl+space) waives the typed-prefix gate, so the whole vocabulary is browsable anywhere.
+ */
+function completionContext(text, caret, force) {
+  const before = text.slice(0, caret);
+  const prefix = (/[A-Za-z_$][A-Za-z0-9_$]*$/.exec(before) || [""])[0];
+  const head = before.slice(0, before.length - prefix.length);
+  const options = optionsFor(head, prefix !== "" || force);
+  if (!options) return null;
+  // Match through a label's quotes, so a raw 'where(ti' still narrows to '"title"' — and accepting
+  // repairs the quoting.
+  const matched = options.filter((o) => o.label.replace(/"/g, "").startsWith(prefix));
+  if (matched.length === 0 || (matched.length === 1 && matched[0].label === prefix)) return null;
+  return { from: caret - prefix.length, options: matched };
+}
 
-function render() {
-  hopsEl.innerHTML = spec.hops.map((h, i) => hopHtml(h, String(i), 1)).join("")
-    || '<p class="hint" style="margin:0 0 10px">No hops: the query reads just the page and its counts.</p>';
-  document.getElementById("rootcounts").innerHTML = SCHEMA.edges.map((e) =>
-    '<label><input type="checkbox" data-root-count value="' + e.name + '"'
-    + (spec.counts.includes(e.name) ? " checked" : "") + ">" + e.name.replace(/^wiki\./, "") + "</label>").join("");
+const opt = (label, kind) => ({ label, kind });
+const edgeOpts = () => EDGE_SHORT.map((e) => opt(e, "edge"));
+const fieldOpts = (quoted) => FIELDS.map((f) => opt(quoted ? '"' + f.name + '"' : f.name, f.type));
+
+function optionsFor(head, typing) {
+  // Inside a string literal only the quoted-argument positions complete; anything else in quotes is
+  // the author's own text, such as an alias or a page title.
+  if ((head.match(/"/g) || []).length % 2 === 1) {
+    if (/\.where\(\s*"[^"]*"\s*,\s*"$/.test(head)) return OPS.map((o) => opt(o, "operator"));
+    if (/\.where\(\s*"$/.test(head)) return fieldOpts(false);
+    return null;
+  }
+  if (head.endsWith(".")) {
+    const recv = (/[A-Za-z_$][A-Za-z0-9_$]*$/.exec(head.slice(0, -1)) || [])[0];
+    if (/\d$/.test(head.slice(0, -1))) return null; // '5.' is a number, not a chain
+    if (recv === "q" || recv === ")") return METHODS.map((m) => opt(m, "method"));
+    return METHODS.map((m) => opt(m, "method"));
+  }
+  // An open paren, or a comma inside one, is an unambiguous argument position: offer what that call
+  // accepts, unprompted. This is how someone who does not know the vocabulary finds 'page_links'.
+  const call = /\.(related|countAs)\(\s*((?:"[^"]*"\s*,\s*)?)$/.exec(head);
+  if (call) {
+    const [, fn, prior] = call;
+    // Both take an alias first, then the edge. With no alias yet, offer one pre-quoted per edge.
+    if (prior === "") return EDGE_SHORT.map((e) => opt('"' + e + '"', "alias"));
+    return edgeOpts();
+  }
+  if (/\.where\(\s*$/.test(head)) return fieldOpts(true);
+  if (/\.where\(\s*"[^"]*"\s*,\s*$/.test(head)) return OPS.map((o) => opt('"' + o + '"', "operator"));
+  if (/,\s*$/.test(head) && /\.related\([^()]*$/.test(head)) return [opt("q => q", "lambda")];
+  if (/^\s*$/.test(head)) return [opt('page(0, "Country")', "start here")];
+  return typing ? [...METHODS.map((m) => opt(m, "method")), ...edgeOpts(), opt("page", "root"), opt("q", "lambda")] : null;
+}
+
+let OPS = ["=", "!=", "<", "<=", ">", ">="];
+
+const EXAMPLES = {
+  "A page card — the demo's own query": 'page(0, "Country")\n  .countAs("linkCount", page_links)\n  .countAs("backlinkCount", linked_from)\n  .related("links", page_links, q => q.limit(25))\n  .related("categories", page_categories, q => q.limit(25))',
+  "Two hops — links, and who links to them": 'page(0, "Country")\n  .related("links", page_links, q => q\n    .limit(5)\n    .countAs("backlinkCount", linked_from)\n    .related("linkedFrom", linked_from, q => q.limit(3)))',
+  "A filter — only long articles": 'page(0, "Country")\n  .related("longLinks", page_links, q => q\n    .limit(10)\n    .where("len", ">", 20000))',
+  "Members of a category": 'page(14, "France_geography_stubs")\n  .countAs("memberCount", category_pages)\n  .related("members", category_pages, q => q.limit(20))',
+  "Over budget on purpose — refused before any I/O": 'page(0, "Country")\n  .related("a", page_links, q => q.limit(100)\n    .related("b", page_links, q => q.limit(100)\n      .related("c", page_links, q => q.limit(100))))',
+};
+
+const wrap = document.getElementById("qwrap");
+const ta = document.getElementById("qedit");
+const hl = document.getElementById("qhl");
+const box = document.getElementById("qcomp");
+const costEl = document.getElementById("cost");
+const errEl = document.getElementById("qerr");
+const qout = document.getElementById("qout");
+const runBtn = document.getElementById("run");
+
+let opts = [];
+let from = 0;
+let sel = 0;
+
+function paint() {
+  // The trailing newline keeps a final empty line the same height the textarea gives it.
+  hl.innerHTML = highlight(ta.value) + "\n";
+  hl.scrollTop = ta.scrollTop;
+}
+
+const closeBox = () => {
+  box.hidden = true;
+  opts = [];
+};
+
+function renderBox() {
+  box.innerHTML = opts
+    .map((o, i) =>
+      '<div class="qopt' + (i === sel ? " sel" : "") + '" data-i="' + i + '">' +
+      '<i class="' + (o.label.startsWith('"') ? "t-str" : o.kind === "edge" ? "t-edge" : o.kind === "method" ? "t-m" : "t-fn") + '">' +
+      esc(o.label) + "</i><span>" + esc(o.kind) + "</span></div>")
+    .join("");
+  box.hidden = false;
+  // Hung under the caret's line: measure by mirroring the text up to the caret in a hidden span.
+  const line = ta.value.slice(0, ta.selectionStart).split("\n").length;
+  box.style.top = Math.min(line * 20.8 + 16, ta.clientHeight) + "px";
+  box.style.left = "13px";
+  const chosen = box.querySelector(".sel");
+  if (chosen) chosen.scrollIntoView({ block: "nearest" });
+}
+
+function refresh(force) {
+  const ctx = ta.selectionStart === ta.selectionEnd
+    ? completionContext(ta.value, ta.selectionStart, force === true) : null;
+  if (!ctx) return closeBox();
+  opts = ctx.options;
+  from = ctx.from;
+  sel = 0;
+  renderBox();
+}
+
+function accept(i) {
+  const o = opts[i];
+  if (!o) return;
+  const caret = ta.selectionEnd;
+  ta.setSelectionRange(from, caret);
+  // execCommand keeps the native undo stack; setRangeText is the undo-breaking fallback.
+  if (!document.execCommand("insertText", false, o.label)) ta.setRangeText(o.label, from, caret, "end");
+  closeBox();
+  paint();
   void reprice();
 }
 
-/** A filter's value typed as the field's own type, so "0" on a number field is 0 and not "0". The
- *  server refuses a mistyped value rather than matching nothing, so this is what makes the obvious
- *  thing work. */
-function typed(field, raw) {
-  const f = SCHEMA.objects[0].fields.find((x) => x.name === field);
-  if (!f) return raw;
-  if (f.type === "number") return raw === "" ? raw : Number(raw);
-  if (f.type === "boolean") return raw === "true" || raw === "1";
-  return raw;
-}
-
-function payload() {
-  const clean = (h) => ({
-    edge: h.edge,
-    ...(h.as ? { as: h.as } : {}),
-    limit: Number(h.limit),
-    ...(h.where.length ? { where: h.where.map((w) => ({ field: w.field, op: w.op, value: typed(w.field, w.raw !== undefined ? w.raw : w.value) })) } : {}),
-    ...(h.counts.length ? { counts: h.counts } : {}),
-    ...(h.hops.length ? { hops: h.hops.map(clean) } : {}),
-  });
-  return {
-    from: { ns: Number(document.getElementById("qns").value), title: stored(document.getElementById("qtitle").value) },
-    ...(spec.counts.length ? { counts: spec.counts } : {}),
-    ...(spec.hops.length ? { hops: spec.hops.map(clean) } : {}),
-  };
-}
+ta.addEventListener("input", () => {
+  paint();
+  refresh(false);
+  void reprice();
+});
+ta.addEventListener("scroll", () => (hl.scrollTop = ta.scrollTop));
+ta.addEventListener("blur", () => setTimeout(closeBox, 120));
+ta.addEventListener("click", () => {
+  if (!box.hidden) refresh(false);
+});
+ta.addEventListener("keydown", (e) => {
+  if (e.ctrlKey && e.key === " ") {
+    e.preventDefault();
+    refresh(true);
+    return;
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+    e.preventDefault();
+    closeBox();
+    void run();
+    return;
+  }
+  if (box.hidden) return;
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    sel = (sel + (e.key === "ArrowDown" ? 1 : opts.length - 1)) % opts.length;
+    renderBox();
+  } else if (e.key === "Tab") {
+    e.preventDefault();
+    accept(sel);
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    accept(sel);
+  } else if (e.key === "Escape") {
+    e.stopPropagation();
+    closeBox();
+  } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    closeBox();
+  }
+});
+box.addEventListener("mousedown", (e) => {
+  const o = e.target.closest(".qopt");
+  if (!o) return;
+  e.preventDefault(); // keep focus, and the blur-close, off until the accept lands
+  accept(Number(o.dataset.i));
+});
 
 let pricing = 0;
 async function reprice() {
@@ -410,90 +594,35 @@ async function reprice() {
   let priced;
   try {
     priced = await (await fetch("/price", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload()),
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: ta.value }),
     })).json();
   } catch (e) {
     return;
   }
-  if (mine !== pricing) return; // a later edit already asked
+  if (mine !== pricing) return; // a later keystroke already asked
   if (priced.error) {
-    costEl.innerHTML = '<span class="bad"><b>refused</b> — ' + esc(priced.error) + "</span>";
+    wrap.classList.add("qbad");
+    errEl.hidden = false;
+    errEl.textContent = priced.error.replace(/^text: /, "") + (priced.offset !== undefined ? "  (at character " + priced.offset + ")" : "");
+    costEl.innerHTML = "";
     runBtn.disabled = true;
     return;
   }
+  wrap.classList.remove("qbad");
+  errEl.hidden = true;
   const pct = ((priced.nodes / SCHEMA.limits.maxNodes) * 100).toFixed(1);
-  costEl.innerHTML = '<span class="ok">within budget</span>'
+  costEl.innerHTML = '<span class="ok">parses, within budget</span>'
     + "<span>answer nodes: <b>" + nf(priced.nodes) + "</b> of " + nf(SCHEMA.limits.maxNodes) + " (" + pct + "%)</span>"
     + "<span>plan frames: <b>" + priced.frames + "</b> of " + SCHEMA.limits.maxFrames + "</span>";
   runBtn.disabled = false;
 }
 
-document.getElementById("addhop").onclick = () => {
-  spec.hops.push({ edge: SCHEMA.edges[0].name, limit: 10, where: [], counts: [], hops: [] });
-  render();
-};
-
-hopsEl.addEventListener("click", (e) => {
-  const btn = e.target.closest("button[data-act]");
-  if (btn) {
-    const path = btn.closest(".hop").dataset.path;
-    const act = btn.dataset.act;
-    if (act === "rmhop") {
-      const parts = path.split(".");
-      const i = Number(parts.pop());
-      const parent = parts.length ? at(parts.join(".")) : spec;
-      parent.hops.splice(i, 1);
-    } else if (act === "addkid") {
-      at(path).hops.push({ edge: SCHEMA.edges[0].name, limit: 5, where: [], counts: [], hops: [] });
-    } else if (act === "addfilter") {
-      at(path).where.push({ field: "ns", op: "=", raw: "0" });
-    } else if (act === "rmfilter") {
-      at(path).where.splice(Number(btn.closest(".filter").dataset.i), 1);
-    }
-    render();
-    return;
-  }
-  const cb = e.target.closest("input[data-act=count]");
-  if (cb) {
-    const hop = at(cb.closest(".hop").dataset.path);
-    if (cb.checked) hop.counts.push(cb.value);
-    else hop.counts = hop.counts.filter((c) => c !== cb.value);
-    void reprice();
-  }
-});
-
-hopsEl.addEventListener("input", (e) => {
-  const el = e.target.closest("[data-k]");
-  if (!el) return;
-  const hop = at(el.closest(".hop").dataset.path);
-  const k = el.dataset.k;
-  const filter = el.closest(".filter");
-  if (filter) {
-    const w = hop.where[Number(filter.dataset.i)];
-    if (k === "value") w.raw = el.value;
-    else w[k] = el.value;
-  } else if (k === "limit") hop.limit = el.value === "" ? "" : Number(el.value);
-  else hop[k] = el.value;
-  void reprice();
-});
-
-document.getElementById("rootcounts").addEventListener("change", (e) => {
-  const cb = e.target.closest("input[data-root-count]");
-  if (!cb) return;
-  if (cb.checked) spec.counts.push(cb.value);
-  else spec.counts = spec.counts.filter((c) => c !== cb.value);
-  void reprice();
-});
-document.getElementById("qtitle").addEventListener("input", () => void reprice());
-
-const qout = document.getElementById("qout");
-document.getElementById("qf").addEventListener("submit", async (e) => {
-  e.preventDefault();
+async function run() {
   qout.innerHTML = '<div class="card">Running…</div>';
   let d;
   try {
     const res = await fetch("/query", {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload()),
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: ta.value }),
     });
     d = await res.json();
   } catch (err) {
@@ -502,7 +631,13 @@ document.getElementById("qf").addEventListener("submit", async (e) => {
   }
   if (d.refused) {
     qout.innerHTML = '<div class="card"><h3>Refused</h3><p class="err" style="margin:0">'
-      + esc(d.refused) + '</p><p class="sub" style="margin-top:8px">at <code>' + esc(d.at) + "</code></p></div>";
+      + esc(d.refused.replace(/^text: /, "")) + "</p>"
+      + (d.offset !== undefined ? '<p class="sub" style="margin-top:8px">at character ' + d.offset + "</p>" : "")
+      + "</div>";
+    if (d.offset !== undefined) {
+      ta.focus();
+      ta.setSelectionRange(d.offset, d.offset);
+    }
     return;
   }
   if (d.error) {
@@ -517,7 +652,17 @@ document.getElementById("qf").addEventListener("submit", async (e) => {
     + (r.requests === 1 ? "" : "s") + ' over <span class="big">' + r.objects + '</span> objects — <span class="big">'
     + r.ms + "</span> ms. Priced at " + nf(d.cost.nodes) + " answer nodes across " + d.cost.frames + " frames.</p>"
     + '<div class="hosts">' + r.hosts.map((h) => "<span>host " + h + "</span>").join("") + "</div></div>"
-    + "<h3 style=\"margin-top:16px\">Result</h3><pre>" + esc(JSON.stringify(d.rows, null, 2)) + "</pre></div>";
+    + '<h3 style="margin-top:16px">Result</h3><pre>' + esc(JSON.stringify(d.rows, null, 2)) + "</pre></div>";
+}
+
+runBtn.addEventListener("click", () => void run());
+
+const exSel = document.getElementById("example");
+exSel.addEventListener("change", () => {
+  ta.value = EXAMPLES[exSel.value];
+  paint();
+  void reprice();
+  ta.focus();
 });
 
 // ---------------------------------------------------------------- start
@@ -527,12 +672,15 @@ document.getElementById("qf").addEventListener("submit", async (e) => {
   const nsOptions = SCHEMA.entry.namespaces.map((n) =>
     '<option value="' + n.value + '">' + esc(n.label) + "</option>").join("");
   nsbox.innerHTML = nsOptions;
-  document.getElementById("qns").innerHTML = nsOptions;
-  document.getElementById("dl-edges").innerHTML = SCHEMA.edges.map((e) =>
-    '<option value="' + esc(e.name) + '">' + esc(e.from + " → " + e.to) + "</option>").join("");
-  document.getElementById("dl-fields").innerHTML = SCHEMA.objects[0].fields.map((f) =>
-    '<option value="' + esc(f.name) + '">' + esc(f.type + (f.optional ? " (optional)" : "")) + "</option>").join("");
-  render();
+  // The editor's whole vocabulary, read off the schema so the popup cannot offer a name the engine
+  // would not resolve — the one property of this editor worth stating.
+  EDGE_SHORT = SCHEMA.edges.map((e) => e.name.replace(/^wiki\./, ""));
+  FIELDS = SCHEMA.objects[0].fields.map((f) => ({ name: f.name, type: f.type + (f.optional ? "?" : "") }));
+  OPS = SCHEMA.limits.ops;
+  exSel.innerHTML = Object.keys(EXAMPLES).map((k) => '<option>' + esc(k) + "</option>").join("");
+  ta.value = EXAMPLES[Object.keys(EXAMPLES)[0]];
+  paint();
+  void reprice();
 
   const params = new URLSearchParams(location.search);
   if (params.get("title")) {
