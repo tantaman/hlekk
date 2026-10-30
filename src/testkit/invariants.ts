@@ -174,7 +174,8 @@ export function check(c: LocalCluster, opts: Options = {}): Violation[] {
   // property, which is how the inline-apply bug was caught.
   if (opts.quiesced) {
     const alive = new Set<Id>();
-    const all = new Map<string, Set<Id>>();
+    /** Each list's targets, with the sort key and payload the row carries. */
+    const all = new Map<string, Map<Id, string>>();
     for (const index of c.directory.hostIndexes()) {
       for (const vshard of c.directory.vshardsOn(index)) {
         const host = c.host(index);
@@ -182,13 +183,14 @@ export function check(c: LocalCluster, opts: Options = {}): Violation[] {
         for (const r of host.sql.all<{ id: Uint8Array }>("SELECT id FROM objects WHERE id BETWEEN ? AND ?", lo, hi)) {
           alive.add(fromKey(r.id));
         }
-        for (const r of host.sql.all<{ id1: Uint8Array; atype: number; id2: Uint8Array }>(
-          "SELECT id1, atype, id2 FROM assocs WHERE id1 BETWEEN ? AND ?",
+        for (const r of host.sql.all<{ id1: Uint8Array; atype: number; id2: Uint8Array; time: number; data: string | null }>(
+          "SELECT id1, atype, id2, time, data FROM assocs WHERE id1 BETWEEN ? AND ?",
           lo,
           hi,
         )) {
           const k = listKey(fromKey(r.id1), r.atype);
-          (all.get(k) ?? all.set(k, new Set()).get(k)!).add(fromKey(r.id2));
+          const held = all.get(k) ?? all.set(k, new Map()).get(k)!;
+          held.set(fromKey(r.id2), `${r.time}/${r.data ?? "null"}`);
         }
       }
     }
@@ -199,12 +201,24 @@ export function check(c: LocalCluster, opts: Options = {}): Violation[] {
       const atype = Number(k.slice(cut + 1));
       const inverse = catalog.inverseOf(atype);
       if (inverse === undefined || !alive.has(id1)) continue;
-      for (const id2 of targets) {
+      for (const [id2, mine] of targets) {
         if (!alive.has(id2)) continue;
-        if (!all.get(listKey(id2, inverse))?.has(id1)) {
+        const theirs = all.get(listKey(id2, inverse))?.get(id1);
+        if (theirs === undefined) {
           say(
             "a paired edge type has both halves between two live objects, once the outbox is empty",
             `${id1} -${atype}-> ${id2} has no ${id2} -${inverse}-> ${id1}`,
+          );
+          continue;
+        }
+        // The inverse is dispatched with the forward write's own time and data, so the two halves
+        // carry the same ones. Time is the sort key an edge list and its cursors are ordered by, so
+        // halves that disagree about it are a pair whose two sides list in different orders — which
+        // existing-or-not cannot see.
+        if (theirs !== mine) {
+          say(
+            "both halves of a pair carry the same time and data",
+            `${id1} -${atype}-> ${id2} holds ${mine} and its mirror holds ${theirs}`,
           );
         }
       }

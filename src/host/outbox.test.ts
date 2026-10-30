@@ -131,6 +131,26 @@ describe("delivering an inverse to another host", () => {
     );
   });
 
+  // And idempotence does not save it. Applying one op twice really is a no-op, as the test above
+  // says. But an add is an upsert that takes the op's own time and data, so two different adds for
+  // the same row each overwrite the other: write both sides and the inverses cross, leaving a pair
+  // that exists on both sides and sorts differently on each. Time is the sort key an edge list and
+  // its cursors are ordered by, so this is not cosmetic.
+  it("crosses the times when both sides of a pair are written, which no insert-if-absent would fix", async () => {
+    const { c, db, alice } = await split();
+    const task = await db.create(TASK, { title: "t" }, { vshard: "5" });
+    await db.assocAdd(ASSIGNEE, task, alice, 1); // the task's side says 1
+    await db.assocAdd(ASSIGNED, alice, task, 9); // Alice's side says 9
+    await c.deliverAll();
+
+    const timeOf = async (host: number, id1: string, atype: number) => {
+      const page = await c.host(host).store().edges(id1, atype, null, 10);
+      return (page as { rows: { time: number }[] }).rows.map((e) => e.time);
+    };
+    assert.deepEqual(await timeOf(0, task, ASSIGNEE), [9], "the task's own write was overwritten by Alice's inverse");
+    assert.deepEqual(await timeOf(1, alice, ASSIGNED), [1], "and Alice's by the task's");
+  });
+
   it("stops a pair at its first failure, so nothing overtakes it, and other pairs carry on", async () => {
     const { c, db, alice } = await split();
     const task = await db.create(TASK, { title: "t" }, { vshard: "5" });
