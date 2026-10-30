@@ -18,7 +18,7 @@ import { Placement } from "../directory/placement.ts";
 import type { Thresholds } from "../directory/placement.ts";
 import type { Snapshot, VshardStats } from "../host/host.ts";
 import { doSql } from "../host/sql.ts";
-import { databaseOf, hostStub } from "./bindings.ts";
+import { databaseOf, hostStub, vshardsOf } from "./bindings.ts";
 import type { Ctx, Env } from "./bindings.ts";
 import { call, routesToWire, serve } from "./rpc.ts";
 
@@ -56,7 +56,10 @@ export class HlekkDirectoryDO {
    *  constructed — which fails as an opaque internal error, with the reason nowhere in reach. */
   #ready(): Parts {
     if (!this.#parts) {
-      const directory = Directory.open(doSql(this.#ctx.storage), { database: databaseOf(this.#env) });
+      const directory = Directory.open(doSql(this.#ctx.storage), {
+        database: databaseOf(this.#env),
+        batch: vshardsOf(this.#env),
+      });
       const mover = new Mover(directory, this.#moveHosts());
       const allocator = new Allocator(directory, {
         open: (vshard, host, epoch) => this.#opened.push({ vshard, host, epoch }),
