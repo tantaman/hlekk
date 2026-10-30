@@ -1049,6 +1049,8 @@ Build the riskiest parts first: per-host performance, then moves under load. Eve
 
 `npm run app` runs a database: a host Durable Object, a directory Durable Object, a KV namespace for the published map, and `src/do/transport.ts`, which is the whole of what the platform costs — eight methods, below which nothing above it changes. It asserts what it did rather than that the requests succeeded: that the rows landed on more than one host DO, that a maintained inverse edge arrived from the host that wrote its other half and that those objects really are elsewhere, that a graph read assembled its answer from several hosts, that both drivers agree, that a vshard moves to a host that has never held anything and the same read still answers the same, and that the placement controller sheds a run when a host crosses its threshold.
 
+A read-only proof of concept comes before any of what a deployment still owes: a ~300 GB database laid out across ~50 hosts in advance and queried, with no moves and every epoch at 0. [`wikimedia-demo.md`](wikimedia-demo.md) records what carries it, what the fan-out measured at that width, and what a bulk loader owes — including that the chunked snapshot below is its primitive, so deferring moves does not defer that work.
+
 ### What a deployment still owes
 
 - **A deployment.** `npm run app` runs on local workerd: real DO SQLite, real DO-to-DO calls, KV simulated. Nothing is deployed by the suite.
