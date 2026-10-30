@@ -1,8 +1,9 @@
-// Build A's schema: the enwiki link and category graph. See docs/demo-dataset.md.
+// The enwiki link and category graph. See docs/wikimedia-import.md, and wikimedia-demo.md for the
+// demo this feeds.
 //
 // One domain file's worth of names, planned into a lock, plus the runtime values a query is built
-// from. Build B adds `wiki.revision` and `wiki.page_revisions`; both are additions, which What a
-// change costs puts in the catalog-only column, so nothing here has to move to get there.
+// from. Revisions would be `wiki.revision` plus an edge type, and both are additions, which What a
+// change costs puts in the catalog-only column — so nothing here has to move to add them.
 
 import { plan } from "../catalog/catalog.ts";
 import { bool, defineObject, edge, num, str } from "../schema/define.ts";
@@ -42,19 +43,19 @@ export const LOCK = plan({
       "wiki.page_links": { from: "wiki.page", to: "wiki.page" },
       "wiki.linked_from": { from: "wiki.page", to: "wiki.page" },
 
-      // ---- the category graph: a genuine maintained pair, at 242 million.
+      // ---- the category graph: also two independent types, for the same reason.
       //
-      // Small enough that the outbox can carry it, which is the point: this is the one edge type in
-      // Build A whose inverse arrives from another host, so it is the only thing in the demo that
-      // exercises build-plan step 4 at scale. `time` is `cl_timestamp`, which categorylinks
-      // carries, so "recently added to this category" is a real query.
-      "wiki.page_categories": { from: "wiki.page", to: "wiki.page", inverse: "wiki.category_pages" },
-      "wiki.category_pages": {
-        from: "wiki.page",
-        to: "wiki.page",
-        inverse: "wiki.page_categories",
-        maintained: true,
-      },
+      // This was a maintained pair in the first draft, specifically to exercise the outbox at 242
+      // million. wikimedia-demo.md puts outbox delivery out of scope and has the loader materialize
+      // both halves of every pair and the counts for both directions — because a bulk load cannot
+      // route backlinks through the outbox at this volume. So pairing this bought a demonstration
+      // of a mechanism the demo excludes, and charged 242 million queued ops on the critical path
+      // for it. Unpaired, each side is one sorted pass over `categorylinks`.
+      //
+      // `time` is `cl_timestamp`, which the table still carries, so "recently added to this
+      // category" is a real query. `category_pages` is from a page in namespace 14.
+      "wiki.page_categories": { from: "wiki.page", to: "wiki.page" },
+      "wiki.category_pages": { from: "wiki.page", to: "wiki.page" },
     },
   },
 });
