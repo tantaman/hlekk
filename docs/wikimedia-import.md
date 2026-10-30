@@ -150,6 +150,21 @@ batching, not counts, not index entries.
 `key` and `to` are MediaWiki `page_id`s — the source's own identifiers, as the seam asks. Resolving
 them to hlekk ids is the loader's, which is what lets this side be verified against the dump alone.
 
+**It is a generator, and a file only on request.** `records()` in `scripts/import-enwiki.mjs` is an
+async generator, so a loader in the same process consumes it and partitions by `(host, vshard)` as
+it reads. `writeRecords` spills it to `records.jsonl` for when handing someone a file is what is
+wanted; that is a convenience, not the intended path, for the reasons below.
+
+**One addition to the shape: continuation records.** A page with a million backlinks would otherwise
+materialize a million objects in the generator, which is the high-degree hazard arriving in the
+importer instead of in a vshard. So a page's edges are split at `MAX_EDGES_PER_RECORD` (50,000) into
+records that repeat the same `key`, `affinity`, `type` and `fields`, with `more: true` on every one
+but the last. Edge writes are independent and an object write is idempotent — `install` is already
+`INSERT OR REPLACE` — so a consumer applies them in order and needs no special case beyond not
+treating a repeated key as a second page. Measured on simplewiki: 15 continuation records across
+950,421 pages at the default, and streaming 22.3 million edges in process held **65 MB of heap**.
+Folding the continuations back reproduces all 950,421 pre-split records exactly.
+
 ### The passes
 
 | Pass | Reads | Writes | Why |
@@ -196,8 +211,8 @@ edge bytes at a measured **46.9 bytes per edge**, and enwiki should carry ~3.5 b
 red links are dropped. (An earlier draft said ~130 GB by scaling page counts; the file scales with
 edges.)
 
-Three reasons it should be a generator the loader pulls from rather than a file, in decreasing order
-of how much they settle:
+Three reasons it is a generator the loader pulls from rather than a file, in decreasing order of how
+much they settle:
 
 - **The checkpoint already exists one step earlier.** The one good reason to materialize is
   resumability, which this doc's demo counterpart rightly puts above throughput. But `edges.tsv` has
@@ -215,11 +230,11 @@ of how much they settle:
   with an integer atype holds the same 3.5 billion edges in ~49 GB. If a materialized form is wanted
   — to hand someone the file, say — it should be that one.
 
-What makes this less trivial than "just stream it": the loader needs records grouped by
-`(host, vshard)`, not by `page_id`, so it cannot consume a stream and write directly. But at 128
-vshards that is 128 open buffers in one pass, not a sort. **And the seam does not move** — the
-contract is the record shape, not a file, so this is a choice on the import side rather than a
-renegotiation of it.
+What made this less trivial than "just stream it", and is now handled: the loader needs records
+grouped by `(host, vshard)`, not by `page_id`, so it cannot consume a stream and write directly —
+but at 128 vshards that is 128 open buffers in one pass, not a sort. And a generator yielding whole
+records puts a high-degree page's entire edge list in memory, which is what continuation records
+above are for. **The seam itself did not move** — the contract is the record shape, not a file.
 
 **Peak disk is the figure this rolls up into.** At enwiki scale: `edges-raw` ~118 GB, `edges.tsv`
 another ~118 GB, `sort`'s own temp space ~118 GB while it merges, `records.jsonl` ~164 GB, and ~20 GB
@@ -369,9 +384,9 @@ hold. Two findings worth keeping, both design gaps rather than loading problems:
 - [ ] Whether the 100 KB SQL statement limit is per statement or per `exec` string.
 - [ ] Which affinity functions the demo compares, given the import takes it as a parameter. Note
       that 48% of simplewiki pages have no category, so `category` is half a fallback to `namespace`.
-- [x] `records.jsonl` should be a generator, not a file: ~164 GB at enwiki scale, a duplicate of a
-      checkpoint `edges.tsv` already provides, and discarded by the second affinity load anyway. The
-      loader partitions by `(host, vshard)` in one pass over 128 buffers. Not yet implemented — the
-      script still writes the file.
+- [x] `records()` is a generator, with `writeRecords` spilling to a file only on request. A page's
+      edges split into continuation records at 50,000 so a high-degree page does not materialize its
+      whole list; folding them back reproduces the unsplit records exactly, and streaming 22.3 M
+      edges held 65 MB. What remains is for the loader to call it instead of reading the file.
 - [ ] enwiki's red-link share, which sets the real edge count. simplewiki's is 24.5% of links and
       0.6% of category targets; a complete wiki should be lower on both.

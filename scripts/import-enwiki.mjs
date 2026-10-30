@@ -435,8 +435,8 @@ async function passCategories(lt, out) {
 }
 
 /** The affinity key for a page, for the functions that need nothing but the page itself. */
-function affinityOf(ns, title, fromCategory) {
-  switch (AFFINITY) {
+function affinityOf(ns, title, fromCategory, which = AFFINITY) {
+  switch (which) {
     case "category":
       return fromCategory ?? `ns:${ns}`;
     case "namespace":
@@ -450,7 +450,7 @@ function affinityOf(ns, title, fromCategory) {
       return `h:${h % 4096}`;
     }
     default:
-      throw new Error(`unknown --affinity ${AFFINITY}`);
+      throw new Error(`unknown --affinity ${which}`);
   }
 }
 
@@ -461,18 +461,44 @@ function affinityOf(ns, title, fromCategory) {
  * nothing but the current page's edge list is ever in memory. A page with a million backlinks is the
  * one that makes that worth doing.
  */
-async function pass5() {
-  await sorted(path("edges-raw.tsv"), path("edges.tsv"), ["1,1n"]);
-  const out = writer(path("records.jsonl"));
+/** Default ceiling on edges carried in one record. See `records`. */
+export const MAX_EDGES_PER_RECORD = 50_000;
 
-  const affIter = lines(path("affinity.tsv"))[Symbol.asyncIterator]();
+/**
+ * 5. The record stream: one record per page, with its outbound edges.
+ *
+ * **A generator, not a file.** The seam is the record shape, so a loader in the same process can
+ * `for await (const r of records())` and partition by `(host, vshard)` as it reads — 128 open
+ * buffers in one pass, not a sort. Materializing this as JSONL instead costs ~164 GB at enwiki
+ * scale, duplicates a checkpoint `edges.tsv` already provides, and is discarded by the second
+ * affinity load anyway; `writeRecords` below still writes it, because handing someone a file is
+ * worth one function. docs/wikimedia-import.md has the arithmetic.
+ *
+ * Three streams all ordered by page id — pages, affinity keys and edges — merged in one pass, so
+ * nothing but the current page's edge list is ever held.
+ *
+ * **That edge list is the thing to bound.** A page with a million backlinks would otherwise
+ * materialize a million objects, which is the high-degree hazard arriving in the importer rather
+ * than in a vshard. So a page's edges are split across **continuation records**: the same `key`,
+ * `affinity`, `type` and `fields` repeated, `more: true` on every record but the last. Edge writes
+ * are independent and an object write is idempotent, so a consumer can apply them in order and
+ * needs no special case beyond not treating a repeated key as a duplicate page.
+ */
+export async function* records(opts = {}) {
+  const dir = opts.work ?? WORK;
+  const at = (f) => join(dir, f);
+  const affinity = opts.affinity ?? AFFINITY;
+  const maxEdges = opts.maxEdges ?? MAX_EDGES_PER_RECORD;
+
+  if (existsSync(at("edges-raw.tsv"))) await sorted(at("edges-raw.tsv"), at("edges.tsv"), ["1,1n"]);
+  else if (!existsSync(at("edges.tsv"))) throw new Error(`${at("edges.tsv")} is missing; run passes 2-4 first`);
+
+  const affIter = lines(at("affinity.tsv"))[Symbol.asyncIterator]();
   let aff = await affIter.next();
-  const edgeIter = lines(path("edges.tsv"))[Symbol.asyncIterator]();
+  const edgeIter = lines(at("edges.tsv"))[Symbol.asyncIterator]();
   let edge = await edgeIter.next();
-  let records = 0;
-  let edgesOut = 0;
 
-  for await (const line of lines(path("pages.tsv"))) {
+  for await (const line of lines(at("pages.tsv"))) {
     const [pageIdStr, ns, title, redirect, len] = line.split("\t");
     const pageId = Number(pageIdStr);
 
@@ -484,31 +510,54 @@ async function pass5() {
     }
 
     while (!edge.done && Number(edge.value.slice(0, edge.value.indexOf("\t"))) < pageId) edge = await edgeIter.next();
-    const edges = [];
-    while (!edge.done) {
-      const parts = edge.value.split("\t");
-      if (Number(parts[0]) !== pageId) break;
-      const e = { type: parts[1], to: parts[2] };
-      if (parts[3] !== "0") e.time = Number(parts[3]);
-      edges.push(e);
-      edge = await edgeIter.next();
-    }
-    edgesOut += edges.length;
 
-    await out.write(
-      JSON.stringify({
-        key: pageIdStr,
-        affinity: affinityOf(Number(ns), title, fromCategory),
-        type: "wiki.page",
-        fields: { ns: Number(ns), title, redirect: redirect === "1", len: Number(len) },
-        edges,
-      }) + "\n",
-    );
-    if (++records % 2_000_000 === 0) log(`pass 5: ${records.toLocaleString()} records`);
+    const head = {
+      key: pageIdStr,
+      affinity: affinityOf(Number(ns), title, fromCategory, affinity),
+      type: "wiki.page",
+      fields: { ns: Number(ns), title, redirect: redirect === "1", len: Number(len) },
+    };
+
+    // Gather up to maxEdges, then look one further: a record claims `more` only when another edge
+    // for this page really exists, so a page with exactly maxEdges edges yields one record.
+    let edges = [];
+    for (;;) {
+      while (!edge.done && edges.length < maxEdges) {
+        const parts = edge.value.split("\t");
+        if (Number(parts[0]) !== pageId) break;
+        const e = { type: parts[1], to: parts[2] };
+        if (parts[3] !== "0") e.time = Number(parts[3]);
+        edges.push(e);
+        edge = await edgeIter.next();
+      }
+      const more = !edge.done && Number(edge.value.slice(0, edge.value.indexOf("\t"))) === pageId;
+      yield more ? { ...head, edges, more: true } : { ...head, edges };
+      if (!more) break;
+      edges = [];
+    }
+  }
+}
+
+/** Writes the record stream to `records.jsonl`. A convenience, not the intended path. */
+async function writeRecords() {
+  const out = writer(path("records.jsonl"));
+  let n = 0;
+  let pages = 0;
+  let edgesOut = 0;
+  let continued = 0;
+  for await (const r of records()) {
+    await out.write(JSON.stringify(r) + "\n");
+    edgesOut += r.edges.length;
+    if (r.more) continued++;
+    else pages++;
+    if (++n % 2_000_000 === 0) log(`pass 5: ${n.toLocaleString()} records`);
   }
   await out.end();
-  report.records = { pages: records, edges: edgesOut };
-  log(`pass 5: ${records.toLocaleString()} records, ${edgesOut.toLocaleString()} edges -> records.jsonl`);
+  report.records = { pages, edges: edgesOut, continuations: continued };
+  log(
+    `pass 5: ${pages.toLocaleString()} pages, ${edgesOut.toLocaleString()} edges, ` +
+      `${continued.toLocaleString()} continuation record(s) -> records.jsonl`,
+  );
 }
 
 // ------------------------------------------------------------------- run
@@ -531,7 +580,7 @@ async function run() {
     if (PASSES.has("4")) await passCategories(lt, out);
     await out.end();
   }
-  if (PASSES.has("5")) await pass5();
+  if (PASSES.has("5")) await writeRecords();
   writeFileSync(path("report.json"), JSON.stringify({ wiki: WIKI, date: DATE, affinity: AFFINITY, ...report }, null, 2));
   log(`done; report at ${path("report.json")}`);
 }
