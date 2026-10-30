@@ -110,7 +110,13 @@ Four constraints the loader has to respect:
 ### What the import branch needs to emit
 
 Per record: an **affinity key**, a **type**, a **field map**, and **outbound edges expressed in the
-source's own identifiers**. This is what `scripts/import-enwiki.mjs` writes, as JSONL — see
+source's own identifiers**. `records()` in `scripts/import-enwiki.mjs` is an async generator of
+exactly that, so the loader can consume it in process and partition by `(host, vshard)` as it reads
+rather than reading a ~164 GB intermediate file. One wrinkle to know: a page whose edge list exceeds
+50,000 arrives as **continuation records** — same key and fields repeated, `more: true` on all but
+the last — so a high-degree page does not materialize its whole list in the importer. Edges are
+additive and an object write is idempotent, so the only thing the loader must not do is treat a
+repeated key as a second page. See
 [`wikimedia-import.md`](wikimedia-import.md#what-the-import-emits) for the shape and the passes that
 produce it, including that both directions of both relations are materialized rather than declared
 as inverses, exactly because the outbox is out of scope here. The loader owns everything downstream of that — vshard choice, id
