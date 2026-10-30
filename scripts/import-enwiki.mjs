@@ -165,12 +165,21 @@ async function dump(table) {
   return gunzip;
 }
 
-/** Streams through GNU sort. Every key is an integer in a fixed column, so this is the right tool. */
+/**
+ * Streams through GNU sort. Every key is an integer or a byte string in a fixed column, so this is
+ * the right tool.
+ *
+ * `LC_ALL=C` is not optional. A merge join below walks two sorted files in step, and that is only
+ * correct while the order `sort` produced and the order the comparison uses are the *same relation*
+ * — so the sort runs in byte order and the comparison compares bytes. Under a locale collation they
+ * diverge on case and on accents, and a merge join whose comparison disagrees with its input's order
+ * does not fail: it silently walks past matches.
+ */
 function sorted(inFile, outFile, keys) {
   const sort = spawn(
     "sort",
     ["-t", "\t", ...keys.flatMap((k) => ["-k", k]), "-S", SORT_MEM, "-T", WORK, "-o", outFile, inFile],
-    { stdio: ["ignore", "inherit", "inherit"] },
+    { stdio: ["ignore", "inherit", "inherit"], env: { ...process.env, LC_ALL: "C" } },
   );
   return new Promise((done, fail) =>
     sort.on("exit", (code) => (code === 0 ? done() : fail(new Error(`sort exited ${code}`)))),
@@ -310,20 +319,32 @@ async function pass1() {
   }
   await pk.end();
 
-  await sorted(path("lt-raw.tsv"), path("lt-sorted.tsv"), ["1,1n", "2,2"]);
-  await sorted(path("pages-keyed.tsv"), path("pages-by-title.tsv"), ["1,1n", "2,2"]);
+  // Both keys sorted as bytes, on both fields, NOT numerically on the namespace. The merge below
+  // compares `ns\ttitle` as one unit, and a numeric first field puts ns 14 after ns 2 in the file
+  // while a byte comparison puts it before — so the page iterator, which only ever moves forward,
+  // walks past every namespace above 9 and resolves nothing in it. That is exactly what happened:
+  // categories are ns 14, and the first run resolved 0 of 2,258,768 memberships while links in ns 0
+  // partly worked. The sort order and the comparison have to be the same relation.
+  await sorted(path("lt-raw.tsv"), path("lt-sorted.tsv"), ["1,1", "2,2"]);
+  await sorted(path("pages-keyed.tsv"), path("pages-by-title.tsv"), ["1,1", "2,2"]);
 
   const lt = new LtMap();
   let red = 0;
   let blue = 0;
-  const keyOf = (line) => line.slice(0, line.lastIndexOf("\t"));
+  // Bytes, to match `LC_ALL=C sort`. Titles are not all ASCII, and JS compares UTF-16 code units
+  // where sort compared UTF-8 bytes, which disagree above the BMP.
+  const keyOf = (line) => Buffer.from(line.slice(0, line.lastIndexOf("\t")), "utf8");
   const tailOf = (line) => line.slice(line.lastIndexOf("\t") + 1);
   const pageIter = lines(path("pages-by-title.tsv"))[Symbol.asyncIterator]();
   let page = await pageIter.next();
+  let pageKey = page.done ? null : keyOf(page.value);
   for await (const line of lines(path("lt-sorted.tsv"))) {
     const key = keyOf(line);
-    while (!page.done && keyOf(page.value) < key) page = await pageIter.next();
-    if (!page.done && keyOf(page.value) === key) {
+    while (!page.done && Buffer.compare(pageKey, key) < 0) {
+      page = await pageIter.next();
+      pageKey = page.done ? null : keyOf(page.value);
+    }
+    if (!page.done && Buffer.compare(pageKey, key) === 0) {
       lt.set(Number(tailOf(line)), Number(tailOf(page.value)));
       blue++;
     } else red++;

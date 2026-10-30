@@ -46,9 +46,11 @@ And two findings that land on the demo side rather than here; both are live bugs
 - **`categorylinks` has dropped `cl_to`.** As of the 2026 dumps its columns are `(cl_from,
   cl_sortkey, cl_timestamp, cl_sortkey_prefix, cl_type, cl_collation_id, cl_target_id)`: a category
   is named by a `linktarget` id now, exactly as a link target is, and `cl_sortkey` is a binary
-  collation key rather than a readable title. Found by reading the bytes. It is good news — category
-  edges resolve through the same map the link edges use — but anything written against `cl_to` reads
-  a collation blob as a title and fails silently, which is what it did here.
+  collation key rather than a readable title. Found by reading the bytes, and since confirmed by
+  resolving ids end to end: 2,244,809 of 2,258,768 simplewiki memberships resolve through the
+  `linktarget` map, so `cl_target_id` is a `linktarget` id. It is good news — category edges resolve
+  through the same map the link edges use — but anything written against `cl_to` reads a collation
+  blob as a title and fails silently, which is what it did here.
 
 ## The dumps, measured
 
@@ -168,8 +170,49 @@ them to hlekk ids is the loader's, which is what lets this side be verified agai
 - **Every pass asserts its table's column count**, because `categorylinks` already proved that a
   changed schema parses fine and produces nonsense. Principle 7.
 - **The two joins refuse to continue past 90% unresolved.** A sparse wiki has red links; a wrong key
-  column has almost nothing else, and the `simplewiki` run separates the two in minutes.
-- **Run it on `simplewiki` first.** Same schema, about 1% of the size.
+  column has almost nothing else. This is not a theoretical guard — it caught the bug below on the
+  first run.
+
+**It has run, on `simplewiki`, end to end: 139 seconds for 950,421 pages and 42,817,596 edges.**
+
+| | |
+| --- | --- |
+| Pages | 950,421 |
+| `pagelinks` rows read | 25,392,774 |
+| Links emitted | 19,163,989 each way; 6,228,785 dropped as red (24.5%) |
+| Memberships emitted | 2,244,809 each way; 13,959 dropped (0.6%) |
+| Records | 950,421, carrying 42,817,596 edges |
+| `records.jsonl` | 1.9 GB |
+
+Edges cross-check exactly — `links × 2 + categories × 2` is the reported 42,817,596 — and the record
+for page 1 is `April`, ns 0, with 414 outlinks, 156 backlinks and 2 categories. 52% of pages got a
+category affinity key; the other 48% have no categories at all and fall back to `ns:`, which is
+worth knowing before treating category affinity as the only knob.
+
+**One figure to carry forward: the intermediate is large.** 1.9 GB of JSONL for 1% of enwiki
+extrapolates to roughly 130 GB — about half the database it describes, in a verbose format, written
+and then read once. Streaming it into the loader rather than materializing it is the obvious answer
+and the seam does not forbid it.
+
+### The bug the guard caught
+
+Worth recording because it is the shape of bug that this kind of pipeline produces: **silence, not
+failure.**
+
+The first run resolved **0 of 2,258,768 memberships**, and it was not `cl_target_id`. The merge join
+in pass 1 walked two files sorted with `sort -k1,1n -k2,2` — the namespace *numeric* — while
+comparing the combined `ns\ttitle` key as a **string**. Numerically ns 14 follows ns 2; as a string
+it precedes it. The page iterator only moves forward, so it ran past every namespace above 9 and
+resolved nothing in any of them. Categories are ns 14, so they resolved nothing at all; links are
+mostly ns 0, which happens to sort first either way, so they partly worked and looked fine.
+
+Both files now sort in byte order on both fields under `LC_ALL=C`, and the comparison compares UTF-8
+bytes with `Buffer.compare` — because JS compares UTF-16 code units where `sort` compared bytes, and
+those disagree above the BMP. The rule it violated is worth stating plainly: **a merge join is
+correct only while the order its input was sorted in and the order its comparison uses are the same
+relation.** Nothing fails when they differ; matches are just missed.
+
+The fix moved link resolution from 17,257,881 to 19,163,989 and memberships from 0 to 2,244,809.
 
 ## What it costs
 
@@ -292,4 +335,9 @@ hold. Two findings worth keeping, both design gaps rather than loading problems:
       which is the only thing that would catch a half-loaded direction.
 - [ ] Whether an R2 binding works inside a Durable Object. Documented for KV, undocumented for R2.
 - [ ] Whether the 100 KB SQL statement limit is per statement or per `exec` string.
-- [ ] Which affinity functions the demo compares, given the import takes it as a parameter.
+- [ ] Which affinity functions the demo compares, given the import takes it as a parameter. Note
+      that 48% of simplewiki pages have no category, so `category` is half a fallback to `namespace`.
+- [ ] Whether `records.jsonl` is streamed into the loader rather than materialized, given it is
+      ~130 GB at enwiki scale.
+- [ ] enwiki's red-link share, which sets the real edge count. simplewiki's is 24.5% of links and
+      0.6% of category targets; a complete wiki should be lower on both.
