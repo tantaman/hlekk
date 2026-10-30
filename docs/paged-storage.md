@@ -10,7 +10,7 @@ Numbers quoted as measured come from the `rindle` repository — either its own 
 deployed `r2db` demo — and are cited to the ledger that holds them. They are evidence about the
 storage engine, not about hlekk.
 
-## 1. The destination
+## The destination
 
 Back a host's trees with rindle's paged copy-on-write B+tree, whose pages live in R2, with the
 Durable Object holding a durable write overlay and a hot page cache rather than the whole dataset.
@@ -33,7 +33,7 @@ What it changes for hlekk, in order of how much it matters:
   otherwise flush them after the handoff and corrupt a tree the new owner is also writing; today
   such a zombie can only damage its own local copy, which is about to be dropped.
 
-## 2. What already exists
+## What already exists
 
 Enough that the work is integration rather than invention.
 
@@ -56,7 +56,7 @@ Enough that the work is integration rather than invention.
   the contract outlived it". The `fuzz-paged-rings` lane drives it in nine concentric rings against
   a SQLite recompute oracle.
 
-## 3. What is missing: the faulting arm
+## What is missing: the faulting arm
 
 `rindle-paged-object`'s read **blocks** on the ranged GET. That is a decision, not an oversight
 (464 §3.5): a native host can hold hundreds of GETs in flight, so blocking-plus-prefetch gets the
@@ -76,7 +76,7 @@ So hlekk needs a faulting arm of the same leaf. Three findings about where it go
   anyway. A typed variant is the honest fix — `PreconditionFailed` is already precedent for "a
   signal, not a fault".
 
-## 4. Rounds or async
+## Rounds or async
 
 **Rounds.** The choice was examined with everything on the table, including making the store async
 from the page leaf upward.
@@ -126,7 +126,7 @@ colour is tree → cursor → txn, which is materially shorter.
 That is where restartability genuinely binds. v1 has no such API, so it is not a reason to choose
 differently now.
 
-## 5. The planner's cost model inverts — and the inversion is about shape, not batching
+## The planner's cost model inverts
 
 The current model: hops inside a host are in-process reads costing microseconds, hops across hosts
 are network round trips, so the win is to batch per host and ship the query to the data.
@@ -144,7 +144,7 @@ outstanding, so the real figure is `depth × ceil(width / 6) × RTT` — a tax o
 saves, not a reason to batch less. **The number to measure is GETs per round**, which is what the
 cap applies to; rounds alone will look fine while a wide round pays nine serial RTTs.
 
-## 6. Residency, and the one decision that cannot be deferred
+## Residency, and the one decision that cannot be deferred
 
 Depth is the floor only when **cold**, and that is where the cheap win is. From rindle's residency
 work (`follow-ups/paged-internal-node-residency.md` §7): keep levels 2-and-up in RAM, which costs
@@ -175,7 +175,110 @@ step: integer or short keys (a 26-byte sequential text key costs 60% more reside
 u64 BLOB ids already get this right), and scan resistance in the local tier, since writes there cost
 roughly 3× the GETs that fetched the page.
 
-## 7. What hlekk already has right
+## What the vshard cap actually bounds
+
+The cap is ~1 GB and `design.md` is explicit that *"the cap is the largest unit that can be
+relocated in a tolerable pause, not the largest unit that fits."* So it is set by move time and by
+nothing else, and the open question says the value is a guess "until step 1's throughput
+measurement". It is a placeholder for a measurement rather than a result, which is worth saying
+plainly before reasoning from it.
+
+Under lease handoff the pause scales with dirty bytes, so that reason goes away. Three bounds take
+its place, and only the first is about the vshard:
+
+- **Write rate, not bytes.** A vshard is one lease holder is one DO's single thread, against a 1,000
+  requests/sec soft limit. So a vshard is bounded by the write rate its owner can serve. That is a
+  load-dependent bound rather than a constant, and it means the trigger for opening more vshards
+  should be load rather than gigabytes.
+- **Write concurrency sets the vshard COUNT.** This is the cap's second job and it survives intact.
+  `design.md` already names it: *"Opening a single vshard would funnel every create in the database
+  onto one vshard on one host, against the 1,000 requests/sec ceiling."* N vshards spread across
+  hosts is N parallel writers, so the count is a concurrency parameter. Bigger vshards are fine;
+  *fewer* vshards costs write throughput.
+- **Branch-page residency bounds the HOST, not the vshard** — see the next section.
+
+So "roughly one vshard per gigabyte of live data" stops being the rule, in both directions: the
+count is load-bound, and the per-vshard overhead below makes one-per-gigabyte actively expensive.
+
+## What a host can hold
+
+This is the number paged storage changes most. A host stops holding the data and holds the write
+overlay, the tree's level-1 branch pages and a leaf cache.
+
+At 16 KiB pages, ~69% steady-state fill, with integer-like keys (which hlekk's big-endian u64 blobs
+are — the favourable case; a 26-byte text key costs 60% more resident memory):
+
+| | share of store | per 1 TB of base | where it lives |
+| --- | --- | --- | --- |
+| all internal levels | ~0.30% | ~3 GB | — |
+| levels 2 and up | ~0.0009% | **~9 MB** | RAM |
+| level 1 | ~0.299% | **~3 GB** | the DO's own 10 GB tier |
+
+Level 1 is the whole cost and does not fit RAM. Reserve half the 10 GB tier for it and a host backs
+**~1.6 TB of base** — about 300× the 5 GB per DO that `design.md`'s growth table assumes. On that
+table, 1 TB needs about one host rather than ~200, and 100 TB about 60 rather than ~20,000.
+
+**Always holding the internal nodes is the right target**, and it is what makes a point read one R2
+GET rather than one per level. Three caveats on "always":
+
+- **RAM is lost on hibernation; the DO's own storage is not.** So the spine has to be *persisted*
+  and re-pinned at wake from local storage, not merely cached. That is what makes a second wake
+  cheap: r2db measured a cold query at 7.34 s then 1.90 s, and `r2Gets` 53 then 16, as its warm set
+  converged on 1,099 of the base's 1,120 branch pages.
+- **A move starts the new owner cold**, so hand the warm set over with the lease. It is a list of
+  page ids, it costs almost nothing, and without it a move's cost migrates from a long pause to a
+  long warm-up rather than going away.
+- **The failure mode is uncalled mechanism, not missing mechanism.** r2db had all of this and its
+  own open path called none of it, so every wake re-descended from R2 for months and roughly a
+  quarter of first visits failed. What fixed it was a boot report with a per-phase breakdown,
+  "because a single wake duration cannot say which of four fixes to apply".
+
+## One paged store per vshard
+
+Lease handoff only works if the unit of lease is the unit of move. If a host runs one paged store
+spanning many vshards, moving a vshard means extracting a key range — a copy, not a handoff, and the
+stop-the-world protocol is back.
+
+So each vshard needs its own base and manifest in R2, and that carries a fixed per-vshard cost: a
+meta page, a catalog, a manifest, a publication cycle and a GC pass, paid whether the vshard is busy
+or not. At 64 vshards it is noise. At one-per-gigabyte a 100 TB database is 100,000 independent
+paged stores on ~60 hosts, which is **~1,600 manifests per host** to publish and sweep.
+
+This is an argument for fewer, larger vshards that is independent of the id-layout reasoning below,
+and probably the stronger of the two. It also sets the floor under "fewer": the write-concurrency
+bound above, since vshards are what parallelism is bought with.
+
+## The id layout
+
+Changed ahead of the storage decision, because every id ever minted encodes it and no id exists yet.
+**4 reserved / 20 vshard / 40 sequence**, from 24/40 with nothing spare. `design.md`'s *Layout* has
+the full reasoning; the parts that belong here:
+
+- **The old 16 PB ceiling was a product of the cap**, not of the field. 2^24 × 1 GB is 16 PB; 2^20 ×
+  100 GB is ~105 PB. A narrower field with a larger vshard reaches further.
+- **It is not a bet on paged storage landing.** 2^20 × 1 GB is still 1 PB.
+- **Reserving at the top is what makes it reversible.** The vshard field stays anchored at bit 40,
+  so every id has zeros above bit 59 and `id >> 40` decodes identically under a wider field:
+  widening back needs no migration, narrowing later would.
+- **Sequence bits did not need to grow.** A 100 GB vshard of 1 KB objects is 10^8 objects against
+  2^40 — four orders of magnitude spare. Larger vshards do not pressure the sequence.
+- **Nothing was spent.** A type tag was considered and rejected: it makes type immutable per object,
+  pins type ids across catalog edits that teams make independently, and `design.md`'s indexing
+  measurement uses "an id names a vshard but not a type" as a reason the shared object table is
+  right. A fixed sub-slab field was considered and rejected on arithmetic: 16 slab bits leaves 24
+  for the sequence, or 16.7M objects per vshard, where a 100 GB vshard wants ~10^8. Slabs stay
+  dynamic.
+- **One unforeseen benefit.** At 24 bits a fully fragmented shard map was 16.7M entries and 200 MB,
+  which a 25 MiB KV value could not hold at all. At 20 bits the same worst case is ~12.6 MB and
+  fits one value, so chunking becomes an optimization rather than the only route to the ceiling.
+
+And one idea checked and dropped: squeezing under 2^53 to make ids JS-safe numbers. Two of
+`design.md`'s four reasons for blob keys are about precision, but the other two bind independently —
+big-endian bytes sorting in unsigned numeric order is what makes one vshard a contiguous key range,
+which the paged tree needs at least as much as SQLite did, and a missed conversion failing loudly as
+an `ArrayBuffer` is principle 7. Blob keys stay either way, so there is nothing to buy.
+
+## What hlekk already has right
 
 The host is already written as the restartable synchronous closure a round loop requires, on both
 sides, for reasons that had nothing to do with pages.
@@ -195,7 +298,7 @@ sides, for reasons that had nothing to do with pages.
 - **Per-round CPU is small**, because the API is restricted: point reads, ordered range reads with
   limits, and maintained counters. Nothing re-executes a join.
 
-## 8. Three hazards
+## Three hazards
 
 - **A page miss must not travel as `UNKNOWN`.** The two signals want opposite responses. `Refusal`
   carries no target, so `UNKNOWN` sends the coordinator back to the directory to re-resolve — "ask
@@ -211,7 +314,7 @@ sides, for reasons that had nothing to do with pages.
   page it is missing, not the first; otherwise one round fetches one page of a run and a deep chain
   needs a round per page. `MissIo` does this deliberately and says so.
 
-## 9. Integration seams
+## Integration seams
 
 Asymmetric, and worth knowing before estimating:
 
@@ -223,7 +326,7 @@ Asymmetric, and worth knowing before estimating:
   substitution and the write path is a rewrite. Giving the write path a `Store`-shaped seam is
   useful on its own and could land independently of any paged work.
 
-## 10. Open
+## Open
 
 - [ ] The faulting arm's shape in rindle: a typed `StoreError` variant, and whether the wanted set
       is drained per call or accumulated across a round.

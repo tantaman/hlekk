@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 
 import { Catalog, plan } from "../catalog/catalog.ts";
 import { LocalCluster } from "../client/local.ts";
-import { vshardOf } from "../host/ids.ts";
+import { MAX_VSHARD, vshardOf } from "../host/ids.ts";
 import { NoRoom, hash } from "./allocator.ts";
 import { pickRun } from "./placement.ts";
 
@@ -104,9 +104,10 @@ describe("the active set", () => {
 
   it("says so rather than silently overfilling when the vshard space runs out", async () => {
     const c = await tiny({ cap: 2_000, batch: 4 });
-    // The id layout gives 24 bits of vshard. Put the last one in use and fill everything, so there is
-    // nothing above it left to open.
-    const top = (1n << 24n) - 1n;
+    // Put the layout's last vshard in use and fill everything, so there is nothing above it left to
+    // open. Derived from MAX_VSHARD rather than restated: this test hardcoded `(1n << 24n) - 1n`
+    // and was the only thing that broke when the field narrowed to 20 bits.
+    const top = MAX_VSHARD;
     c.directory.assign(top, 0, 0);
     c.directory.sql.run("INSERT OR REPLACE INTO usage (vshard, bytes) SELECT vshard, 1000000 FROM assignments");
     assert.deepEqual(c.allocator.active(), [], "nothing is taking roots");

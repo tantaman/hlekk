@@ -4,11 +4,33 @@
 
 import type { Id } from "../query/types.ts";
 
-export const VSHARD_BITS = 24n;
+// 20 vshard bits, 40 sequence bits, and the top 4 RESERVED and required to be zero.
+//
+// It was 24/40/0. The vshard field narrowed because a vshard's size is no longer bounded by what a
+// stop-the-world move can copy: 24 bits reached 16.7 PB only at the ~1 GB cap that bound set, and
+// 2^20 vshards reach ~105 PB at 100 GB each — a higher ceiling from a narrower field. Even if the
+// cap never moves, 2^20 × 1 GB is 1 PB, so this is not a bet on that change landing.
+//
+// The spare bits are at the TOP, and that is the whole point of doing this before any id exists.
+// The vshard field stays anchored at bit 40, so every id ever minted has zeros above bit 59 and
+// `id >> SEQ_BITS` decodes identically under a wider field: widening back to 24 bits later needs no
+// migration. Narrowing later would need one. So this direction is free and reversible, and what it
+// buys today is the refusal below — nothing can mint a vshard id above 2^20 and quietly spend the
+// reservation.
+//
+// Deliberately NOT carved up further. A fixed sub-slab field for the split scheme (design.md,
+// "If splits are ever needed") would have to come out of the sequence, and 16 slab bits leaves 24
+// for the sequence — 16.7M objects per vshard, where a 100 GB vshard of 1 KB objects wants ~10^8.
+// Slabs are allocated dynamically out of the sequence space, with continuation slabs when one
+// fills, which is what makes them work at any vshard size.
+export const VSHARD_BITS = 20n;
 export const SEQ_BITS = 40n;
+export const RESERVED_BITS = 64n - VSHARD_BITS - SEQ_BITS;
 
 export const MAX_VSHARD = (1n << VSHARD_BITS) - 1n;
 export const MAX_SEQ = (1n << SEQ_BITS) - 1n;
+// Also the reserved-bits check: an id with any bit above 59 set is out of range, so a reservation
+// cannot be spent by accident on the read path either.
 const MAX_ID = (1n << (VSHARD_BITS + SEQ_BITS)) - 1n;
 
 /** Parses a decimal id. Throws on anything else, rather than letting it reach SQLite. */
