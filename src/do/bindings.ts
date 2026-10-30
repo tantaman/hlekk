@@ -2,6 +2,7 @@
 // serve. Hand-written for the same reason `DoStorage` is: nothing here needs a dependency on the
 // generated worker types, and writing out what is actually used says what the layer depends on.
 
+import { Directory } from "../directory/directory.ts";
 import type { DoStorage } from "../host/sql.ts";
 
 export interface Stub {
@@ -40,9 +41,25 @@ export interface Env {
   /** Lowers the placement controller's byte threshold, so a demo can reach a rebalance without
    *  writing gigabytes. */
   HLEKK_SHED_BYTES?: string;
+  /** The initial vshard count, and the size of each later batch. A database keeps the value it was
+   *  created with: the count is read once, when the directory first opens, and changing it afterwards
+   *  moves nothing. Left unset it is INITIAL_VSHARDS. */
+  HLEKK_VSHARDS?: string;
 }
 
 export const databaseOf = (env: Env): string => env.HLEKK_DATABASE ?? "demo";
+
+/** The initial vshard count this database was created with, or the default. A count the id layout
+ *  cannot hold is refused here rather than at the first assignment, where the reason would be a
+ *  constraint failure on a vshard number. */
+export function vshardsOf(env: Env): number | undefined {
+  if (env.HLEKK_VSHARDS === undefined) return undefined;
+  const n = Number(env.HLEKK_VSHARDS);
+  if (!Number.isInteger(n) || n < 1 || BigInt(n) > Directory.maxVshards) {
+    throw new RangeError(`HLEKK_VSHARDS must be an integer in 1..${Directory.maxVshards}, got ${env.HLEKK_VSHARDS}`);
+  }
+  return n;
+}
 
 /** The directory is one DO per database. */
 export const directoryStub = (env: Env): Stub =>

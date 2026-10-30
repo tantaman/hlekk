@@ -84,10 +84,15 @@ export async function runRounds(
     }
     if (++stats.rounds > MAX_ROUNDS) throw new Error("query did not converge");
 
+    // Grouped by push, not by rebuilding the array each time: a wide fan-out is thousands of tasks
+    // over tens of hosts, and spreading into a fresh array per task made one host's batch cost
+    // k^2/2 copies to assemble.
     const byHost = new Map<HostClient, Miss[]>();
     for (const t of tasks) {
       const h = route(missOwner(t));
-      byHost.set(h, [...(byHost.get(h) ?? []), t]);
+      const batch = byHost.get(h);
+      if (batch) batch.push(t);
+      else byHost.set(h, [t]);
     }
     stats.requests += byHost.size;
     const replies = await Promise.all([...byHost].map(([h, ts]) => h.exec(plan, ts)));
