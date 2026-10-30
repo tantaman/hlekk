@@ -14,14 +14,18 @@ import type { Directory } from "./directory.ts";
 import type { Mover } from "./move.ts";
 
 export interface Thresholds {
-  /** Bytes on one host before it sheds. Well under the 10 GB per-DO limit. */
+  /** Bytes on one host before it sheds, against the 10 GB per-DO limit. Measured on what the engine
+   *  reports it occupies, not on a sum of payloads: see `VshardStats`. */
   bytes?: number;
   /** Requests per window on one host before it sheds, against the 1,000/sec soft limit per DO. */
   requests?: number;
 }
 
 export const DEFAULT_THRESHOLDS: Required<Thresholds> = {
-  bytes: 5 * 1024 * 1024 * 1024,
+  // Close to the 10 GB per-DO limit, leaving room for the shed to run before a write meets
+  // SQLITE_FULL. It sits above a single vshard's cap on purpose: a host holding one vshard at the cap
+  // is not something a move can help, and `pickRun` declines it rather than renaming the host.
+  bytes: 8_000_000_000,
   requests: 500_000,
 };
 
@@ -30,6 +34,12 @@ export interface HostLoad {
   bytes: number;
   requests: number;
   vshards: bigint[];
+  /** Whether `bytes` is the host's own figure. False means it has not reported since it was created,
+   *  so `bytes` is the sum of its vshards' shares instead — a smaller unit, and smaller by a factor
+   *  that depends on the rows. A host in that state holds either nothing or only what this rebalance
+   *  just gave it, so reading it as near-empty is right; but the two are not comparable figures and
+   *  anything reporting them should say which it has. */
+  reported: boolean;
 }
 
 export interface Shed {
@@ -52,18 +62,24 @@ export class Placement {
     this.thresholds = { ...DEFAULT_THRESHOLDS, ...thresholds };
   }
 
-  /** What each host holds, from what the allocator last recorded. */
+  /** What each host holds, from what the allocator last recorded.
+   *
+   *  `bytes` is the host's own report of what its database occupies, which is the figure the 10 GB
+   *  per-DO limit is enforced on, falling back to the sum of its vshards' shares for a host that has
+   *  not reported yet. Summing the shares alone would undercount real storage by up to 4.7x and so
+   *  shed too late — after SQLITE_FULL, where writes fail and a delete is the only way back. */
   load(): HostLoad[] {
     return this.directory.hostIndexes().map((host) => {
       const vshards = this.directory.vshardsOn(host);
-      let bytes = 0;
+      let shares = 0;
       let requests = 0;
       for (const v of vshards) {
         const u = this.allocator.usage(v);
-        bytes += u.bytes;
+        shares += u.bytes;
         requests += u.requests;
       }
-      return { host, bytes, requests, vshards };
+      const reported = this.directory.hostBytes(host);
+      return { host, bytes: reported ?? shares, requests, vshards, reported: reported !== null };
     });
   }
 
@@ -79,18 +95,29 @@ export class Placement {
       const why = l.bytes > this.thresholds.bytes ? "bytes" : l.requests > this.thresholds.requests ? "requests" : null;
       if (!why) continue;
       const weight = (v: bigint) => (why === "bytes" ? this.allocator.usage(v).bytes : this.allocator.usage(v).requests);
+
+      // Two units meet here. A host's `bytes` is what its engine reports, and a vshard's weight is
+      // the share its rows account for, which is smaller by a factor that depends on those rows. So
+      // thresholds and destinations are decided in the host's unit, `pickRun` chooses in shares, and
+      // these convert between them by the ratio this host currently shows. For requests there is one
+      // unit and both are the identity.
+      const shares = l.vshards.reduce((n, v) => n + this.allocator.usage(v).bytes, 0);
+      const convertible = why === "bytes" && shares > 0 && l.bytes > 0;
+      const toShares = (n: number) => (convertible ? Math.ceil(n * (shares / l.bytes)) : n);
+      const toHost = (n: number) => (convertible ? Math.round(n * (l.bytes / shares)) : n);
+
       const over = (why === "bytes" ? l.bytes - this.thresholds.bytes : l.requests - this.thresholds.requests);
       // Shed enough to come back under, plus a margin, so it does not trip again immediately.
       const target = Math.ceil(over + (why === "bytes" ? this.thresholds.bytes : this.thresholds.requests) * 0.1);
-      const picked = pickRun(l.vshards, weight, target);
+      const picked = pickRun(l.vshards, weight, toShares(target));
       if (picked.length === 0 || picked.length === l.vshards.length) continue; // nothing to shed, or it is one vshard
 
-      const to = this.#destination(taking, picked.reduce((n, v) => n + weight(v), 0), why, () => nextHost++);
+      const moved = picked.reduce((n, v) => n + weight(v), 0);
+      const to = this.#destination(taking, toHost(moved), why, () => nextHost++);
       if (to === l.host) continue;
       out.push({ vshards: picked, from: l.host, to, why });
-      const moved = picked.reduce((n, v) => n + weight(v), 0);
       const here = taking.get(l.host)!;
-      if (why === "bytes") here.bytes -= moved;
+      if (why === "bytes") here.bytes -= toHost(moved);
       else here.requests -= moved;
     }
     return out;

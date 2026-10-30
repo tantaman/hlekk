@@ -15,8 +15,10 @@
   "kv_namespaces": [{ "binding": "HLEKK_MAP", "id": "hlekk-map-demo" }],
   "vars": {
     "HLEKK_DATABASE": "demo",
-    // Low enough that a few hundred bytes of demo data crosses it, so the placement controller can be
-    // watched shedding a run rather than having to be taken on faith.
-    "HLEKK_SHED_BYTES": "900"
+    // Above what a host's SQLite weighs empty (~40 KB with the schema in place) and below what the
+    // demo's writes take it to, so the controller can be watched shedding a run and it is the data
+    // that crossed the line. Measured on real DO SQLite, not guessed: a threshold under the empty
+    // size is tripped before a single row exists and demonstrates nothing.
+    "HLEKK_SHED_BYTES": "45000"
   }
 }

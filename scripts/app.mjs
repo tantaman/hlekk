@@ -9,6 +9,10 @@ import { spawn } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
+// What a host DO's SQLite weighs with the schema in place and nothing stored. The shed threshold has
+// to sit above this, or it is crossed before any data exists. Measured on workerd, not assumed.
+const EMPTY_DB_BYTES = 40960;
+
 const PORT = Number(process.env.APP_PORT ?? 8788);
 const base = `http://127.0.0.1:${PORT}`;
 
@@ -176,12 +180,24 @@ try {
   check("and the id did not change, only where it lives", relocated.ids[0].id === subject && relocated.ids[0].host === to);
 
   // ---- the placement controller
-  const sheds = (await hit("/admin/rebalance", {})).sheds;
+  const rebalanced = await hit("/admin/rebalance", {});
+  const sheds = rebalanced.sheds;
   const spread = (await hit("/admin/where")).hosts.filter((h) => h.objects > 0);
   check(
     "the placement controller sheds a run when a host is over threshold",
     sheds.length > 0,
     sheds.map((s) => `h${s.from}->h${s.to} x${s.vshards.length} (${s.why})`).join(" ") || "nothing over threshold",
+  );
+  // The threshold is measured on what the engine reports, which starts in the tens of kilobytes
+  // before a single row is written. So a shed only means something if the hosts that crossed it were
+  // over that floor: a threshold below it is tripped before any data exists. Only hosts that have
+  // reported are comparable — the ones this rebalance just created are still counted in shares.
+  const loaded = rebalanced.loads.filter((l) => l.reported);
+  check(
+    "and the hosts that crossed it were over the empty-database floor",
+    loaded.length > 0 && loaded.every((l) => l.bytes > EMPTY_DB_BYTES),
+    loaded.map((l) => `h${l.host}:${(l.bytes / 1024).toFixed(0)}KB/${l.vshards}v`).join(" ") +
+      ` | unreported: ${rebalanced.loads.filter((l) => !l.reported).length}`,
   );
   const last = await hit(`/issues/${subject}`);
   check("and the answer survives that too", JSON.stringify(last.issue) === JSON.stringify(got));

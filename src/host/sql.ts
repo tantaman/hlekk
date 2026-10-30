@@ -13,12 +13,21 @@ export interface Sql {
   run(query: string, ...params: Param[]): void;
   /** One local transaction. A throw rolls it back and writes nothing. Nesting joins the outer one. */
   txn<T>(f: () => T): T;
+  /** What this database really occupies, in bytes, as the engine reports it: payload plus the keys,
+   *  indexes, page overhead and freelist that a per-row estimate cannot see. The placement controller
+   *  measures against a 10 GB per-DO limit, so it needs the figure the limit is enforced on and not a
+   *  sum of payload lengths, which undercounts by 1.05x to 4.7x depending on row size. */
+  size(): number;
   close(): void;
 }
 
 /** The shape a Durable Object's storage presents. */
 export interface DoStorage {
-  sql: { exec(query: string, ...params: unknown[]): { toArray(): unknown[] } };
+  sql: {
+    exec(query: string, ...params: unknown[]): { toArray(): unknown[] };
+    /** A property, not a method, on the real SqlStorage. */
+    readonly databaseSize: number;
+  };
   transactionSync<T>(f: () => T): T;
 }
 
@@ -40,6 +49,7 @@ export function doSql(storage: DoStorage): Sql {
       storage.sql.exec(query, ...params).toArray();
     },
     txn: (f) => storage.transactionSync(f),
+    size: () => storage.sql.databaseSize,
     close: () => {},
   };
 }

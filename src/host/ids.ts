@@ -24,10 +24,12 @@ import type { Id } from "../query/types.ts";
 //
 // 3. A logical database is what one customer spins up, and the service scales by adding databases
 //    rather than by growing one. So the vshard field bounds a single customer's database, not the
-//    product: 2^16 vshards is ~65 TB at the current ~1 GB cap — the line managed Postgres draws,
-//    RDS at 64 TiB and Aurora at 128 TiB — and ~6.5 PB once a vshard's size stops being bounded by
-//    what a stop-the-world move can copy. A customer past that shards above hlekk, as they would
-//    past a Postgres instance.
+//    product: 2^16 vshards is ~590 TB at the 9 GB cap, past the line managed Postgres draws — RDS
+//    at 64 TiB and Aurora at 128 TiB — and ~6.5 PB once a vshard's size stops being bounded by what
+//    a stop-the-world move can copy. A customer past that shards above hlekk, as they would past a
+//    Postgres instance. The field was narrowed while the cap was ~1 GB and the ceiling ~65 TB;
+//    raising the cap multiplied the ceiling by nine without touching an id, which is the one thing
+//    anchoring the field at SEQ_BITS makes free.
 //
 // The reserved bit is the SIGN bit and it is load-bearing, not option value. Keeping it clear puts
 // every id below 2^63, the threshold where SQLite coerces an integer to REAL and two distinct ids

@@ -112,6 +112,7 @@ export class HlekkHostDO {
         // ---- what the placement controller, the global index and an operator ask for
 
         stats: () => host.stats(),
+        size: () => host.size(),
 
         /** What this host holds. Separate from `stats`, which resets the request counters: a view
          *  that read those would be taking the controller's window. */

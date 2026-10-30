@@ -66,6 +66,12 @@ export class HlekkHost {
       const expected = [...samples].sort((a, b) => (BigInt(b) < BigInt(a) ? -1 : 1));
       check("big-endian keys sort in unsigned numeric order", JSON.stringify(order) === JSON.stringify(expected), order.join(","));
 
+      // ---- the engine reports its own size, which is the figure the 10 GB per-DO limit is enforced
+      // on and so what the placement controller sheds against. A per-row estimate cannot stand in:
+      // it sees neither the indexes nor the page overhead.
+      const size = doSql(this.#raw).size();
+      check("databaseSize reports real bytes", Number.isFinite(size) && size > 0, `${size} bytes`);
+
       // ---- the write path, over real DO SQLite
       this.#host.adopt("5");
       const created = this.#host.create({ otype: ISSUE, data: { title: "Crash on save" }, vshard: "5", epoch: 0 });

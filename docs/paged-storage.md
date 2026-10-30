@@ -6,6 +6,16 @@ A detailed exploration behind one bullet of [`design.md`](design.md)'s *Later* s
 here is committed. It exists because the bullet described the destination as greenfield and it is
 not: most of it is built, in Rust, and ran in production on a 100 GB base.
 
+**Written against a ~1 GB vshard cap, which has since been retired.** The cap is now 9 GB, set by
+the 10 GB per-DO storage limit rather than by move time: the long stop-the-world pause a large
+vshard implies is accepted, and the base of the database in R2 — this document — is the route out of
+it rather than a precondition for the cap. That does not weaken the case here, it narrows it. The
+argument that lifting the byte cap is what paged storage buys is spent, because the byte cap was
+lifted without it. What remains, and is unchanged, is everything downstream of the pause: moves by
+lease handoff instead of copy, read placement from shared immutable pages, and a host whose capacity
+is set by branch-page residency rather than live bytes. Figures below quoting "the current cap" mean
+~1 GB and are left as they were written.
+
 Numbers quoted as measured come from the `rindle` repository — either its own harnesses or its
 deployed `r2db` demo — and are cited to the ledger that holds them. They are evidence about the
 storage engine, not about hlekk.
@@ -177,11 +187,15 @@ roughly 3× the GETs that fetched the page.
 
 ## What the vshard cap actually bounds
 
-The cap is ~1 GB and `design.md` is explicit that *"the cap is the largest unit that can be
-relocated in a tolerable pause, not the largest unit that fits."* So it is set by move time and by
-nothing else, and the open question says the value is a guess "until step 1's throughput
-measurement". It is a placeholder for a measurement rather than a result, which is worth saying
-plainly before reasoning from it.
+*This section has been overtaken: the cap is now 9 GB and set by storage, and `design.md`'s claim
+that it "is the largest unit that can be relocated in a tolerable pause, not the largest unit that
+fits" has been reversed there. The reasoning is kept because what it concludes — what bounds a
+vshard once bytes do not — still applies, and applies sooner now that bytes have stopped bounding it
+for a different reason. Read "~1 GB, set by move time" below as the state when it was written.*
+
+The cap was ~1 GB and set by move time and nothing else, with the open question calling the value a
+guess "until step 1's throughput measurement" — a placeholder for a measurement rather than a
+result, which is worth saying plainly before reasoning from it.
 
 Under lease handoff the pause scales with dirty bytes, so that reason goes away. Three bounds take
 its place, and only the first is about the vshard:
@@ -256,8 +270,9 @@ the parts that belong here:
 
 - **The old 16 PB ceiling was a product of the cap**, not of the field. 2^24 × 1 GB is 16 PB. What
   sets the width instead is that a logical database is what one customer spins up and the service
-  scales by adding databases, so the field bounds one customer: ~65 TB at the current cap, which is
-  where managed Postgres draws its line, and ~6.5 PB once a vshard is not bounded by a copy.
+  scales by adding databases, so the field bounds one customer: ~65 TB at the ~1 GB cap this was
+  written against, ~590 TB at the 9 GB cap that replaced it, and ~6.5 PB once a vshard is not
+  bounded by a copy. Managed Postgres draws its line at the first of those.
 - **The rest went to the sequence, which is the half paged storage drives.** The byte cap is what
   used to retire a vshard early; removing it means vshards live longer and spend more ids. And
   `SEQ_BITS` can never be changed afterwards — widening it moves the vshard field and re-decodes
