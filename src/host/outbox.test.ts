@@ -14,7 +14,7 @@ const LOCK = plan({
     objects: { "tasks.task": { fields: { title: "string" } } },
     edges: {
       "tasks.assignee": { from: "tasks.task", to: "core.user", inverse: "tasks.assigned", unique: true },
-      "tasks.assigned": { from: "core.user", to: "tasks.task", inverse: "tasks.assignee" },
+      "tasks.assigned": { from: "core.user", to: "tasks.task", inverse: "tasks.assignee", maintained: true },
     },
   },
 });
@@ -107,48 +107,54 @@ describe("delivering an inverse to another host", () => {
     assert.equal(await assignedTo(c, 1, alice), 0);
   });
 
-  // Found by the simulation, which writes lazily and so lets two sources interleave. The design says
-  // "each inverse edge has exactly one writer, the vshard of its forward edge, so per-source ordering
-  // is enough". That holds while a caller writes one side of a pair. Write both between the same two
-  // objects and there are two writers for the same two rows, with no ordering between them — so what
-  // survives is decided by whichever source is delivered last. Recorded as an open question; the
-  // generators keep to one side per pair of objects so the rest of the suite is not asking it.
-  it("is left holding half a pair when both its sides are written, which the design records as open", async () => {
+  // Found by the simulation, which writes lazily and so let two sources interleave. Both halves of a
+  // pair used to be writable, and writing both between the same two objects put two vshards in charge
+  // of the same two rows — the outbox orders each source against itself and not against the other, so
+  // a remove through one side and an add through the other landed in whichever order delivery took,
+  // and two adds with different times overwrote each other's sort key. Idempotence does not reach
+  // either: being safe to retry is not being safe to reorder, and an insert-if-absent would still
+  // leave the times disagreeing while breaking the re-timing of an edge.
+  //
+  // So the catalog names one side of every pair as the derived one and the host refuses direct writes
+  // to it. One writer per row, which is the condition the outbox's per-source ordering always assumed.
+  it("refuses a direct write to the derived half, naming the side to write", async () => {
     const { c, db, alice } = await split();
     const task = await db.create(TASK, { title: "t" }, { vshard: "5" });
 
-    await db.assocAdd(ASSIGNEE, task, alice, 1);
-    await db.assocRemove(ASSIGNEE, task, alice); // task's vshard: add, then withdraw
-    await db.assocAdd(ASSIGNED, alice, task, 1); // Alice's vshard, maintaining the other half
-    await c.deliverAll();
-    assert.equal(c.queued(), 0, "everything was delivered");
-
-    assert.equal(await assignedTo(c, 1, alice), 0, "the withdrawal through the task's vshard landed");
-    assert.equal(
-      await c.host(0).store().count(task, ASSIGNEE),
-      1,
-      "and the add through Alice's put the other half back, which nothing asked for",
+    await assert.rejects(
+      () => db.assocAdd(ASSIGNED, alice, task, 1),
+      /tasks\.assigned is maintained by tasks\.assignee; write tasks\.assignee instead/,
     );
+    await assert.rejects(() => db.assocRemove(ASSIGNED, alice, task), /maintained by tasks\.assignee/);
+    assert.equal(c.queued(), 0, "and nothing was written or queued on the way to being refused");
+
+    // The maintaining side writes both halves, which is the only way they can stay in step.
+    await db.assocAdd(ASSIGNEE, task, alice, 1);
+    await c.deliverAll();
+    assert.equal(await assignedTo(c, 1, alice), 1);
   });
 
-  // And idempotence does not save it. Applying one op twice really is a no-op, as the test above
-  // says. But an add is an upsert that takes the op's own time and data, so two different adds for
-  // the same row each overwrite the other: write both sides and the inverses cross, leaving a pair
-  // that exists on both sides and sorts differently on each. Time is the sort key an edge list and
-  // its cursors are ordered by, so this is not cosmetic.
-  it("crosses the times when both sides of a pair are written, which no insert-if-absent would fix", async () => {
+  // The refusal is about the request, not about this host, so it does not wait on a route: a write
+  // that can never succeed should not cost a re-route first.
+  it("refuses it without consulting ownership, so a stale route costs nothing", async () => {
+    const { c, alice } = await split();
+    const r = c.host(0).assocRemove({ atype: ASSIGNED, id1: alice, id2: "1", epoch: 99 });
+    assert.ok(!r.ok && "maintained" in r, `expected a maintained refusal, got ${JSON.stringify(r)}`);
+  });
+
+  // The derived side's rows still arrive, because delivery does not go through the refusal: an
+  // inverse add and a cascade's withdrawal are `apply`, not `assocAdd`.
+  it("still lets the inverse and a withdrawal through, since delivery is not a direct write", async () => {
     const { c, db, alice } = await split();
     const task = await db.create(TASK, { title: "t" }, { vshard: "5" });
-    await db.assocAdd(ASSIGNEE, task, alice, 1); // the task's side says 1
-    await db.assocAdd(ASSIGNED, alice, task, 9); // Alice's side says 9
+    await db.assocAdd(ASSIGNEE, task, alice, 1);
     await c.deliverAll();
+    assert.equal(await assignedTo(c, 1, alice), 1, "the inverse landed");
 
-    const timeOf = async (host: number, id1: string, atype: number) => {
-      const page = await c.host(host).store().edges(id1, atype, null, 10);
-      return (page as { rows: { time: number }[] }).rows.map((e) => e.time);
-    };
-    assert.deepEqual(await timeOf(0, task, ASSIGNEE), [9], "the task's own write was overwritten by Alice's inverse");
-    assert.deepEqual(await timeOf(1, alice, ASSIGNED), [1], "and Alice's by the task's");
+    await db.assocRemove(ASSIGNEE, task, alice);
+    await c.deliverAll();
+    assert.equal(await assignedTo(c, 1, alice), 0, "and the withdrawal did too");
+    assert.equal(c.queued(), 0);
   });
 
   it("stops a pair at its first failure, so nothing overtakes it, and other pairs carry on", async () => {
@@ -218,7 +224,7 @@ describe("delivery across a move", () => {
             inverse: "issues.comment_issue",
             onDelete: "cascade",
           },
-          "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment" },
+          "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment", maintained: true },
         },
       },
     });

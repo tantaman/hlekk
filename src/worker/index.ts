@@ -23,7 +23,7 @@ const LOCK = plan({
         inverse: "issues.comment_issue",
         onDelete: "cascade",
       },
-      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment" },
+      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment", maintained: true },
     },
   },
 });

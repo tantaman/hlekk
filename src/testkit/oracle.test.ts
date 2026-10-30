@@ -218,13 +218,14 @@ describe("the differential oracle over generated schemas", () => {
   });
 
   it("produces schemas with every edge kind the catalog allows", () => {
-    const seen = { inverse: 0, cascade: 0, detach: 0, unique: 0, field: 0, namespaces: 0, self: 0 };
+    const seen = { inverse: 0, maintained: 0, cascade: 0, detach: 0, unique: 0, field: 0, namespaces: 0, self: 0 };
     for (let seed = 1; seed <= 80; seed++) {
       const { lock } = generateSchema(seeded(seed));
       const spaces = new Set(Object.keys(lock.objects).map((n) => n.split(".")[0]));
       if (spaces.size > 1) seen.namespaces++;
       for (const e of Object.values(lock.edges)) {
         if (e.inverse !== undefined) seen.inverse++;
+        if (e.maintained) seen.maintained++;
         if (e.onDelete === "cascade") seen.cascade++;
         if ((e.onDelete ?? "detach") === "detach") seen.detach++;
         if (e.unique) seen.unique++;

@@ -24,7 +24,7 @@ import { assertSound } from "./invariants.ts";
 import { unreliable } from "./unreliable.ts";
 import type { Faults } from "./unreliable.ts";
 import type { Shape } from "./shape.ts";
-import { Sides, storedOut } from "./shape.ts";
+import { writableOut } from "./shape.ts";
 
 /** The things the schedule can decide to do next, and how often it decides to. A write-heavy mix, so
  *  there is something for the rest of them to be wrong about. */
@@ -130,7 +130,6 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
 
   const live: { id: Id; type: string }[] = [];
   const written: { atype: number; id1: Id; id2: Id }[] = [];
-  const sides = new Sides();
   const taken: string[] = [];
   const report: SimReport = {
     events: {},
@@ -165,9 +164,11 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
   /** An object to work on. Biased towards the ones just made, because a workload spread uniformly
    *  over everything it has ever created never touches one object twice, and a race needs two
    *  writers: no conflict, no contended edge, no delete of something with edges on it. */
-  const pickLive = () => {
-    if (live.length === 0) return undefined;
-    return r.chance(0.6) ? r.pick(live.slice(-8)) : r.pick(live);
+  const pickLive = (fit: (o: { id: Id; type: string }) => boolean = () => true) => {
+    const recent = live.slice(-8).filter(fit);
+    if (recent.length > 0 && r.chance(0.6)) return r.pick(recent);
+    const all = live.filter(fit);
+    return all.length === 0 ? undefined : r.pick(all);
   };
   const liveOf = (type: string) => live.filter((o) => o.type === type);
   const body = (type: string): { data: Fields; refs: Record<string, number> } =>
@@ -237,16 +238,14 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
   };
 
   const assoc = async (): Promise<void> => {
-    const from = pickLive();
+    // From a type that has an edge to write: every pair is written from one side, so the other side's
+    // type may originate nothing, and picking uniformly would spend most steps on those.
+    const from = pickLive((o) => writableOut(shape, o.type).length > 0);
     if (!from) return;
-    const out = storedOut(shape, from.type);
-    if (out.length === 0) return;
-    const rel = r.pick(out);
+    const rel = r.pick(writableOut(shape, from.type));
     const targets = liveOf(rel.to);
     if (targets.length === 0) return;
     const to = r.pick(targets);
-    if (!sides.allows(rel, from.id, to.id)) return;
-    sides.claim(rel, from.id, to.id);
     await db.assocAdd(rel.atype!, from.id, to.id, r.int(8), r.chance(0.3) ? { tag: r.pick(["x", "y"]) } : null);
     written.push({ atype: rel.atype!, id1: from.id, id2: to.id });
   };

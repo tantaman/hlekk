@@ -15,7 +15,7 @@ import type { Random } from "../runtime/runtime.ts";
 import type { Query } from "../schema/query.ts";
 import type { EdgeType, FieldMap } from "../schema/define.ts";
 import type { Shape } from "./shape.ts";
-import { Sides, storedOut } from "./shape.ts";
+import { writableOut } from "./shape.ts";
 
 /** A payload, and which of the script's objects its id fields point at. */
 interface Written {
@@ -89,19 +89,17 @@ export function generateGraph(r: Random, shape: Shape, opts: GraphOptions = {}):
   /** Edges the script has written, so a remove mostly lands on one rather than on nothing. */
   const written: { atype: number; from: number; to: number }[] = [];
   const positionsOf = (type: string) => byType.get(type) ?? [];
-  // Positions, not ids, since the ids do not exist yet; the rule is the same either way.
-  const sides = new Sides();
-
-  for (let i = 0; i < edges; i++) {
-    const from = r.int(made.length);
-    const out = storedOut(shape, made[from]);
-    if (out.length === 0) continue;
+  // Only from a type that has an edge to write. Picking uniformly spends most attempts on types that
+  // originate nothing — every pair is written from one side, so the other side's type may have no
+  // writable edge at all — and the graph comes out thin.
+  const origins = made.map((_, j) => j).filter((j) => writableOut(shape, made[j]).length > 0);
+  for (let i = 0; i < edges && origins.length > 0; i++) {
+    const from = r.pick(origins);
+    const out = writableOut(shape, made[from]);
     const rel = r.pick(out);
     const candidates = positionsOf(rel.to);
     if (candidates.length === 0) continue;
     const to = r.pick(candidates);
-    if (!sides.allows(rel, String(from), String(to))) continue;
-    sides.claim(rel, String(from), String(to));
     ops.push({
       kind: "assoc",
       atype: rel.atype!,

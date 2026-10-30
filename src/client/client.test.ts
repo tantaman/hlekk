@@ -21,7 +21,7 @@ const LOCK = plan({
         inverse: "issues.comment_issue",
         onDelete: "cascade",
       },
-      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment" },
+      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment", maintained: true },
     },
   },
 });
@@ -272,10 +272,10 @@ describe("the catalog reaches the hosts", () => {
               inverse: "issues.comment_issue",
               onDelete: "cascade",
             },
-            "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment" },
+            "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment", maintained: true },
             // New in v2, and paired, so writing one half is meant to maintain the other.
             "issues.issue_owner": { from: "issues.issue", to: "core.user", inverse: "issues.user_owned", unique: true },
-            "issues.user_owned": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner" },
+            "issues.user_owned": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner", maintained: true },
           },
         },
       },

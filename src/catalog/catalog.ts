@@ -24,6 +24,15 @@ export interface EdgeDecl {
   to: string;
   /** The paired type whose edges this one's writes maintain. Must name this edge's mirror. */
   inverse?: string;
+  /** True on the half of a pair that is derived: its rows are written only by its inverse's writes,
+   *  and a direct write to it is refused.
+   *
+   *  One side of every pair has to say this. A row written from both sides has two writers on two
+   *  vshards, and the outbox orders each source against itself and not against the other — so a
+   *  remove through one side and an add through the other land in whichever order delivery takes, and
+   *  two adds with different times overwrite each other's sort key. Being safe to retry is not being
+   *  safe to reorder, so idempotence does not reach it. One writer per row does. */
+  maintained?: boolean;
   onDelete?: OnDelete;
   /** A field relationship: follows an id in the source payload. Nothing is stored, so it has no atype. */
   field?: string;
@@ -83,6 +92,8 @@ export interface EdgeType {
   from: string;
   to: string;
   inverse?: string;
+  /** The derived half of a pair: read and counted like any other, but written only by its inverse. */
+  maintained: boolean;
   onDelete: OnDelete;
   field?: string;
   unique: boolean;
@@ -153,6 +164,7 @@ export class Catalog {
         from: e.from,
         to: e.to,
         inverse: e.inverse,
+        maintained: e.maintained ?? false,
         onDelete: e.onDelete ?? DEFAULT_ON_DELETE,
         field: e.field,
         unique: e.unique ?? false,
@@ -178,6 +190,28 @@ export class Catalog {
       }
       if (back.field !== undefined || e.field !== undefined) {
         throw new CatalogError(`${e.name} and ${e.inverse}: a field relationship has no inverse`);
+      }
+      // One writer per row, named here rather than left to whoever calls first. Without it both
+      // vshards maintain the same two rows and nothing orders them against each other.
+      if (e.inverse === e.name) {
+        throw new CatalogError(
+          `${e.name} names itself as its inverse, so neither side can maintain the other.` +
+            " Declare two edge types that name each other, and mark one maintained.",
+        );
+      }
+      if (e.maintained === back.maintained) {
+        throw new CatalogError(
+          e.maintained
+            ? `${e.name} and ${e.inverse} are both maintained, so neither can be written`
+            : `${e.name} and ${e.inverse} are a pair and neither is maintained:` +
+              " mark the derived one, whose rows the other's writes should write",
+        );
+      }
+    }
+
+    for (const e of this.#edgesByName.values()) {
+      if (e.maintained && e.inverse === undefined) {
+        throw new CatalogError(`${e.name} is maintained but names no inverse to be maintained by`);
       }
     }
 
@@ -211,6 +245,12 @@ export class Catalog {
 
   edgeNamed(name: string): EdgeType | undefined {
     return this.#edgesByName.get(name);
+  }
+
+  /** The edge type whose writes maintain this one, if its rows are not its own to write. */
+  maintainedBy(atype: number): EdgeType | undefined {
+    const e = this.#edgesByType.get(atype);
+    return e?.maintained ? this.#edgesByName.get(e.inverse!) : undefined;
   }
 
   /** The atype of the edge paired with this one, if it has an inverse. */

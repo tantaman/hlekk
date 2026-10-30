@@ -5,8 +5,7 @@
 // seed can make its own and the generators do not care which one they were handed.
 
 import type { Lock } from "../catalog/catalog.ts";
-import { cmpId } from "../query/types.ts";
-import type { Fields, Id, Json } from "../query/types.ts";
+import type { Fields, Json } from "../query/types.ts";
 import type { Random } from "../runtime/runtime.ts";
 import type { FieldMap, ObjectType } from "../schema/define.ts";
 
@@ -23,6 +22,8 @@ export interface Outgoing {
   atype?: number;
   /** The atype of the edge type paired with this one, where it has one. */
   inverse?: number;
+  /** True on the derived half of a pair, whose rows are written only by its inverse. */
+  maintained?: boolean;
 }
 
 /** A field a filter can compare, with values that actually occur in payloads, so a generated filter
@@ -57,34 +58,11 @@ export interface Shape {
 export const storedOut = (shape: Shape, type: string): Outgoing[] =>
   shape.outgoing[type].filter((o) => o.atype !== undefined);
 
-/** Which side of a paired edge type is already maintaining a pair of objects.
+/** The stored edges a workload writes: one side of each pair, which the catalog now decides. The
+ *  other half is refused, so a workload that wrote it would be testing the refusal and nothing else.
  *
- *  Both halves of a pair are writable through the API, and writing both between the same two objects
- *  puts two vshards in charge of the same two rows: `assocAdd(A, x, y)` maintains the B half from x's
- *  vshard and `assocAdd(B, y, x)` maintains the A half from y's, and the outbox orders each source
- *  against itself and not against the other. A remove through one side and an add through the other
- *  then land in whichever order delivery takes, and the pair is left holding one half. That is a
- *  question about the design, recorded as one.
- *
- *  A workload not asking it keeps to whichever side wrote first. Which costs nothing: every edge type
- *  is still written, from both ends, just never between one pair of objects from both at once. */
-export class Sides {
-  readonly #claimed = new Map<string, Id>();
-
-  /** The pair of rows a write would maintain, named the same way from either end. */
-  #key(rel: Outgoing, id1: Id, id2: Id): string {
-    const pair = Math.min(rel.atype!, rel.inverse!);
-    const [lo, hi] = cmpId(id1, id2) <= 0 ? [id1, id2] : [id2, id1];
-    return `${pair}:${lo}:${hi}`;
-  }
-
-  allows(rel: Outgoing, id1: Id, id2: Id): boolean {
-    if (rel.inverse === undefined) return true;
-    const held = this.#claimed.get(this.#key(rel, id1, id2));
-    return held === undefined || held === id1;
-  }
-
-  claim(rel: Outgoing, id1: Id, id2: Id): void {
-    if (rel.inverse !== undefined) this.#claimed.set(this.#key(rel, id1, id2), id1);
-  }
-}
+ *  This used to be a rule the generators kept to themselves, because both halves were writable and
+ *  writing both put two vshards in charge of the same two rows with nothing ordering them. One
+ *  maintained side per pair is that rule moved into the catalog, where it holds for applications too. */
+export const writableOut = (shape: Shape, type: string): Outgoing[] =>
+  storedOut(shape, type).filter((o) => !o.maintained);
