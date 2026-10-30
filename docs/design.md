@@ -831,13 +831,17 @@ A placement controller in the directory DO watches each host's storage bytes and
 
 ## Indexing
 
-There are no per-type object tables. Field indexes come in three kinds, and only one of them lives on a host's object table.
+**The object table is generic** — one row per object with a JSON payload — rather than one table per object type. That choice is the migration model: objects are stored as JSON, so the catalog is a lens over stored data rather than its layout, and seven of the eleven rows in What a change costs touch no data at all. Per-type tables would turn most of those into coordinated DDL on every host, and would couple the move protocol to the catalog, since a vshard would no longer be one key range across three fixed tables. What they would buy is typed columns: engine-enforced constraints, no JSON key repeated per row, and indexes that need no expression match. A generic table is also what lets an ID route on its own: the ID names a vshard but not a type, so a point read against per-type tables would need the type supplied or looked up first. Traversals would be fine, since an edge type declares its target types in the catalog, but `db.get` takes bare IDs. The price of doing without them is measured below.
+
+Field indexes come in three kinds, and only one of them lives on a host's object table.
 
 | Need | Example | Mechanism |
 | --- | --- | --- |
 | Filter or order a `related` list | Issue's comments, newest first | Index on edge fields: `time` today, more sort fields later |
 | Global lookup by a field | User by email, issue by slug | Global index sharded by `hash(value)`, written through the outbox |
 | Host-local filter on an object field | Rare in this API | SQLite expression index on `objects` |
+
+The third row's "rare" is load-bearing rather than descriptive. An index on the shared object table is paid for by every writer in the database, not by the type that declared it; see The cost of indexes on a shared table.
 
 ### Edge fields only on `related`
 
@@ -865,9 +869,48 @@ CREATE INDEX obj_issue_status
   WHERE otype = 7;
 ```
 
-- A query uses it only if it repeats the same expression and `otype = 7` as a literal. Generated SQL inlines `otype`.
+- **A query must repeat the index's expression**, but the match is on the parsed expression, not on its text. Measured on SQLite 3.45.1: extra whitespace and reordered `AND` clauses still plan as `SEARCH objects USING INDEX`, while `data->>'status'` — semantically identical — degrades to a full index scan. The risk is therefore not formatting but two call sites rendering the same field two ways, which is why the JSON path wants one renderer shared by `CREATE INDEX` and the predicate compiler (see Prior art: ent).
+- **`otype` as a bound parameter also used the index** in that test, so inlining it in generated SQL may be unnecessary. Partial-index planning can depend on values known at prepare time, so confirm this in the DO's own SQLite before relying on either form.
+- **A declared virtual generated column is the more robust form.** `ALTER TABLE objects ADD COLUMN status TEXT GENERATED ALWAYS AS (json_extract(data,'$.status')) VIRTUAL`, indexed with `WHERE otype = 7`, plans as a `SEARCH` for every query form tried, including both `otype` and the value as parameters, because queries name a column instead of repeating an expression. Only `VIRTUAL` can be added to a populated table — SQLite rejects `STORED` with "cannot add a STORED column" — which is the form wanted anyway, since nothing is duplicated but the index entry. It shares the write cost below, and each such column counts against the table's column limit.
 - Index definitions live in the schema catalog. A host applies `CREATE INDEX IF NOT EXISTS` when it wakes and sees a new catalog version.
 - Building an index on a multi-GB host blocks the single-threaded DO until it finishes.
+
+### The cost of indexes on a shared table
+
+Measured on SQLite 3.45.1, microseconds per insert against the number of indexes present on the table:
+
+| Indexes on the table | Generated columns, unindexed | Partial expression indexes | One table per type |
+| --- | --- | --- | --- |
+| 0 | 1.1 | 1.1 | 2.5 |
+| 64 | 16.8 | 15.7 | 2.0 |
+| 256 | 58.0 | 128.3 | 2.0 |
+| 1024 | 232 | 3257 | 2.0 |
+
+**The cost is superlinear and lands on writes.** At 1024 partial indexes an insert costs about 3.3 ms, which on one single-threaded DO is roughly 300 writes a second — under the per-DO request limit the design already treats as a ceiling.
+
+**It does not depend on the row's type.** At 256 indexes, a row whose `otype` matched no index at all cost 228 µs where a row matching four cost 225 µs. SQLite evaluates every partial index's `WHERE` for every row written to the table; there is no dispatch on `otype`. So an index one domain declares for one type is paid for by every writer in the database, including types that have no indexes. Teams add types independently, so nothing makes the team that adds an index the team that pays for it.
+
+**There is a hard ceiling.** Each indexed field needs its own generated column, and `SQLITE_MAX_COLUMN` is 2000, with `ALTER TABLE` topping out near 1995. Cold open costs more as well, since the schema is parsed on every DO wake: 9.1 ms at 1024 indexes, against 2.1 ms for the same index count spread over per-type tables.
+
+**The fix is to take the dispatch out of SQLite**, rather than to accept per-type tables and their migration cost — and the mechanism for it is already built. `index_entries` carries global index entries in rows rather than in SQLite indexes:
+
+```sql
+CREATE TABLE index_entries (
+  vshard INTEGER NOT NULL,      -- the index vshard this entry lives in
+  idx    INTEGER NOT NULL,      -- which index
+  key    TEXT    NOT NULL,      -- the normalized value
+  id     BLOB,
+  state  TEXT    NOT NULL,
+  at     INTEGER NOT NULL,
+  PRIMARY KEY (vshard, idx, key)
+) WITHOUT ROWID;
+```
+
+A host-local index wants the same table with entries homed in the object's own vshard instead of in an index vshard keyed by `hash(value)`. Three properties follow from the shape rather than from any new work. The write path already knows the otype, so it writes only the entries belonging to that type, in the object's own transaction: write cost is proportional to the indexes on the type being written, not to the size of the catalog, and one table with one b-tree replaces a growing set of partial indexes. The key leads with `vshard`, so one vshard's entries stay a contiguous range and a move copies them exactly as it copies `objects` — no extra index, no rebuild on the target, no coupling to the catalog. And `idx` is a catalog integer, so adding an index adds no DDL at all, which keeps it in the Catalog-only column rather than the Catalog + build one.
+
+What it costs is one extra b-tree hop per indexed read, index maintenance in host code instead of in the engine, and — because the key leads with `vshard` rather than with the value — one lookup per vshard when a query spans the host's vshards rather than one over the host. That is the trade a value-leading key would invert, and it is the reason the global case homes entries by `hash(value)`: there, one vshard holds every entry for a value. Unmeasured for the local case; the table above is the reason to measure it.
+
+**Caveats on the numbers.** A desktop SQLite build, in memory, inserts only. The DO's build options and storage layer differ, and updates cost more than inserts in every layout. What should carry is the shape — flat in catalog size for per-type and side tables, superlinear for indexes on one shared table — not the absolute figures. The per-type column also does no JSON extraction, so it is not like-for-like on total work.
 
 ## Prior art: ent
 
@@ -891,7 +934,7 @@ CREATE INDEX obj_issue_status
 **Left behind**
 
 - **Per-parent limits by window function.** `sqlgraph.LimitNeighbors` wraps an eager-load query in a CTE with `row_number() OVER (PARTITION BY fk)` and keeps the rows under the limit (`dialect/sql/sqlgraph/graph.go`). That is the right trade for ent, where one round trip to a remote SQL server beats many. It is the wrong one here, measurably: on the `assocs` schema above the windowed form plans as a full scan of every partition plus a temp b-tree, because it cannot stop at the limit, while the per-parent form `WHERE id1 = ? AND atype = ? ORDER BY time DESC, id2 DESC LIMIT ?` plans as a covering index search that terminates early. A host's SQLite is in-process, so statements are nearly free and the loop over parents is correct. Where one statement is wanted anyway, `UNION ALL` over per-parent limited subqueries keeps both the index and the early exit. The same check settled a smaller question: because `assocs` is `WITHOUT ROWID`, `assocs_range (id1, atype, time)` carries `id2` implicitly, so ordering by `(time, id2)` needs no fourth index column.
-- **SQL as the only place a predicate runs.** ent evaluates every predicate in the database, so it never has to ask whether two evaluators agree. Here they must: a filter on a target's field runs on the host when the target is local and at the coordinator otherwise, so the same predicate compiles to SQLite *and* runs in JavaScript and has to give the same answer. By default it doesn't. On SQLite 3.45 `json_extract(data,'$.n') > 5` is **true** when `n` is the string `"abc"`, because SQLite orders all text above all numbers, while `'abc' > 5` is false in JavaScript. JSON `true` extracts as integer `1` with `typeof` `'integer'`, so a host cannot tell `true` from `1` after extraction and a coordinator comparing with `===` can. A missing key and a JSON `null` both extract to SQL `NULL`, separable only through `json_type`. Rindle's rule that a predicate is total and never fails on a type mismatch falls out of neither evaluator: it has to be specified once, implemented twice, and held there by a differential test that runs every operator against both over random JSON. The one consolation is that `=` is type-strict in SQLite — `json_extract('{"n":"5"}','$.n') = 5` is false — which agrees with `===`.
+- **SQL as the only place a predicate runs.** ent evaluates every predicate in the database, so it never has to ask whether two evaluators agree. Here they must: a filter on a target's field runs on the host when the target is local and at the coordinator otherwise, so the same predicate compiles to SQLite *and* runs in JavaScript and has to give the same answer. By default it doesn't. On SQLite 3.45 `json_extract(data,'$.n') > 5` is **true** when `n` is the string `"abc"`, because SQLite orders all text above all numbers, while `'abc' > 5` is false in JavaScript. JSON `true` extracts as integer `1` with `typeof` `'integer'`, so a host cannot tell `true` from `1` after extraction and a coordinator comparing with `===` can. A missing key and a JSON `null` both extract to SQL `NULL`, separable only through `json_type`. Rindle's rule that a predicate is total and never fails on a type mismatch falls out of neither evaluator: it has to be specified once, implemented twice, and held there by a differential test that runs every operator against both over random JSON. The one consolation is that `=` is type-strict in SQLite — `json_extract('{"n":"5"}','$.n') = 5` is false — which agrees with `===`. `CAST` does not rescue the rest: with `CAST(json_extract(data,'$.n') AS INTEGER)`, `'abc' > 5` becomes false and agrees with JavaScript, but `'abc' < 5` becomes true, because the cast yields 0 where JavaScript yields NaN. It relocates the disagreement. What removes it is validating payloads on write against the field types the catalog already declares, so that a string never sits in a number field; evaluation still has to be total, because of fields removed and re-added, types widened, and rows written under older catalog versions.
 - **Cascade in both directions, synchronously.** ent sets `ON DELETE CASCADE` unconditionally on both foreign keys of an M2M join table, while an entity-to-entity edge defaults to `NO ACTION`, or `SET NULL` when the column is nullable, and cascades only when annotated (`entc/gen/graph.go`, `deleteAction`). Read onto this model: the edge rows are the join rows and should always cascade; target objects should not unless the edge type says so. What doesn't carry is the synchrony, and dropping it exposes a hole. Deleting X has to remove the edges that point **at** X, which live on other vshards, and the only way to find them is X's inverse edges — so an edge type that declares no inverse leaves edges nothing will ever find. Either an edge type with a deletable target must have an inverse, or dangling edges are permanent and reads must drop them.
 - **Schema authoring in the host language.** ent's schemas are Go structs: `User.Type` is a typed reference, mixins compose, an IDE completes the field builders, and `schemast` edits the schema directory programmatically so that `protoc-gen-ent` can generate schemas from `.proto` files (`doc/md/generating-ent-schemas.md`). The price is a two-stage build and a documented circular-import dance (`import _ "<project>/ent/runtime"`). ent is the strongest case for a DSL over the JSON files; the reason to keep JSON is that the lock has to feed generators for other languages. Both hold if the lock stays JSON as a build artifact and authoring is whatever a domain's team can review.
 
