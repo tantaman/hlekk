@@ -109,10 +109,11 @@ describe("ids", () => {
     assert.throws(() => parseId("01"), TypeError);
     assert.throws(() => makeId(MAX_VSHARD + 1n, 0n), RangeError);
     assert.throws(() => makeId(0n, MAX_SEQ + 1n), RangeError);
-    // The reserved high bits: an id that spends one is out of range on the way in, so the
-    // reservation cannot be consumed by a caller handing us a wide id either.
+    // The reserved sign bit: an id at or above 2^63 is refused on the way in, which is the
+    // threshold where SQLite would coerce it to REAL and let two distinct ids compare equal.
     assert.throws(() => parseId((1n << (VSHARD_BITS + SEQ_BITS)).toString()), RangeError);
-    assert.equal(RESERVED_BITS, 4n);
+    assert.equal(RESERVED_BITS, 1n);
+    assert.equal(VSHARD_BITS + SEQ_BITS, 63n, "every id stays below 2^63");
   });
 
   it("orders ids numerically, as the blob keys do", () => {
