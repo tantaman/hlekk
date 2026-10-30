@@ -239,6 +239,11 @@ page for each of the three edge passes. Both columns are floors: they count requ
 request ceiling, and the thing that will actually bind is DO SQLite write throughput, which is
 unmeasured. The ratio is the point.
 
+**This only binds on the deployed path.** Build A can be loaded locally by writing the SQLite files
+directly, where there are no requests to count — see *Bulk loading* below. So `txn` is a
+prerequisite for deploying the demo, not for building it, which is a good reason to build it
+second.
+
 **An edge always lives on its `id1`'s vshard, so a group of edge writes sharing an `id1` touches
 exactly one vshard** and satisfies *Transactions*' rule that every id share the anchor's. One
 page's whole outlink list is therefore one legal transaction, which is exactly the grouping the
@@ -263,6 +268,81 @@ A third thing worth setting before the load: **index vshards.** `npm run app` op
 title entries and ~60 bytes each, the index is ~4 GB, so 2 vshards exceeds the ~1 GB cap outright.
 Open 16, both for the bytes and because the index is written on every page create and the vshard
 count is what gives that write parallelism.
+
+### Bulk loading, and what the platform actually allows
+
+There is **no import, export, backup or snapshot tool for a deployed Durable Object's SQLite
+database** — not in Wrangler, not in the API. Cloudflare's own storage-options page says the quiet
+part: *"With SQLite in Durable Objects, you may also need to build some of your own database tooling
+that comes out-of-the-box with D1."* D1 has `import`/`export`; Durable Objects have neither, and the
+reason is architectural rather than a gap in the tooling — a Durable Object's storage is private to
+the object, so its own JavaScript is the only writer there has ever been.
+
+Point-in-time recovery exists and is not an import. `getCurrentBookmark`,
+`getBookmarkForTime` and `onNextSessionRestoreBookmark` restore **that object's own** storage to a
+bookmark within 30 days, configured from inside the object and completed with `ctx.abort()`. The
+docs do not describe restoring from a file or into a different object, and PITR *"is not supported
+in local development because a durable log of data changes is not stored locally."*
+
+**Locally, though, the files are right there, and this is the load path for Build A.** Verified
+today against this repo: after `npm run app`, each host is a plain SQLite database at
+`.wrangler/app-state/v3/do/hlekk-app-HlekkHostDO/<hex>.sqlite`, holding `objects`, `assocs`,
+`assoc_counts`, `outbox`, `vshards` and `index_entries` exactly as *Host schema* specifies, plus
+`assocs_range`, and a `__miniflare_do_name` table whose row is the DO's name — `demo/h-6` — which is
+what maps a file to a host. Ids are 8-byte big-endian blobs of `vshard << 47 | seq`, readable
+straight out of the file.
+
+So the whole of Build A can be built offline with ordinary SQLite tooling and never touch the write
+path. Proven end to end on a row that hlekk never wrote: an `objects` row inserted with Python's
+`sqlite3` into `demo/h-6`'s file at `(vshard 90, seq 5)`, with `vshards.next_seq` bumped to keep the
+invariant that a vshard's sequence is past every id it holds, then read back through the Worker's
+normal graph query — routed to vshard 90, host 6, answered in **1 request and 0 rounds**:
+
+```
+{ "title": "written straight into the sqlite file", "status": "open",
+  "id": "12666373951979525", "$version": 1, "comments": [], "commentCount": 0 }
+```
+
+That turns the load from a request-rate problem into a disk-bound one: hours at worst, and no
+1,000/sec ceiling anywhere in it. It also makes `src/testkit/invariants.ts` load-bearing rather than
+merely reassuring — a loader that bypasses the write path has bypassed every check in it, so the
+invariant pass over the finished cluster is the only thing standing between a hand-built database
+and a subtly wrong one. Run it before believing any query.
+
+**What this does not do is deploy.** A deployed demo needs the rows to arrive through running code,
+and the way to make that cheap is to stop sending one request per row and **let each host feed
+itself**: the loader shards its sorted output by destination vshard, uploads one file per host, and
+each host ingests its own in an alarm loop. Alarms suit it — a 15-minute wall-time limit, 30 seconds
+of CPU by default and up to 5 minutes via `limits.cpu_ms`, self-rescheduling by design, and
+at-least-once with six retries at exponential backoff from 2 seconds. Two things stand in the way,
+and only one is work:
+
+- **Ids have to be assigned before the host mints them**, since the loader must know which vshard a
+  row belongs to in order to shard by it. The fix is a reservation: a host advances
+  `vshards.next_seq` by *n* and hands back the base, after which the loader computes
+  `id = (vshard << 47) | (base + i)` offline. Same trick the paged-storage demo would get free from
+  Software Heritage's published node order, and it keeps the sequence invariant intact.
+- **R2 from inside a Durable Object is undocumented.** Reading KV from a DO has its own documented
+  example (`this.env.YOUR_KV_NAMESPACE.get(...)`); R2 has nothing comparable on the DO pages, so
+  that it works the same way is an inference, not a fact. Verify it with a one-binding spike before
+  any plan rests on it.
+
+**The in-DO batching recipe, whichever path.** The limits are specific and two of them bite:
+
+| Limit | Value | Consequence |
+| --- | --- | --- |
+| Bound parameters per query | **100** | A parameterized multi-row insert fits ~20 `assocs` rows. Far too few. |
+| SQL statement length | **100 KB** | With literals inlined instead of bound — `x'002d000000000005'` for a blob id — a row costs ~50 bytes, so ~2,000 rows per statement. |
+| Row / BLOB / string size | 2 MB | Never approached by Build A. |
+| Columns per table | 100 | Fine; relevant only to the generated-column indexing idea. |
+| CPU per invocation | 30 s, to 5 min via `limits.cpu_ms` | Sets how much one alarm can ingest. |
+| Storage per object | 10 GB, then `SQLITE_FULL` on write | Reads and `DELETE` still work when full, which is the only reason a packed host is recoverable. |
+
+So the shape is: inline literals rather than bindings, ~2,000 rows per `exec`, many `exec` calls
+inside one `transactionSync()` so the batch costs one commit. `exec` does accept several statements
+separated by semicolons, but it refuses `BEGIN` and `SAVEPOINT`, so the transaction has to come from
+`transactionSync`. One thing the docs do not say: whether the 100 KB limit applies per statement or
+to the whole multi-statement string. Assume per call until measured.
 
 ### The passes
 
@@ -425,9 +505,14 @@ pure inserts.
       one component that is pure bulk rather than new behaviour. `src/worker/wiki.ts` is its schema
       and `scripts/load-enwiki.mjs` its loader. Build B remains an addition, not a change: a new
       object type and a new edge type are both catalog-only under *What a change costs*.
-- [ ] `db.txn(anchorId, ops)` as a `Mutation` kind, which the load needs to finish in hours rather
-      than a day. The grouping the loader already produces — one anchor's whole edge list — is one
-      vshard, so the smallest version is enough.
+- [ ] `db.txn(anchorId, ops)` as a `Mutation` kind, needed to *deploy* the demo rather than to
+      build it: the local load writes the SQLite files directly and counts no requests at all. The
+      grouping the loader already produces — one anchor's whole edge list — is one vshard, so the
+      smallest version is enough.
+- [ ] Whether an R2 binding works from inside a Durable Object. Documented for KV, undocumented for
+      R2, and the self-feeding deployed load rests on it. One binding and a spike settles it.
+- [ ] Whether the 100 KB SQL statement limit applies per statement or to a whole multi-statement
+      `exec` string. It sets the rows-per-call figure and the docs do not say.
 - [ ] Per-index normalization, so a case-sensitive title index and a case-insensitive email index
       can coexist. `titleKey` in `src/worker/wiki.ts` is the stopgap and says so.
 - [ ] The two `/ingest` routes the loader posts to, and whether they belong in the demo worker or
