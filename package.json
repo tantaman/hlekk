@@ -6,7 +6,9 @@
     "demo": "node src/query/demo.ts",
     "typecheck": "tsc -p .",
     "test": "node --test \"src/**/*.test.ts\"",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "app": "node scripts/app.mjs",
+    "app:dev": "wrangler dev --config wrangler.app.jsonc"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

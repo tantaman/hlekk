@@ -21,6 +21,7 @@ import type { Runtime } from "../runtime/runtime.ts";
 import type { Catalog } from "../catalog/catalog.ts";
 import type { Miss, Plan } from "../query/types.ts";
 import { Hlekk } from "./client.ts";
+import { applyTo } from "./transport.ts";
 import type { Mutation, Transport } from "./transport.ts";
 
 /** Where published chunks live. A KV namespace in production. */
@@ -266,27 +267,7 @@ export class LocalCluster {
       },
       async write(host: number, m: Mutation, epoch: number): Promise<Reply<unknown>> {
         cluster.calls.write++;
-        const h = cluster.host(host);
-        switch (m.kind) {
-          case "create":
-            return h.create({ otype: m.otype, data: m.data, with: m.with, vshard: m.vshard, epoch });
-          case "update":
-            return h.update({ id: m.id, data: m.data, expect: m.expect, epoch });
-          case "delete":
-            return h.delete({ id: m.id, epoch });
-          case "assocAdd":
-            return h.assocAdd({ atype: m.atype, id1: m.id1, id2: m.id2, time: m.time, data: m.data, epoch });
-          case "assocRemove":
-            return h.assocRemove({ atype: m.atype, id1: m.id1, id2: m.id2, epoch });
-          case "apply":
-            return h.apply(m.op);
-          case "indexReserve":
-            return h.indexReserve({ vshard: m.vshard, idx: m.idx, key: m.key, now: m.now, ttlMs: m.ttlMs, epoch });
-          case "indexConfirm":
-            return h.indexConfirm({ vshard: m.vshard, idx: m.idx, key: m.key, id: m.id, epoch });
-          case "indexRelease":
-            return h.indexRelease({ vshard: m.vshard, idx: m.idx, key: m.key, epoch });
-        }
+        return applyTo(cluster.host(host), m, epoch);
       },
       chunk(index: number): Promise<Uint8Array | null> {
         return cluster.store.get(chunkKey(cluster.database, index));

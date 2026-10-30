@@ -1,0 +1,22 @@
+{
+  "name": "hlekk-app",
+  // A database over several host Durable Objects, a directory Durable Object, and a KV namespace for
+  // the published shard map. `npm run app` runs it on local workerd and asserts what it did; nothing
+  // here is deployed by the suite.
+  "main": "src/worker/app.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "HLEKK_HOSTS", "class_name": "HlekkHostDO" },
+      { "name": "HLEKK_DIRECTORY", "class_name": "HlekkDirectoryDO" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HlekkHostDO", "HlekkDirectoryDO"] }],
+  "kv_namespaces": [{ "binding": "HLEKK_MAP", "id": "hlekk-map-demo" }],
+  "vars": {
+    "HLEKK_DATABASE": "demo",
+    // Low enough that a few hundred bytes of demo data crosses it, so the placement controller can be
+    // watched shedding a run rather than having to be taken on faith.
+    "HLEKK_SHED_BYTES": "900"
+  }
+}
