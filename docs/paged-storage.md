@@ -251,32 +251,33 @@ bound above, since vshards are what parallelism is bought with.
 ## The id layout
 
 Changed ahead of the storage decision, because every id ever minted encodes it and no id exists yet.
-**1 reserved / 20 vshard / 43 sequence**, from 24/40 with nothing spare. `design.md`'s *Layout* has
-the full reasoning; the parts that belong here:
+**1 reserved / 16 vshard / 47 sequence**, from 24/40. `design.md`'s *Layout* has the full reasoning;
+the parts that belong here:
 
-- **The old 16 PB ceiling was a product of the cap**, not of the field. 2^24 × 1 GB is 16 PB; 2^20 ×
-  100 GB is ~105 PB. A narrower field with a larger vshard reaches further.
-- **It is not a bet on paged storage landing.** 2^20 × 1 GB is still 1 PB.
-- **The freed bits went to the sequence**, which is the half of this that paged storage drives. The
-  byte cap is what used to retire a vshard early; removing it means vshards live longer and spend
-  more ids, so the sequence becomes the binding lifetime bound. `SEQ_BITS` can never be changed
-  afterwards — widening it moves the vshard field and re-decodes every id — whereas the vshard
-  field can be widened into spare bits, so a reservation only ever helps the field whose pressure
-  this change *reduces*. Stated against what a vshard can actually serve rather than a sample rate:
-  one DO at ~1,000 creates/sec is 3.15e10 ids a year, so 2^43 is ~279 years and 2^40 would have
-  been ~35.
+- **The old 16 PB ceiling was a product of the cap**, not of the field. 2^24 × 1 GB is 16 PB. What
+  sets the width instead is that a logical database is what one customer spins up and the service
+  scales by adding databases, so the field bounds one customer: ~65 TB at the current cap, which is
+  where managed Postgres draws its line, and ~6.5 PB once a vshard is not bounded by a copy.
+- **The rest went to the sequence, which is the half paged storage drives.** The byte cap is what
+  used to retire a vshard early; removing it means vshards live longer and spend more ids. And
+  `SEQ_BITS` can never be changed afterwards — widening it moves the vshard field and re-decodes
+  every id — so it is sized generously while the vshard field is sized for what is needed.
+- **The burn rate is not the request limit.** Earlier splits were sized against 1,000/sec as though
+  it were writes; it is *requests*, and one transaction can create many objects in a colocation
+  group. At 100,000 creates/sec — an ordinary tenant import behind `with: parentId` — 2^40 lasts
+  ~4 months and 2^47 ~45 years.
 - **Nothing was spent on a new field.** A type tag was rejected: it makes type immutable per object,
   pins type ids across catalog edits that teams make independently, and `design.md`'s indexing
   measurement uses "an id names a vshard but not a type" as a reason the shared object table is
-  right. A fixed sub-slab field was rejected on arithmetic: 16 slab bits leaves 27 for the
-  sequence, against a lifetime budget measured in centuries. Slabs stay dynamic.
+  right. A fixed sub-slab field was rejected because it would come out of the sequence, the field
+  under real pressure. Slabs stay dynamic.
 - **The one reserved bit is the sign bit.** Every id stays below 2^63, the threshold where SQLite
   coerces an integer to REAL and two distinct ids can compare equal. Blob keys are the defence;
-  this makes the collision unrepresentable. The cost is that the vshard field is now effectively
-  fixed at 20 bits, with a second logical database as the escape hatch above ~1 PB.
+  this makes the collision unrepresentable. The cost is that the vshard field is fixed at 16 bits,
+  with sharding above hlekk as the hatch — the same answer a Postgres instance's ceiling has.
 - **One unforeseen benefit.** At 24 bits a fully fragmented shard map was 16.7M entries and 200 MB,
-  which a 25 MiB KV value could not hold at all. At 20 bits the same worst case is ~12.6 MB and
-  fits one value, so chunking becomes an optimization rather than the only route to the ceiling.
+  which a 25 MiB KV value could not hold at all. At 16 bits the same worst case is ~786 KB, so the
+  reader-side ceiling is simply gone and chunking is left doing incremental republication only.
 
 And one idea checked and dropped: squeezing under 2^53 to make ids JS-safe numbers. Two of
 `design.md`'s four reasons for blob keys are about precision, but the other two bind independently —
