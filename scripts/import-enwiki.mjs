@@ -34,7 +34,7 @@
 // directions agree, which is why invariants.ts has to check them as if they were pairs.
 
 import { spawn } from "node:child_process";
-import { createReadStream, createWriteStream, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createGunzip } from "node:zlib";
 import { Readable } from "node:stream";
@@ -438,7 +438,10 @@ async function passCategories(lt, out) {
 function affinityOf(ns, title, fromCategory, which = AFFINITY) {
   switch (which) {
     case "category":
-      return fromCategory ?? `ns:${ns}`;
+      // Spread the pages that have no category rather than collapsing them onto one key. 48% of
+      // simplewiki pages have none, and `ns:0` for all of them is one affinity key, which is one
+      // vshard on one host.
+      return fromCategory ?? affinityOf(ns, title, null, "hash");
     case "namespace":
       return `ns:${ns}`;
     case "initial":
@@ -490,8 +493,14 @@ export async function* records(opts = {}) {
   const affinity = opts.affinity ?? AFFINITY;
   const maxEdges = opts.maxEdges ?? MAX_EDGES_PER_RECORD;
 
-  if (existsSync(at("edges-raw.tsv"))) await sorted(at("edges-raw.tsv"), at("edges.tsv"), ["1,1n"]);
-  else if (!existsSync(at("edges.tsv"))) throw new Error(`${at("edges.tsv")} is missing; run passes 2-4 first`);
+  // Sort only when the spool is newer than the sorted copy. A consumer that iterates records many
+  // times should not pay a 1.4 GB sort per iteration — measured at 40 s for simplewiki, which at
+  // enwiki scale would be the whole run again.
+  const raw = at("edges-raw.tsv");
+  const sortedFile = at("edges.tsv");
+  const stale = existsSync(raw) && (!existsSync(sortedFile) || statSync(raw).mtimeMs > statSync(sortedFile).mtimeMs);
+  if (stale) await sorted(raw, sortedFile, ["1,1n"]);
+  else if (!existsSync(sortedFile)) throw new Error(`${sortedFile} is missing; run passes 2-4 first`);
 
   const affIter = lines(at("affinity.tsv"))[Symbol.asyncIterator]();
   let aff = await affIter.next();

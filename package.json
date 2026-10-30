@@ -8,7 +8,8 @@
     "test": "node --test \"src/**/*.test.ts\"",
     "smoke": "node scripts/smoke.mjs",
     "app": "node scripts/app.mjs",
-    "app:dev": "wrangler dev --config wrangler.app.jsonc"
+    "app:dev": "wrangler dev --config wrangler.app.jsonc",
+    "ingest:local": "node scripts/ingest-local.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
