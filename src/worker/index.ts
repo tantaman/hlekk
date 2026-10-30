@@ -6,7 +6,7 @@
 
 import { Catalog, plan } from "../catalog/catalog.ts";
 import { Host } from "../host/host.ts";
-import { fromKey, makeId, toKey, vshardOf } from "../host/ids.ts";
+import { fromKey, makeId, MAX_SEQ, MAX_VSHARD, toKey, vshardOf } from "../host/ids.ts";
 import { doSql } from "../host/sql.ts";
 import type { DoStorage } from "../host/sql.ts";
 
@@ -55,7 +55,10 @@ export class HlekkHost {
       // ---- blobs survive the round trip through DO SQLite, which hands them back as ArrayBuffer
       this.#raw.sql.exec("CREATE TABLE IF NOT EXISTS probe (k BLOB PRIMARY KEY) WITHOUT ROWID").toArray();
       this.#raw.sql.exec("DELETE FROM probe").toArray();
-      const samples = ["9", "10", makeId(0n, 1n), makeId((1n << 24n) - 1n, (1n << 40n) - 1n)];
+      // The last sample is the largest representable id, which is what says the ordering holds at the
+      // top of the range. It tracks the bit split rather than restating it: written out, it went stale
+      // the day the vshard field narrowed, and `makeId` refused it before a single check had run.
+      const samples = ["9", "10", makeId(0n, 1n), makeId(MAX_VSHARD, MAX_SEQ)];
       for (const id of samples) this.#raw.sql.exec("INSERT INTO probe VALUES (?)", toKey(id)).toArray();
       const back = doSql(this.#raw).all<{ k: Uint8Array }>("SELECT k FROM probe ORDER BY k DESC");
       check("blobs normalize to Uint8Array", back.every((r) => r.k instanceof Uint8Array));
