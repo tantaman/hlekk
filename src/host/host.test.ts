@@ -28,10 +28,10 @@ const LOCK = plan({
         inverse: "issues.comment_issue",
         onDelete: "cascade",
       },
-      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment" },
+      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment", maintained: true },
       // The owner is a person, who outlives the issue.
       "issues.issue_owner": { from: "issues.issue", to: "core.user", inverse: "issues.user_owned", unique: true },
-      "issues.user_owned": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner" },
+      "issues.user_owned": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner", maintained: true },
       "issues.comment_author": { from: "issues.comment", to: "core.user", field: "authorId" },
       // An issue that blocks another cannot be deleted out from under it.
       "issues.issue_blocks": { from: "issues.issue", to: "issues.issue", onDelete: "restrict" },

@@ -17,7 +17,7 @@ const LOCK = plan({
     },
     edges: {
       "issues.issue_comment": { from: "issues.issue", to: "issues.comment", inverse: "issues.comment_issue" },
-      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment" },
+      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment", maintained: true },
       "issues.issue_owner": { from: "issues.issue", to: "core.user", unique: true },
       "issues.comment_author": { from: "issues.comment", to: "core.user", field: "authorId" },
     },

@@ -69,9 +69,23 @@ export class Restricted extends Error {
   }
 }
 
+/** A direct write to the derived half of a pair. Its rows are its inverse's to write: one writer per
+ *  row is what lets the outbox's per-source ordering mean anything. */
+export class Maintained extends Error {
+  readonly edge: string;
+  readonly by: string;
+  constructor(edge: string, by: string) {
+    super(`${edge} is maintained by ${by}; write ${by} instead`);
+    this.name = "Maintained";
+    this.edge = edge;
+    this.by = by;
+  }
+}
+
 export type Reply<T> =
   | { ok: true; value: T }
   | { ok: false; refused: Refusal }
+  | { ok: false; maintained: { edge: string; by: string } }
   | { ok: false; restricted: { id: Id; edge: string } }
   | { ok: false; taken: { idx: number; key: string; by: Id | null } }
   | { ok: false; conflict: { id: Id; expected: number; actual: number } };
@@ -322,6 +336,7 @@ export class Host {
     const time = op.time ?? this.clock.now();
     const data = op.data ?? null;
     return this.#write(() => {
+      this.#own(op.atype);
       this.#claim(vshardOf(op.id1), op.epoch);
       this.#putEdge(op.atype, op.id1, op.id2, time, data);
       const inverse = this.#catalog.inverseOf(op.atype);
@@ -334,6 +349,7 @@ export class Host {
 
   assocRemove(op: AssocRemoveOp): Reply<void> {
     return this.#write(() => {
+      this.#own(op.atype);
       this.#claim(vshardOf(op.id1), op.epoch);
       this.#dropEdge(op.atype, op.id1, op.id2);
       const inverse = this.#catalog.inverseOf(op.atype);
@@ -615,11 +631,22 @@ export class Host {
       return { ok: true, value: this.sql.txn(f) };
     } catch (e) {
       if (e instanceof NotOwned) return { ok: false, refused: e.refusal };
+      if (e instanceof Maintained) return { ok: false, maintained: { edge: e.edge, by: e.by } };
       if (e instanceof Restricted) return { ok: false, restricted: { id: e.id, edge: e.edge } };
       if (e instanceof Taken) return { ok: false, taken: { idx: e.idx, key: e.key, by: e.by } };
       if (e instanceof Conflict) return { ok: false, conflict: { id: e.id, expected: e.expected, actual: e.actual } };
       throw e;
     }
+  }
+
+  /** Refuses a direct write to the derived half of a pair. Checked before ownership, because the
+   *  request is wrong wherever it is sent and re-routing it would cost a round trip for nothing.
+   *
+   *  Only direct writes. `apply` is how the maintaining side's rows arrive, and a cascade's
+   *  withdrawal goes the same way, so neither comes through here. */
+  #own(atype: number): void {
+    const by = this.#catalog.maintainedBy(atype);
+    if (by) throw new Maintained(this.#catalog.edge(atype)!.name, by.name);
   }
 
   /** State must be owned and the routed epoch must match. Checked before anything is written. */

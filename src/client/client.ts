@@ -237,6 +237,7 @@ export class Hlekk {
       if (!route) throw new Unroutable(vshard);
       const reply = (await this.#transport.write(route.host, m, route.epoch)) as Reply<T>;
       if (reply.ok) return reply.value;
+      if ("maintained" in reply) throw new MaintainedEdge(reply.maintained.edge, reply.maintained.by);
       if ("restricted" in reply) throw new WriteRefused(m, reply.restricted);
       if ("taken" in reply) throw new ValueTaken(reply.taken.idx, reply.taken.key, reply.taken.by);
       if ("conflict" in reply) throw new VersionConflict(reply.conflict.id, reply.conflict.expected, reply.conflict.actual);
@@ -382,6 +383,19 @@ export class ValueTaken extends Error {
     this.name = "ValueTaken";
     this.idx = idx;
     this.key = key;
+    this.by = by;
+  }
+}
+
+/** A direct write to the derived half of a paired edge type. Write its inverse: that side's writes
+ *  maintain this one, and one writer per row is what keeps the two halves in step. */
+export class MaintainedEdge extends Error {
+  readonly edge: string;
+  readonly by: string;
+  constructor(edge: string, by: string) {
+    super(`${edge} is maintained by ${by}; write ${by} instead`);
+    this.name = "MaintainedEdge";
+    this.edge = edge;
     this.by = by;
   }
 }

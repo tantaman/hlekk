@@ -84,6 +84,7 @@ export class Model {
   }
 
   assocAdd(atype: number, id1: Id, id2: Id, time: number, data: Fields | null = null): void {
+    this.#own(atype);
     // No existence check, as the host has none: an edge may be written from or to an object that is
     // not there, and a read is what drops it.
     this.#put(atype, id1, id2, time, data);
@@ -92,6 +93,7 @@ export class Model {
   }
 
   assocRemove(atype: number, id1: Id, id2: Id): void {
+    this.#own(atype);
     this.#drop(atype, id1, id2);
     const inverse = this.catalog.inverseOf(atype);
     if (inverse !== undefined) this.#drop(inverse, id2, id1);
@@ -132,6 +134,14 @@ export class Model {
   }
 
   // ---- internals
+
+  /** The derived half of a pair is not the caller's to write; only its inverse's writes reach it. */
+  #own(atype: number): void {
+    const by = this.catalog.maintainedBy(atype);
+    if (by) {
+      throw new ModelRefusal("MaintainedEdge", `${this.catalog.edge(atype)!.name} is maintained by ${by.name}`);
+    }
+  }
 
   /** Applies each of the object's edge types' onDelete. Every restrict is checked before anything is
    *  written, so a held-back delete leaves no trace. */

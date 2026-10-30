@@ -28,10 +28,10 @@ export const LOCK = plan({
         inverse: "issues.comment_issue",
         onDelete: "cascade",
       },
-      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment" },
+      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment", maintained: true },
       "issues.issue_label": { from: "issues.issue", to: "issues.label" },
       "issues.issue_owner": { from: "issues.issue", to: "core.user", unique: true, inverse: "issues.user_owned" },
-      "issues.user_owned": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner" },
+      "issues.user_owned": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner", maintained: true },
       "issues.comment_author": { from: "issues.comment", to: "core.user", field: "authorId" },
       "issues.issue_related": { from: "issues.issue", to: "issues.issue" },
     },
@@ -73,10 +73,10 @@ export const outgoing: Record<string, Outgoing[]> = {
     { name: "related", rel: issueRelated, to: "Issue", atype: issueRelated.atype },
   ],
   Comment: [
-    { name: "issue", rel: commentIssue, to: "Issue", atype: commentIssue.atype, inverse: issueComments.atype },
+    { name: "issue", rel: commentIssue, to: "Issue", atype: commentIssue.atype, inverse: issueComments.atype, maintained: true },
     { name: "author", rel: commentAuthor, to: "User" },
   ],
-  User: [{ name: "owns", rel: userOwned, to: "Issue", atype: userOwned.atype, inverse: issueOwner.atype }],
+  User: [{ name: "owns", rel: userOwned, to: "Issue", atype: userOwned.atype, inverse: issueOwner.atype, maintained: true }],
   Label: [],
 };
 

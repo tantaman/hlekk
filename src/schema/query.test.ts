@@ -19,10 +19,10 @@ const LOCK = planCatalog({
     },
     edges: {
       "issues.issue_comment": { from: "issues.issue", to: "issues.comment", inverse: "issues.comment_issue" },
-      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment" },
+      "issues.comment_issue": { from: "issues.comment", to: "issues.issue", inverse: "issues.issue_comment", maintained: true },
       "issues.issue_label": { from: "issues.issue", to: "issues.label" },
       "issues.issue_owner": { from: "issues.issue", to: "core.user", unique: true, inverse: "issues.user_owned_issues" },
-      "issues.user_owned_issues": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner" },
+      "issues.user_owned_issues": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner", maintained: true },
       "issues.comment_author": { from: "issues.comment", to: "core.user", field: "authorId" },
     },
   },

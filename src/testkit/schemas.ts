@@ -86,6 +86,8 @@ interface PlannedEdge {
   onDelete: OnDelete;
   unique: boolean;
   inverse?: string;
+  /** The mirror of a pair is the derived half: the catalog refuses direct writes to it. */
+  maintained?: boolean;
 }
 
 interface PlannedRel {
@@ -138,6 +140,7 @@ function grow(r: Random, bp: Blueprint, opts: { types: number; edges: number; sp
       const back = declare(to, from);
       forward.inverse = back.name;
       back.inverse = forward.name;
+      back.maintained = true;
     }
   }
   for (let i = first; i < count; i++) {
@@ -165,6 +168,7 @@ export function compileSchema(bp: Blueprint, previous?: Lock): Shape {
       onDelete: e.onDelete,
       ...(e.unique ? { unique: true } : {}),
       ...(e.inverse ? { inverse: e.inverse } : {}),
+      ...(e.maintained ? { maintained: true } : {}),
     };
   }
   for (const rel of bp.rels) {
@@ -189,7 +193,7 @@ export function compileSchema(bp: Blueprint, previous?: Lock): Shape {
     const atype = lock.edges[e.name].atype!;
     const rel = edge(e.name, atype, types[bp.short[e.from]], types[bp.short[e.to]], e.unique ? { unique: true } : undefined);
     const inverse = e.inverse === undefined ? undefined : lock.edges[e.inverse].atype;
-    outgoing[bp.short[e.from]].push({ name: e.alias, rel, to: bp.short[e.to], atype, inverse });
+    outgoing[bp.short[e.from]].push({ name: e.alias, rel, to: bp.short[e.to], atype, inverse, maintained: e.maintained });
   }
   for (const rel of bp.rels) {
     outgoing[bp.short[rel.from]].push({

@@ -11,7 +11,7 @@ const issues: Record<string, Domain> = {
     edges: {
       "issues.issue_label": { from: "issues.issue", to: "issues.label" },
       "issues.issue_owner": { from: "issues.issue", to: "core.user", inverse: "issues.user_owned" },
-      "issues.user_owned": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner" },
+      "issues.user_owned": { from: "core.user", to: "issues.issue", inverse: "issues.issue_owner", maintained: true },
     },
   },
 };
@@ -96,6 +96,56 @@ describe("plan", () => {
           },
         }),
       CatalogError,
+    );
+  });
+
+  // One writer per row. Both halves of a pair used to be writable, which put two vshards in charge of
+  // the same two rows with nothing ordering them against each other, so the pair could be left
+  // holding one half or with the two halves disagreeing about an edge's time. Naming the derived side
+  // is what makes the outbox's per-source ordering mean something, so the catalog insists on it
+  // rather than leaving it to whoever writes first.
+  const pair = (fwd: Record<string, unknown>, back: Record<string, unknown>) =>
+    plan({
+      a: {
+        objects: { "a.x": { fields: {} }, "a.y": { fields: {} } },
+        edges: {
+          "a.fwd": { from: "a.x", to: "a.y", inverse: "a.back", ...fwd },
+          "a.back": { from: "a.y", to: "a.x", inverse: "a.fwd", ...back },
+        },
+      },
+    });
+
+  it("takes a pair with one side maintained", () => {
+    const lock = pair({}, { maintained: true });
+    const cat = Catalog.compile(lock);
+    assert.equal(cat.edgeNamed("a.back")!.maintained, true);
+    assert.equal(cat.edgeNamed("a.fwd")!.maintained, false);
+    assert.equal(cat.maintainedBy(lock.edges["a.back"].atype!)!.name, "a.fwd", "and says which side writes it");
+    assert.equal(cat.maintainedBy(lock.edges["a.fwd"].atype!), undefined);
+  });
+
+  it("refuses a pair where neither side is maintained, or both are", () => {
+    assert.throws(() => pair({}, {}), /neither is maintained/);
+    assert.throws(() => pair({ maintained: true }, { maintained: true }), /both maintained/);
+  });
+
+  it("refuses an edge that is maintained but names no inverse", () => {
+    assert.throws(
+      () =>
+        plan({
+          a: { objects: { "a.x": { fields: {} } }, edges: { "a.e": { from: "a.x", to: "a.x", maintained: true } } },
+        }),
+      /maintained but names no inverse/,
+    );
+  });
+
+  it("refuses an edge that names itself as its inverse, since neither side could maintain the other", () => {
+    assert.throws(
+      () =>
+        plan({
+          a: { objects: { "a.x": { fields: {} } }, edges: { "a.e": { from: "a.x", to: "a.x", inverse: "a.e" } } },
+        }),
+      /names itself as its inverse/,
     );
   });
 });
