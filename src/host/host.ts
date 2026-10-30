@@ -13,7 +13,7 @@ import { missOwner } from "../query/types.ts";
 import type { Fields, Id, Miss, Plan } from "../query/types.ts";
 import { MAX_SEQ, fromKey, makeId, toKey, vshardOf, vshardRange } from "./ids.ts";
 import { MAX_PAYLOAD, migrate } from "./schema.ts";
-import type { Sql } from "./sql.ts";
+import type { Param, Sql } from "./sql.ts";
 import { SqlStore } from "./store.ts";
 import type { Refusal, Routed, State } from "./store.ts";
 
@@ -187,16 +187,28 @@ export interface Snapshot {
   index: { idx: number; key: string; id: Id | null; state: string; at: number }[];
 }
 
-/** What a vshard costs this host, for the placement controller. Bytes are the stored payloads, which
- *  is what a move has to copy; the page overhead SQLite adds on top of them is not something a DO can
- *  see. Requests are counted since the last read, so the controller polling on a fixed interval reads
- *  a rate. */
+/** What a vshard costs this host, for the placement controller. Requests are counted since the last
+ *  read, so the controller polling on a fixed interval reads a rate.
+ *
+ *  `bytes` is what this vshard's own rows weigh: payloads as bytes and not characters, plus the keys
+ *  and index entries around them. It is deliberately an estimate of the rows and NOT of the storage
+ *  they occupy, which runs 1.05x to 4.7x higher once page overhead is counted — a WITHOUT ROWID row
+ *  whose payload passes the max-local threshold spills to an overflow page and costs a whole one, so
+ *  a 1,000-byte object can cost 4.7 KB where a 980-byte one costs 1.03 KB. Use it to compare vshards
+ *  with each other; use `Host.size()` for anything measured against the per-DO limit. */
 export interface VshardStats {
   vshard: string;
   bytes: number;
   objects: number;
   requests: number;
 }
+
+/** Per-row costs beyond the payload: keys, the fixed columns and the cell overhead around them. Only
+ *  the ratios between these matter, since the shares they build are scaled to the engine's own size.
+ *  An edge is charged for its index entry as well as its row — `assocs_range` carries the whole
+ *  primary key, this table being WITHOUT ROWID, so it costs more than the row it points at and a flat
+ *  per-edge constant left the larger half of an edge-heavy vshard uncharged. */
+const ROW_COST = { object: 18, assoc: 28 + 38, count: 20, outbox: 18, index: 34 } as const;
 
 export interface ExecReply extends HostReply {
   /** Vshards the caller routed to that this host no longer serves at that epoch. */
@@ -376,23 +388,69 @@ export class Host {
   /** Per-vshard size and request rate. Reading it resets the request counters, so two readers would
    *  each see part of the traffic; one controller polls it. */
   stats(): VshardStats[] {
-    return this.vshards().map((row) => {
+    // Two passes: a share per vshard, then the engine's real size split across them. Lengths are
+    // taken as blobs, since LENGTH() on TEXT counts characters and a UTF-8 payload is wider than it
+    // reads — the same distinction #payload already makes against the row-size cap.
+    const raw = this.vshards().map((row) => {
       const vshard = row.vshard.toString();
+      const v = Number(row.vshard);
       const [lo, hi] = vshardRange(BigInt(row.vshard));
-      const objects = this.sql.all<{ n: number; bytes: number }>(
-        "SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(data)), 0) AS bytes FROM objects WHERE id BETWEEN ? AND ?",
+      const sum = (query: string, ...params: Param[]) =>
+        this.sql.all<{ n: number; bytes: number }>(query, ...params)[0] ?? { n: 0, bytes: 0 };
+
+      const objects = sum(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(CAST(data AS BLOB))), 0) AS bytes" +
+          " FROM objects WHERE id BETWEEN ? AND ?",
         lo,
         hi,
-      )[0] ?? { n: 0, bytes: 0 };
-      const assocs = this.sql.all<{ bytes: number }>(
-        "SELECT COALESCE(SUM(LENGTH(COALESCE(data, '')) + 24), 0) AS bytes FROM assocs WHERE id1 BETWEEN ? AND ?",
+      );
+      const assocs = sum(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(CAST(COALESCE(data, '') AS BLOB))), 0) AS bytes" +
+          " FROM assocs WHERE id1 BETWEEN ? AND ?",
         lo,
         hi,
-      )[0] ?? { bytes: 0 };
+      );
+      // Counted too, because they are rows the vshard owns and a move carries: an edge-heavy vshard
+      // holds a count per (id1, atype), and a vshard whose outbox is backed up holds that as well.
+      const counts = sum("SELECT COUNT(*) AS n, 0 AS bytes FROM assoc_counts WHERE id1 BETWEEN ? AND ?", lo, hi);
+      const outbox = sum(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(CAST(op AS BLOB))), 0) AS bytes FROM outbox WHERE vshard = ?",
+        v,
+      );
+      const index = sum(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(CAST(key AS BLOB))), 0) AS bytes" +
+          " FROM index_entries WHERE vshard = ?",
+        v,
+      );
+
+      const share =
+        objects.bytes + objects.n * ROW_COST.object +
+        assocs.bytes + assocs.n * ROW_COST.assoc +
+        counts.n * ROW_COST.count +
+        outbox.bytes + outbox.n * ROW_COST.outbox +
+        index.bytes + index.n * ROW_COST.index;
+
       const requests = this.#requests.get(vshard) ?? 0;
       this.#requests.delete(vshard);
-      return { vshard, bytes: objects.bytes + assocs.bytes, objects: objects.n, requests };
+      return { vshard, share, objects: objects.n, requests };
     });
+
+    return raw.map((r) => ({ vshard: r.vshard, bytes: r.share, objects: r.objects, requests: r.requests }));
+  }
+
+  /** What this host's database really occupies, as the engine reports it. The per-vshard figures above
+   *  cannot be made to sum to this: the difference is keys, indexes, page overhead and the freelist,
+   *  and part of it belongs to no vshard at all. Attributing it pro rata was tried and rejected — it
+   *  made a vshard's figure depend on what its neighbours hold, and charged the whole fixed cost of a
+   *  database to its first vshard.
+   *
+   *  So the two measurements answer two questions and the controller uses each for its own: this one
+   *  decides whether the DO is near the 10 GB limit, where being exact is what averts SQLITE_FULL,
+   *  and the shares decide which vshard to shed, where only the ratios between them matter. That also
+   *  leaves the soft cap free to stay an estimate, since this is the figure the limit is enforced on
+   *  and it is what the controller acts before. */
+  size(): number {
+    return this.sql.size();
   }
 
   #count(vshard: bigint): void {
@@ -403,7 +461,22 @@ export class Host {
   // ---- moves
 
   /** Everything this vshard holds. Taken while the vshard is fenced, so the rows cannot change under
-   *  it; a snapshot of a vshard still taking writes would be torn. */
+   *  it; a snapshot of a vshard still taking writes would be torn.
+   *
+   *  THIS DOES NOT SCALE TO THE VSHARD CAP, and not merely as a slow pause. The whole vshard becomes
+   *  one JS object, crosses one RPC and is replayed by `install()` row at a time inside a single
+   *  transaction, against a 128 MB isolate and 30 s of CPU per request (300 s configured). So the
+   *  size this survives is measured in hundreds of megabytes, under the cap today and far under it at
+   *  9 GB. Past that the move does not take longer, it fails: `MoveFailed` at `copy`, retried, with
+   *  the vshard left fenced — reads served, writes refused — for as long as it keeps failing.
+   *
+   *  The fix is to chunk it, and it is owed at any cap. A vshard is one contiguous key range in
+   *  objects, assocs and assoc_counts, so a cursor paginates it; `install` is already INSERT OR
+   *  REPLACE, so a chunk is idempotent and a crashed copy re-copies; and the `vshards` row flip is
+   *  already the last step, so a half-installed vshard is invisible. The fence holds across all of
+   *  it, so nothing about the correctness argument changes — only that the pause becomes a sequence
+   *  of transactions rather than one. Nothing exercises this yet because the harnesses move tens of
+   *  rows. */
   snapshot(vshard: string): Snapshot {
     const v = BigInt(vshard);
     const [lo, hi] = vshardRange(v);

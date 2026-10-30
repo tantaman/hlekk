@@ -21,9 +21,23 @@ export const USAGE_DDL: readonly string[] = [
    )`,
 ];
 
-/** A vshard's soft size cap. Set by move time, not storage: a stop-the-world move pauses the vshard's
- *  writes for the whole copy. */
-export const VSHARD_CAP = 1024 * 1024 * 1024;
+/** A vshard's soft size cap, set against the 10 GB per-DO storage limit rather than against move
+ *  time. A vshard is allowed to fill most of a host because the answer to one that grows large is to
+ *  give it a host of its own: shedding is for a host whose *several* vshards approach the limit
+ *  together, and a lone vshard at the cap needs no destination because the cap is what stops it
+ *  growing further.
+ *
+ *  The margin below 10 GB covers what no vshard owns — the `vshards` table, the freelist a delete
+ *  leaves behind — and leaves the controller room to act before a write meets SQLITE_FULL, past which
+ *  writes fail while reads and deletes keep working. DO bills storage in GB of 10^9 bytes, so this is
+ *  9 GB in those terms and not in GiB.
+ *
+ *  The move pause this implies is accepted: a 9 GB stop-the-world copy is a long one, and the route
+ *  out of it is the base of the database in R2 (`paged-storage.md`), not a smaller cap. What is NOT
+ *  merely slow is the copy itself — `snapshot()` materializes a whole vshard as one JS object and
+ *  `install()` replays it in a single transaction, which no 9 GB vshard survives. See the note on
+ *  `Host.snapshot`. */
+export const VSHARD_CAP = 9_000_000_000;
 
 export interface AllocatorOptions {
   /** The soft cap. A vshard stops taking new roots at half of it, keeping the rest for colocated

@@ -22,7 +22,9 @@ export const DDL: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS hosts (
      host         INTEGER PRIMARY KEY,
      region       TEXT,
-     jurisdiction TEXT
+     jurisdiction TEXT,
+     -- What the host's database really occupies, as it last reported. NULL until it has been asked.
+     bytes        INTEGER
    )`,
   `CREATE TABLE IF NOT EXISTS catalog (
      version INTEGER PRIMARY KEY,
@@ -93,6 +95,18 @@ export class Directory {
     );
   }
 
+  /** Records what a host reports it really occupies. The per-vshard shares cannot be summed to this,
+   *  so it is kept per host and not derived. */
+  observeHostBytes(host: number, bytes: number): void {
+    this.sql.run("UPDATE hosts SET bytes = ? WHERE host = ?", bytes, host);
+  }
+
+  /** What a host last reported it occupies, or null if it has never been asked. */
+  hostBytes(host: number): number | null {
+    const row = this.sql.all<{ bytes: number | null }>("SELECT bytes FROM hosts WHERE host = ?", host)[0];
+    return row?.bytes ?? null;
+  }
+
   hostIndexes(): number[] {
     return this.sql.all<{ host: number }>("SELECT host FROM hosts ORDER BY host").map((r) => r.host);
   }
@@ -103,11 +117,13 @@ export class Directory {
     return row?.next ?? 0;
   }
 
-  /** Hosts in increasing order of what they hold, which is the order a new batch fills them in. */
+  /** Hosts in increasing order of what they hold, which is the order a new batch fills them in. The
+   *  host's own figure where it has reported one, since that is what the per-DO limit is enforced on;
+   *  the sum of its vshards' shares until then. */
   hostsByLoad(): number[] {
     return this.sql
       .all<{ host: number }>(
-        "SELECT h.host AS host, COALESCE(SUM(u.bytes), 0) AS bytes FROM hosts h" +
+        "SELECT h.host AS host, COALESCE(h.bytes, SUM(u.bytes), 0) AS bytes FROM hosts h" +
           " LEFT JOIN assignments a ON a.host = h.host LEFT JOIN usage u ON u.vshard = a.vshard" +
           " GROUP BY h.host ORDER BY bytes ASC, h.host ASC",
       )

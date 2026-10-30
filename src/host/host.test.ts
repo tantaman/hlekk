@@ -497,3 +497,77 @@ describe("onDelete", () => {
     assert.equal(h.sql.all<{ n: number }>("SELECT COUNT(*) AS n FROM objects")[0].n, 0, "the pair went together");
   });
 });
+
+describe("what a vshard costs", () => {
+  const bytesOf = (h: Host, vshard: string) => h.stats().find((s) => s.vshard === vshard)!.bytes;
+
+  it("measures a payload in bytes, not characters", () => {
+    const ascii = open("1");
+    const wide = open("1");
+    // Same number of characters, three times the bytes. LENGTH() on TEXT counts characters, so this
+    // is the case a character count reports as identical.
+    ok(ascii.create({ otype: ISSUE, data: { title: "aaaaaaaaaa" }, vshard: "1", epoch: 0 }));
+    ok(wide.create({ otype: ISSUE, data: { title: "あああああああああ" }, vshard: "1", epoch: 0 }));
+    assert.ok(
+      bytesOf(wide, "1") > bytesOf(ascii, "1") + 15,
+      `wide ${bytesOf(wide, "1")} should exceed ascii ${bytesOf(ascii, "1")} by about two bytes per character`,
+    );
+  });
+
+  it("charges an edge for its index entry as well as its row", () => {
+    const h = open("1");
+    const issue = ok(h.create({ otype: ISSUE, data: { title: "t" }, vshard: "1", epoch: 0 }));
+    const empty = bytesOf(h, "1");
+    const targets = [];
+    for (let i = 0; i < 20; i++) {
+      targets.push(ok(h.create({ otype: COMMENT, data: { body: "b", authorId: "0" }, with: issue, epoch: 0 })));
+    }
+    const withObjects = bytesOf(h, "1");
+    for (const t of targets) ok(h.assocAdd({ atype: ISSUE_COMMENT, id1: issue, id2: t, time: 1, epoch: 0 }));
+    const withEdges = bytesOf(h, "1");
+
+    // 20 forward edges, their 20 colocated inverses and the counts for both. `assocs_range` carries
+    // the whole primary key, this table being WITHOUT ROWID, so the index weighs more than the rows
+    // it points at — a flat per-edge constant left the larger half of that uncharged.
+    const perEdge = (withEdges - withObjects) / 40;
+    assert.ok(perEdge > 50, `an edge and its index entry should exceed 50 bytes, got ${perEdge.toFixed(1)}`);
+    assert.ok(withObjects > empty, "the objects were charged too");
+  });
+
+  it("counts the rows a vshard owns outside objects and assocs", () => {
+    const h = open("1");
+    const a = ok(h.create({ otype: ISSUE, data: { title: "t" }, vshard: "1", epoch: 0 }));
+    const before = bytesOf(h, "1");
+    // An edge to another vshard queues an inverse in the outbox, which is a row this vshard owns and
+    // a move carries, so it has to be charged for it.
+    ok(h.assocAdd({ atype: ISSUE_OWNER, id1: a, id2: makeId(9n, 1n), time: 1, epoch: 0 }));
+    assert.ok(h.pending().length > 0, "there is an outbox row to charge for");
+    assert.ok(bytesOf(h, "1") > before, "the outbox row was charged");
+  });
+
+  it("reports the engine's own size, which the shares do not sum to", () => {
+    const h = open("1");
+    const empty = h.size();
+    assert.ok(empty > 0, "a database with the schema in it occupies something");
+    for (let i = 0; i < 400; i++) {
+      ok(h.create({ otype: ISSUE, data: { title: "x".repeat(300) }, vshard: "1", epoch: 0 }));
+    }
+    assert.ok(h.size() > empty, "writing grew it");
+    // The gap is keys, indexes, page overhead and the freelist. It is why the controller measures the
+    // per-DO limit on this figure and uses the shares only to compare vshards with each other.
+    assert.ok(h.size() > bytesOf(h, "1"), `real ${h.size()} should exceed the share ${bytesOf(h, "1")}`);
+  });
+
+  it("charges a vshard for its own rows and not its neighbour's", () => {
+    const h = open("1", "2");
+    ok(h.create({ otype: ISSUE, data: { title: "x".repeat(500) }, vshard: "1", epoch: 0 }));
+    const one = bytesOf(h, "1");
+    // Growing vshard 2 must not move vshard 1's figure: attributing the database's overhead pro rata
+    // did exactly that, and charged the whole fixed cost of a database to its first vshard.
+    for (let i = 0; i < 50; i++) {
+      ok(h.create({ otype: ISSUE, data: { title: "y".repeat(500) }, vshard: "2", epoch: 0 }));
+    }
+    assert.equal(bytesOf(h, "1"), one, "vshard 1 is unchanged by what vshard 2 holds");
+    assert.ok(bytesOf(h, "2") > one * 10, "and vshard 2 is charged for all of it");
+  });
+});

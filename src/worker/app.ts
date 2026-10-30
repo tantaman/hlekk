@@ -47,7 +47,7 @@ export default {
       }
       if (path === "/admin/where") return json(await call(directory, "where"));
       if (path === "/admin/deliver") return json({ pending: await call(directory, "deliver") });
-      if (path === "/admin/rebalance") return json({ sheds: await call(directory, "rebalance") });
+      if (path === "/admin/rebalance") return json(await call(directory, "rebalance"));
       if (path === "/admin/move") {
         return json(await call(directory, "move", url.searchParams.get("vshard"), num("to", 1)));
       }

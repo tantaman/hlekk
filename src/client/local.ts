@@ -101,9 +101,13 @@ export class LocalCluster {
     return sheds;
   }
 
-  /** Pulls each host's per-vshard size and request rate into the directory. */
+  /** Pulls each host's per-vshard size and request rate into the directory, and what the host itself
+   *  reports it occupies, which is the figure the per-DO limit is enforced on. */
   collect(): void {
-    for (const host of this.hosts.values()) this.allocator.observe(host.stats());
+    for (const [index, host] of this.hosts) {
+      this.allocator.observe(host.stats());
+      this.directory.observeHostBytes(index, host.size());
+    }
   }
 
   /** Move operations a chaos test has made fail, by name. */

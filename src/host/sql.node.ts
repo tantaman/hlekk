@@ -35,6 +35,11 @@ export function nodeSql(path = ":memory:"): Sql {
         open = false;
       }
     },
+    // page_count * page_size is what databaseSize reports on DO. Read, not cached: both move.
+    size(): number {
+      const one = (q: string) => Number(Object.values(db.prepare(q).get() as object)[0]);
+      return one("PRAGMA page_count") * one("PRAGMA page_size");
+    },
     close: () => db.close(),
   };
 }

@@ -225,16 +225,30 @@ export class HlekkDirectoryDO {
       /** One turn of the controller: read what the hosts hold, move what is over threshold, publish
        *  once. */
       rebalance: async () => {
-        const stats = await Promise.all(
-          this.#ready().directory.hostIndexes().map((h) => call<VshardStats[]>(hostStub(this.#env, h), "stats")),
+        const hosts = this.#ready().directory.hostIndexes();
+        const reports = await Promise.all(
+          hosts.map(async (h) => ({
+            host: h,
+            stats: await call<VshardStats[]>(hostStub(this.#env, h), "stats"),
+            bytes: await call<number>(hostStub(this.#env, h), "size"),
+          })),
         );
-        for (const s of stats) this.#ready().allocator.observe(s);
+        for (const r of reports) {
+          this.#ready().allocator.observe(r.stats);
+          this.#ready().directory.observeHostBytes(r.host, r.bytes);
+        }
         const sheds = await this.#ready().placement.rebalance(() => this.#publish().then(() => undefined));
         await this.#flush();
         this.#ready().allocator.resetRequests();
         // Vshards cross the wire as decimal strings, so the shape says so rather than relying on the
-        // serializer to notice.
-        return sheds.map((s) => ({ ...s, vshards: s.vshards.map(String) }));
+        // serializer to notice. The loads go with them because a shed is only meaningful against what
+        // the hosts reported: a threshold an empty database already crosses proves nothing.
+        return {
+          sheds: sheds.map((s) => ({ ...s, vshards: s.vshards.map(String) })),
+          loads: this.#ready().placement
+            .load()
+            .map((l) => ({ host: l.host, bytes: l.bytes, reported: l.reported, vshards: l.vshards.length })),
+        };
       },
 
       publish: () => this.#publish(),
