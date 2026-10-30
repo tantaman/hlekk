@@ -129,7 +129,15 @@ Three decisions in that file are the interesting ones.
 **The sort key.** `assocs` orders by `time`, and each edge type needs a meaning for it.
 `page_revisions` gets the revision timestamp, so a page's history reads newest-first for free and
 the `(time, id2)` cursor is exactly a history cursor. `page_categories` gets `cl_timestamp`, which
-`categorylinks` carries, so "recently added to this category" is a real query. `page_links` has no
+`categorylinks` carries, so "recently added to this category" is a real query.
+
+A note on that table, found by reading the bytes rather than the documentation: **`categorylinks`
+no longer stores `cl_to`.** As of the 2026 dumps its seven columns are `(cl_from, cl_sortkey,
+cl_timestamp, cl_sortkey_prefix, cl_type, cl_collation_id, cl_target_id)` — a category is named by
+a `linktarget` id now, exactly as a link target is, and `cl_sortkey` is a binary collation key, not
+a readable title. This is good news for the loader, since category edges resolve through the same
+`linktarget` map the link edges use and there is one fewer join; it does make the category pass
+depend on the link-target pass, which it did not before. `page_links` has no
 natural time: the dump does not record where in the article a link appeared, so the ordinal is not
 available and `time` is 0 with the primary key's `id2` breaking the tie. That is stable and
 arbitrary. **It is also what rules out the link-order demos** — the "first link in every article
@@ -148,13 +156,26 @@ survives the link graph — only that it survives the category graph. The invari
 `src/testkit/invariants.ts` should be extended to verify the two unpaired types agree as if they were
 a pair, since nothing in the engine is enforcing it.
 
-**Colocation is set at load, and it is what makes the demo fast.** A page, its revisions, its
-outgoing links and its category memberships are all created `with: pageId`, so they share the page's
-vshard. Then a page's history and its outlink list are one host and one hop. What necessarily
-crosses hosts is the *targets*: the page objects an outlink points at live in their own vshards, so
-rendering a page's links with their titles is the two-hop case the design is built around, and
-`linked_from` for a popular page is a long list on one host whose members are scattered over all of
-them. Both are the interesting cases, and both come out of the data rather than being arranged.
+**Build A never uses `with:`, and that is worth being exact about.** An earlier draft of this
+section said pages, links and categories are created `with: pageId`. They are not, because there is
+nothing to colocate: `wiki.page` is the only object type in Build A, and an edge already lives on
+its `id1`'s vshard with no option in the matter. So a page's outlink list and its category list are
+one host and one hop for free, by the storage layout rather than by a placement decision.
+
+**The only placement lever is therefore the affinity key a page is created under**, and the loader
+sets it to the page's first category. Pages sharing one land together and stay together as the
+database spreads, so browsing within a topic stays on a few hosts while browsing across topics fans
+out — which is the contrast demo query 6 exists to show. With no affinity at all, placement is
+random within the active set, every traversal is a full fan-out, and the demo has one case instead
+of two.
+
+What necessarily crosses hosts is the *targets*: the page objects an outlink points at live in
+their own vshards, so rendering a page's links with their titles is the two-hop case the design is
+built around, and `linked_from` for a popular page is a long list on one host whose members are
+scattered over all of them. Both come out of the data rather than being arranged.
+
+**`with:` only starts to matter in Build B**, where a revision is an object that wants to be in its
+page's vshard. That is also where the undecided colocation group limit starts to bind.
 
 ## What it costs
 
@@ -196,30 +217,89 @@ The shard map is a non-issue at this scale: 1,024 vshards fully fragmented is ~1
 
 ## Loading it
 
-**The write path is the only way in.** Without paged storage there is no base to bulk-build and no
-manifest to publish, so every one of the ~5.2 billion rows in Build B goes through
-`transactionSync()` on an owning host. That single fact shapes the whole load:
+Two things have to be built before the load can run, and both were found by writing the loader
+against the code rather than against the design doc.
 
-- **Batch by page, colocated.** One transaction writes a page, its revisions, its outlinks and its
-  categories, all `with: pageId`. For a median page that is a handful of rows; for a heavily-edited
-  one it is thousands. Driving the load page-by-page in page-id order means the input is already
-  grouped the way the transactions want.
-- **The colocation group limit binds here and its value is still undecided.** *Design limits* leaves
-  it as "a documented limit, value to be set". A page with 100,000 revisions is a colocation group
-  with 100,000 members, and the loader is the first thing that will find out what the limit is. This
-  is the demo's first contribution back to the design.
-- **`linked_from` needs a second pass in target order.** The same 1.78 billion links, sorted by
-  target instead of source, so each target page's backlink list is written contiguously into its own
-  vshard. Sorting 1.78 billion 12-byte tuples is an ordinary external sort, done outside hlekk.
-- **Throughput is the unknown, and the load is the measurement.** Build-plan step 1 owes a per-DO
-  throughput number and `npm run app` "writes tens of objects, not thousands". Whether 5.2 billion
-  rows across ~100 hosts takes four hours or four days is not currently knowable from anything in
-  the repo. **This is the demo's main technical return**: it retires step 1's open item, and the
-  vshard density and move thresholds that are currently guesses become measured.
-- **Watch the allocator, do not drive it.** The database is created with its full vshard count, so
-  the load should never need the active set to grow — but *Growing the vshard count* opens the next
-  `N` when the active set empties, and a load that trips that has told you something about the byte
-  cap. Log it rather than preventing it.
+### `db.txn` is specified but not built, and the load needs it
+
+`Mutation` in `src/client/transport.ts` is `create | update | delete | assocAdd | assocRemove |
+apply | indexReserve | indexConfirm | indexRelease`. There is no batch kind, and no `txn` on the
+client — `db.txn(anchorId, …)` appears in *Mutations* and *Transactions* in `design.md` and in the
+build plan's assumptions, but nothing implements it. So today every edge is its own round trip.
+
+What that costs Build A:
+
+| | Requests | At the 1,000/sec per-DO ceiling, 50 hosts |
+| --- | --- | --- |
+| One mutation per row | ~4.0 billion | ~22 hours |
+| Batched per anchor | **~380 million** | **~2.1 hours** |
+
+The batched figure is 66.5 M pages × 3 for reserve–create–confirm, plus roughly one transaction per
+page for each of the three edge passes. Both columns are floors: they count requests against the
+request ceiling, and the thing that will actually bind is DO SQLite write throughput, which is
+unmeasured. The ratio is the point.
+
+**An edge always lives on its `id1`'s vshard, so a group of edge writes sharing an `id1` touches
+exactly one vshard** and satisfies *Transactions*' rule that every id share the anchor's. One
+page's whole outlink list is therefore one legal transaction, which is exactly the grouping the
+sorted passes produce. This is the smallest useful version of `txn` and it is all the load needs.
+
+### The title index collides on case
+
+`client.normalize` is `value.trim().toLowerCase()`, applied to every index key. MediaWiki titles are
+case-sensitive after the first character, so `Ash` and `ASH` — both real enwiki pages — normalize to
+one key, and the second page to be loaded is refused with `ValueTaken` and silently dropped.
+
+The stopgap is in `src/worker/wiki.ts`: `titleKey` escapes every uppercase letter to `%` plus its
+lowercase hex code, which makes the key lowercase-stable, so normalization is a no-op on it and
+nothing collides. Verified on `Ash`/`ASH`.
+
+**The honest fix is for normalization to be a property of the index rather than one global
+function.** `design.md`'s *Global lookups and uniqueness* says values are normalized "once, in one
+place" and is right that it must be one place per index; it is currently one place per database.
+An index over emails and an index over case-sensitive titles cannot share a rule.
+
+A third thing worth setting before the load: **index vshards.** `npm run app` opens 2. At ~66.5 M
+title entries and ~60 bytes each, the index is ~4 GB, so 2 vshards exceeds the ~1 GB cap outright.
+Open 16, both for the bytes and because the index is written on every page create and the vshard
+count is what gives that write parallelism.
+
+### The passes
+
+`scripts/load-enwiki.mjs`. Each is a stream over one published dump; nothing is held except two
+flat id maps.
+
+| Pass | Reads | Writes | Why |
+| --- | --- | --- | --- |
+| 0 | `page.sql.gz` | `pages.tsv` | Every page's id, namespace, title, redirect flag, length |
+| 0b | `categorylinks.sql.gz` | `affinity.tsv` | Each page's first category, as its placement key |
+| 1 | `pages.tsv` | pages, `ids.bin` | `createUnique` per page; `page_id → hlekk id` |
+| 2 | `linktarget.sql.gz` | `lt.bin` | `lt_id → hlekk id` by `(ns, title)`; 0 means a red link |
+| 3 | `pagelinks.sql.gz` | `wiki.page_links` | Grouped by source page |
+| 4 | `pagelinks.sql.gz` | `wiki.linked_from` | The same rows, grouped by target page |
+| 5 | `categorylinks.sql.gz` | `wiki.page_categories` | Grouped by source; the inverse rides the outbox |
+
+- **The id maps are flat arrays, not hashes.** `page_id` and `lt_id` are dense and bounded — enwiki's
+  run to roughly 10^8 — so an 8-bytes-per-slot Buffer indexed by the key is ~800 MB off-heap with
+  O(1) reads, and every pass that uses one is already sorted by that key, so the access pattern is
+  sequential. 0 doubles as "red link".
+- **Sorting is GNU `sort`.** Every key is an integer in a fixed column. Reimplementing an external
+  sort in JS would be strictly worse.
+- **Run it on `simplewiki` first.** Same schema, about 1% of the size, finishes in minutes. Every
+  pass either works there or is broken everywhere.
+- **The row parser is a scanner, not a `split`.** A dump is `INSERT INTO \`t\` VALUES\n(…),\n(…);`
+  with one row per line, but a quoted field can contain a newline, a comma or an escaped quote, so
+  neither character can be split on. Verified against 200,000 real `page` rows and against unit
+  cases for each of those escapes plus a row cut by a chunk boundary.
+- **Every pass asserts its table's column count.** This is not defensive padding: `categorylinks`
+  dropping `cl_to` made the loader read a binary collation sortkey as a category title, which wrote
+  millions of garbage affinity keys and resolved no category edges at all — and every field still
+  parsed, so nothing failed. Principle 7 says a changed schema should stop the load.
+- **One assumption is left for the first run to settle.** `cl_target_id` is read as a `linktarget`
+  id, by analogy with `pl_target_id` and because `cl_to` is gone. The column shape says so; an id
+  was not resolved end to end to confirm it. So passes 2 and 5 refuse to continue when more than
+  90% of their rows fail to resolve — a sparse wiki has red links, a wrong key column has almost
+  nothing else, and the `simplewiki` run separates the two in minutes.
 
 **The exact-count oracle.** A dump is a consistent snapshot, so every maintained counter has a known
 right answer: re-derive each page's outlink, backlink, category-member and revision counts from the
@@ -341,11 +421,23 @@ pure inserts.
 
 ## Open
 
-- [ ] Build A or Build B first. A is the ~50-host demo and the faster load; B is the ~500 GiB
-      headline. They differ only by the revision component.
+- [x] Build A first. It is the ~50-host demo, it is the faster load, and the thing B adds is the
+      one component that is pure bulk rather than new behaviour. `src/worker/wiki.ts` is its schema
+      and `scripts/load-enwiki.mjs` its loader. Build B remains an addition, not a change: a new
+      object type and a new edge type are both catalog-only under *What a change costs*.
+- [ ] `db.txn(anchorId, ops)` as a `Mutation` kind, which the load needs to finish in hours rather
+      than a day. The grouping the loader already produces — one anchor's whole edge list — is one
+      vshard, so the smallest version is enough.
+- [ ] Per-index normalization, so a case-sensitive title index and a case-insensitive email index
+      can coexist. `titleKey` in `src/worker/wiki.ts` is the stopgap and says so.
+- [ ] The two `/ingest` routes the loader posts to, and whether they belong in the demo worker or
+      behind an admin-only binding.
 - [ ] Per-DO write throughput, which decides whether the load is hours or days. Unmeasured, and
-      measuring it is build-plan step 1.
-- [ ] The colocation group limit, which the most-edited pages will hit during the load.
+      measuring it is build-plan step 1. The request-count floors above are not it.
+- [ ] Index vshard count. 16 is the proposal, against the 2 that `npm run app` opens and a ~4 GB
+      title index.
+- [ ] The colocation group limit. It does not bind in Build A, which creates no colocated objects;
+      it binds in Build B, where the most-edited pages are colocation groups of 10^5 revisions.
 - [ ] The backlink degree distribution, and whether the top vshard needs placement by affinity.
 - [ ] The share of enwiki links that are red, which sets the real edge count.
 - [ ] Whether the demo's unpaired `page_links` / `linked_from` should become a real maintained pair
