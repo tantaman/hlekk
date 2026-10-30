@@ -15,10 +15,17 @@
   "kv_namespaces": [{ "binding": "HLEKK_MAP", "id": "hlekk-map-demo" }],
   "vars": {
     "HLEKK_DATABASE": "demo",
-    // Above what a host's SQLite weighs empty (~40 KB with the schema in place) and below what the
-    // demo's writes take it to, so the controller can be watched shedding a run and it is the data
-    // that crossed the line. Measured on real DO SQLite, not guessed: a threshold under the empty
-    // size is tripped before a single row exists and demonstrates nothing.
+    // Above what a host's SQLite weighs empty on workerd (40,960 B with the schema in place) and
+    // below what the demo's writes take it to, so the controller can be watched shedding a run and
+    // it is the data that crossed the line. A threshold under the empty size is tripped before a
+    // single row exists and demonstrates nothing.
+    //
+    // Which is nearly what this is, and the figure is a workerd figure: a deployed host DO weighs
+    // 45,056 B empty, measured on 43 of them in the Wikimedia pilot. So 45,000 sits *below* the
+    // real empty size and this threshold would shed before a single row existed if this config
+    // were ever deployed. It is not -- `npm run app` drives it on local workerd, where 40,960 is
+    // the right number -- but the margin is 56 bytes on one platform and negative on the other,
+    // which is too thin to leave unsaid.
     "HLEKK_SHED_BYTES": "45000"
   }
 }

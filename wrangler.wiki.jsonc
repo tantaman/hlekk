@@ -1,0 +1,39 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "hlekk-wiki",
+  // The Wikimedia demo, deployed. Unlike wrangler.jsonc and wrangler.app.jsonc, which are local
+  // harnesses the suite drives on workerd, this one is meant to be `wrangler deploy`-ed: it is how
+  // the import is proven against real Durable Objects, real KV and a real network before anything
+  // the size of enwiki is committed to it.
+  "main": "src/worker/wiki-app.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "HLEKK_HOSTS", "class_name": "HlekkHostDO" },
+      { "name": "HLEKK_DIRECTORY", "class_name": "HlekkDirectoryDO" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HlekkHostDO", "HlekkDirectoryDO"] }],
+  // Real, created with `wrangler kv namespace create hlekk-map-wiki`. The id in wrangler.app.jsonc
+  // is a placeholder that only local workerd accepts.
+  "kv_namespaces": [{ "binding": "HLEKK_MAP", "id": "af144fc56d0541699307352f0a63ab76" }],
+  "vars": {
+    // A database of its own, so the pilot shares no host DO with the issue-tracker demo. Changing
+    // this name is how a clean slate is had: host DOs are named `${HLEKK_DATABASE}/h-${n}`, so a new
+    // name is a new set of empty objects. There is no import, export or truncate for a deployed
+    // Durable Object's SQLite, which makes the name the only reset switch there is -- and an empty
+    // baseline is what the storage multiplier has to be read against.
+    "HLEKK_DATABASE": "wiki-pilot2",
+    // 128 vshards over ~50 hosts: 2-3 per host, ~2 GB apiece at the demo's target size, and the
+    // shape src/client/fanout.test.ts measured at 61-81 host requests for a ~500-object read. The
+    // count is read once, when the directory first opens, so it is chosen before the load and
+    // cannot be changed by editing this afterwards.
+    "HLEKK_VSHARDS": "128"
+  },
+  // HLEKK_SHED_BYTES is deliberately absent. It lowers the placement controller's threshold so a
+  // demo can be watched rebalancing, and this database must not rebalance: wikimedia-demo.md puts
+  // moves and epoch transitions out of scope and keeps every vshard at epoch 0, which is what keeps
+  // the subtlest machinery in the system off the demo path. Without it the controller keeps its
+  // real threshold and nothing sheds at pilot size.
+  "observability": { "enabled": true }
+}

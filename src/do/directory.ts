@@ -45,6 +45,14 @@ export class HlekkDirectoryDO {
   #parts: Parts | null = null;
   /** Vshards the allocator opened that their host has not been told about yet. */
   readonly #opened: { vshard: bigint; host: number; epoch: number }[] = [];
+  /** How many times the map has been written to KV, for the life of this instance.
+   *
+   *  Exposed through `where` because the cost of publishing is invisible from everywhere else and
+   *  is rate limited where it matters: classic KV refuses more than one write per second per key,
+   *  so a publish per created object fails a load on a real deployment and passes every local
+   *  test, local KV having no such limit. Counting it is what lets a harness assert the shape of
+   *  the behaviour rather than its effect. */
+  #publishes = 0;
 
   constructor(ctx: Ctx, env: Env) {
     this.#ctx = ctx;
@@ -105,16 +113,21 @@ export class HlekkDirectoryDO {
     return this.#ready().directory.catalog().lock;
   }
 
-  /** Tells each host about the vshards the allocator opened for it. One call per host, not per
-   *  vshard: opening a batch is one decision and should cost one round trip to each host it touches. */
-  async #flush(): Promise<void> {
+  /** Tells each host about the vshards the allocator opened for it, and returns how many there were.
+   *  One call per host, not per vshard: opening a batch is one decision and should cost one round
+   *  trip to each host it touches.
+   *
+   *  The count is what callers publish on. Nothing else can tell them whether the map changed:
+   *  `#opened` is spliced empty here, so a caller inspecting it afterwards always sees zero. */
+  async #flush(): Promise<number> {
     const pending = this.#opened.splice(0);
-    if (pending.length === 0) return;
+    if (pending.length === 0) return 0;
     const byHost = new Map<number, { vshard: string; epoch: number }[]>();
     for (const o of pending) {
       byHost.set(o.host, [...(byHost.get(o.host) ?? []), { vshard: o.vshard.toString(), epoch: o.epoch }]);
     }
     await Promise.all([...byHost].map(([host, entries]) => this.#adopt(host, entries)));
+    return pending.length;
   }
 
   async #adopt(host: number, entries: { vshard: string; epoch: number }[]): Promise<void> {
@@ -126,6 +139,7 @@ export class HlekkDirectoryDO {
    *  limited on classic KV. */
   async #publish(): Promise<number> {
     const indexes = this.#ready().directory.chunkIndexes();
+    this.#publishes++;
     for (const i of indexes) {
       await this.#env.HLEKK_MAP.put(chunkKey(databaseOf(this.#env), i), this.#ready().directory.chunk(i));
     }
@@ -204,8 +218,22 @@ export class HlekkDirectoryDO {
         const vshard = this.#ready().allocator.place(affinity ?? undefined);
         // The allocator may have opened a batch to answer this, and a vshard its host has not adopted
         // would refuse the write that is about to arrive.
-        await this.#flush();
-        if (this.#opened.length === 0 && this.#ready().directory.mapVersion() > 0) await this.#publish();
+        const opened = await this.#flush();
+        // Only when the allocator actually opened something. A `place` that hands back an
+        // already-open vshard changes no route, so there is nothing to publish — and publishing
+        // anyway means one KV write per created object, which classic KV rate limits to one write
+        // per second per key and refuses with 429 beyond it. Local workerd's KV has no such limit,
+        // so this cost nothing until a real deployment put a load through it.
+        if (opened > 0 && this.#ready().directory.mapVersion() > 0) {
+          // Not fatal, and this is the one publish site where that is true. The map is a cache and
+          // the directory is authoritative: a vshard missing from a stale chunk is absent rather
+          // than wrong, so a client falls through to `resolve` and gets the right host anyway. A
+          // batch opening twice inside KV's one-write-per-second window would otherwise fail a
+          // create for a route the caller never needed published.
+          await this.#publish().catch((e) => {
+            console.error(`place: publishing the map failed, falling back to resolve: ${(e as Error).message}`);
+          });
+        }
         return vshard.toString();
       },
 
@@ -271,6 +299,7 @@ export class HlekkDirectoryDO {
           database: databaseOf(this.#env),
           catalog: this.#ready().directory.catalog().version,
           mapVersion: this.#ready().directory.mapVersion(),
+          publishes: this.#publishes,
           indexVshards: this.#ready().directory.indexVshards().map(String),
           inFlight: this.#ready().mover.inFlight().length,
           hosts: hosts.map((host, i) => ({

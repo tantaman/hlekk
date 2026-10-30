@@ -309,6 +309,194 @@ set and an identical spread either way, because `grow()` already places a batch 
 the reorder in the script is tidiness, not the fix, and the original is recorded as unexplained
 rather than given a mechanism it did not have.
 
+## The same ingest, deployed, which also works
+
+`npm run ingest:deployed -- --base https://hlekk-wiki.tantaman.workers.dev --pages 10000` —
+`scripts/ingest-deployed.ts` against `src/worker/wiki-app.ts`, deployed with `wrangler.wiki.jsonc`:
+43 host Durable Objects, one directory Durable Object, a real KV namespace holding the published
+shard map, 128 vshards, four index vshards.
+
+**It changes exactly one thing from the run above: the transport.** Every mutation and every read
+now crosses a real RPC boundary to a real Durable Object, the map is read from real KV, and the hosts
+are tens of separate objects in Cloudflare's network rather than tables in one process. The subset
+selection moved to `scripts/wiki-subset.ts` so both runs load the *same* pages — a subset chosen two
+ways drifts, and then a difference between the two results cannot be told from a difference in what
+was asked. The checks are the same for the same reason.
+
+It reached **9/9 at 2,000 pages and 158,058 edges**, the same checks the in-process run passes:
+every emitted edge written, nothing queued in any outbox, pages on 43 of 43 hosts, every sampled page
+findable by `(ns, title)`, the exact-count oracle agreeing on 25 pages, a limit honoured against the
+real list, and a page card reading a real page across hosts — `Country`, 25 links **shown from 17
+hosts in 17 host requests, 95 ms** plus 28 ms to turn the title into an id. The 10,000-page load is
+the same thing with a skew problem in front of it; see *The affinity key that ate the cluster*.
+
+Two of those checks had to be weakened honestly rather than dropped. "Every page is findable" reads
+the index for a 300-page sample rather than all 10,000, because over HTTP that is one request per
+title; every page is still covered for existence by the object count, which the index cannot fake.
+And disk growth is only asserted when the run actually created something, since a re-run over loaded
+data writes nothing — which turned out to be worth having, because a re-ingest of 158,058 identical
+edges changed `databaseSize` by **exactly 0 bytes**, which is idempotency demonstrated at the storage
+layer rather than argued from the SQL.
+
+**The deployment also carries the demo's read surface**, at `/` — a title box, a page card, and which
+host Durable Objects each answer was assembled from, served as one document from the Worker so there
+is nothing to build and no asset host to depend on. It identifies itself as a dated mirror under
+CC BY-SA 4.0 and the GFDL, which *Why this dataset* records as a requirement rather than a courtesy.
+
+### What only a deployment could find
+
+Five things. The first two are bugs that every local test passed, and the third is the one that
+decides the shape of the real loader.
+
+**1. The directory published the whole shard map to KV on every object create.** `place` ends with
+`if (this.#opened.length === 0 && mapVersion() > 0) await this.#publish()`, meant to say *only if the
+allocator opened a vshard*. But `#flush()` immediately above it does `this.#opened.splice(0)`, so by
+the time the guard reads that list it is always empty and the condition is always true. Classic KV
+allows **one write per second per key** and refuses the rest with 429, so the pilot died 7 pages in
+with `place: KV PUT failed: 429 Too Many Requests`. Local workerd's KV rate limits nothing, which is
+why 232 unit tests, the DO smoke harness and the whole app harness passed over it.
+
+`#flush()` now returns how many vshards it adopted and `place` publishes only on a non-zero count —
+nothing else can tell, since the list it used to consult is spliced empty by then. The publish is
+also no longer fatal at that one site: the map is a cache and the directory is authoritative, so a
+vshard missing from a stale chunk is *absent* rather than wrong and the client falls through to
+`resolve`. `scripts/app.mjs` now asserts the shape rather than the effect — it counts publishes
+across 62 creates, 38 of them placed, and requires at most 2. It reports 0, and would have reported
+38 before the fix.
+
+**2. A bulk insert in shuffled order does not survive its own size.** The first version of the driver
+shuffled the whole edge list, reasoning that an edge routes by `id1`, so a batch taken in record
+order is one page on one Durable Object, and a Durable Object is single-threaded. That bought
+parallelism and paid for it twice: throughput sat at **973 edge writes/s** and then one host refused
+with `Durable Object is overloaded. Requests queued for too long.` at about 2 million edges, which no
+amount of retrying cleared.
+
+The cause is the index, not the queue. `assocs` is keyed `(id1, atype, id2)`, so a shuffled insert
+lands at a random point in its host's B-tree. While a host holds 3,700 rows that tree is entirely in
+cache and the insert is nearly free; at 46,000 rows and climbing it is not, and every insert dirties
+a different page. **Per-host throughput fell from ~101 writes/s to ~23** as the tables grew, the
+queues grew with it, and the platform eventually refused. Grouping each batch onto one host in key
+order — sequential appends into one tree, every host worked at once, at most one batch in flight per
+host so nothing queues deeply — took it to **~6,300 edge writes/s, a 6.5x gain, and no refusals**.
+
+That is the shape [`wikimedia-demo.md`](wikimedia-demo.md#what-the-loader-owes) already prescribes
+for the real loader: batch per `(host, vshard)`, a vshard being one contiguous key range. It is now
+measured rather than assumed, and the measurement is the argument for it.
+
+**3. The global unique index is the write bottleneck, and its size is fixed at `init`.** An edge
+write goes to its page's host, so pass B spreads over all 43. A `createUnique` writes through the
+*index* vshard its title hashes to, and there are **four** in the database, so every page in pass A
+funnels through four Durable Objects — reserve, then confirm, two writes each. At pass B's
+concurrency that queued hundreds deep on each and the platform refused with `Durable Object is
+overloaded`. Pass A now runs at its own much lower concurrency and reports 0 retries.
+
+The part that matters beyond the pilot: `indexVshards` is read once, when the directory first opens,
+and cannot be raised afterwards. Four is enough for 10,000 pages at a throttled rate and is not a
+number to carry into a 66.5-million-page load, where the title index is both the only entry point and
+the narrowest part of the write path. **It belongs in the pre-load decision beside `HLEKK_VSHARDS`**,
+and there is no import, export or truncate for a deployed Durable Object's SQLite to fix it after the
+fact — only a new `HLEKK_DATABASE` name and a reload.
+
+**4. An empty host Durable Object weighs 45,056 bytes deployed, not the 40,960 it weighs on
+workerd.** Measured across 43 of them with the schema in place and nothing stored. A 10% difference
+that matters twice: the figure below is a ratio counted from this floor, and `wrangler.app.jsonc` set
+`HLEKK_SHED_BYTES` to 45,000 — *below* the real empty size — on the strength of the workerd number,
+so that threshold would shed before a single row existed if that config were ever deployed. It is a
+local harness and 40,960 is right there, but the margin is 56 bytes on one platform and negative on
+the other, which is too thin to leave unsaid. Corrected in place.
+
+**5. Two smaller platform facts, both of which cost real time.** `Date.now()` does not advance during
+synchronous execution on Workers — it is pinned to the last I/O — so `while (Date.now() - started <
+ms) {}` is an infinite loop that terminates only by hitting the CPU limit, whatever the limit is. It
+cannot be used to measure or probe CPU; count iterations instead. And `/admin/where` fans out 86
+calls across 43 hosts, so under ingest load the *directory* itself returns `Durable Object is
+overloaded` — the operator view is unavailable exactly when it would be most wanted. Relatedly,
+`/admin/size` now takes its host list from the directory rather than a count in the query string,
+because a Durable Object is created by being addressed: asking about hosts the directory never made
+brings empty ones into existence and then counts their schema, inflating the thing being measured by
+45 KB a time.
+
+### Throughput, and what it says about the real load
+
+**~5,400 edge writes/s is wrong, and the way it was wrong is the lesson.** That figure came from
+re-running the driver over edges that already existed, which takes the `ON CONFLICT DO UPDATE` path
+with no row insert and no count bump. It is a no-op upsert rate read as an insert rate, and it was
+measured three times before the mistake showed. A rate measured over data that is already loaded is
+not a load rate, and the only defence is to check whether the run reported `already present`.
+
+The honest figures for the ordinary write path, deployed:
+
+| | Rate | Note |
+| --- | --- | --- |
+| Pages, through 4 index vshards | **~280/s** | five DO calls each; throttled to avoid overloading the index |
+| Edges, shuffled across 43 hosts | **~970/s** | ~23/s per host, and it fails at ~2 M — see finding 2 |
+| Edges, grouped per host in key order | **~6,300/s** | ~570/s on a single host, a 25x per-host gain |
+| Edges, in process with no network | ~76,000/s | the figure above, for comparison |
+
+**What that says about enwiki is the useful part.** At ~6,300 writes/s, 3.5 billion edges is **~6,400
+hours**. Even granting a perfect spread and no skew, the ordinary write path cannot load this dataset
+— not because it is slow but because it is the wrong primitive, one durable commit per edge. This is
+the measurement behind *What the loader owes*: the chunked snapshot is not an optimization to get to
+later, it is the only way the load happens at all. A pilot that had merely succeeded would not have
+said so.
+
+### The storage multiplier, which was the open question
+
+**43 host DOs weigh 45,056 bytes each empty, so 1,937,408 bytes is the floor**, and the data is
+counted from it rather than from whatever a run started with — which is what makes the figure
+readable after a resumed load.
+
+Measured at 2,000 pages and 158,058 edges: **8,556,544 bytes** of data, which is **54.1 bytes per
+edge** against the ~57 this doc costs one at, and **0.85x the payload arithmetic** overall. So the
+multiplier is at the *bottom* of the 1.05x-4.7x range this doc gave, and below 1.0 because the
+arithmetic's ~90 bytes for a page object is generous for rows this small while every row here stays
+well under the threshold that would spill it to an overflow page.
+
+**So `linked_from` stays.** The open question was whether the multiplier would force dropping
+backlinks, halving the database and costing the demo its best query. At 0.85x it does not: ~251 GB of
+arithmetic lands near ~215 GB of storage rather than past 300 GB. That is the question this pilot
+existed to answer, and it is answered on real Durable Object SQLite rather than estimated.
+
+One caveat kept rather than buried: this is a 2,000-page sample whose rows are all small, and
+`databaseSize` moves in 4 KB pages, so it is a floor reading on a small database. The figure to carry
+forward is "at or below 1x", not "0.85".
+
+### The affinity key that ate the cluster
+
+The 10,000-page load did not finish, and why is the most important thing the pilot found.
+
+Edges group onto hosts by their source page, and **the largest host held 2,145,020 of 3,125,310
+edges — 68.2% on one of 43**. With one batch in flight per host that is a sequential straggler and
+the load would have taken another hour.
+
+It is not the allocator's doing. Placement is by affinity key, the import's default key is the page's
+**first category**, and the mass is in the keys:
+
+| Share of edges | Pages | Affinity key |
+| --- | --- | --- |
+| **68.2%** | 2,875 | `cat:217683` — `Category:France_geography_stubs` |
+| 11.4% | 1,001 | `cat:215663` |
+| 1.8% | 224 | `cat:340576` |
+
+2,875 of the 10,000 pages share one key, and one key is one vshard on one host **by design**. Packing
+those keys onto 43 hosts best-first still puts 68.2% on the heaviest, so no placement decision could
+have improved it. simplewiki has thousands of auto-generated French commune articles; they were
+created early so they have low page ids and fall inside the scan window, they interlink densely so
+they dominate a most-linked selection, and they share a stub maintenance category.
+
+**The lesson generalizes past the subset.** This doc already fixed the case where a page has *no*
+category — 48% of them, all landing in one `ns:` key — by falling back to the title hash. It did not
+consider that a category which *is* present can be arbitrarily large. `Category:Living people` on
+enwiki has roughly a million members. So **category affinity does not survive the real load**: it
+would put ~1M pages and their edges on one vshard, past the 9 GB vshard cap and the 10 GB per-object
+limit, and no amount of rebalancing fixes it because a vshard is the unit that moves.
+
+That makes the demo doc's *affinity is a knob* beat sharper than it was written. The knob does not
+just trade locality against spread; past a point it produces a key no topology can hold. What a
+loader needs is a **bounded** key: cap a key's membership and spill the remainder to the title hash,
+or compose the category with a hash bucket. Which is a decision for the real load, now with a
+measurement behind it instead of an intuition.
+
 ## What it costs
 
 | Component | Rows | Each | Total |
@@ -423,7 +611,8 @@ hold. Two findings worth keeping, both design gaps rather than loading problems:
 
 ## Open
 
-- [ ] The storage multiplier, from a pilot's `databaseSize`. It decides whether `linked_from` stays.
+- [x] The storage multiplier: **at or below 1x**, measured at 0.85x and 54.1 bytes/edge on a
+      deployed pilot. `linked_from` stays. See *The storage multiplier, which was the open question*.
 - [ ] Per-index normalization, so a case-sensitive title index and a case-insensitive email index can
       coexist. `titleKey` is the stopgap and says so.
 - [ ] Extending `invariants.ts` to check the four unpaired edge types agree as if they were pairs,
@@ -432,6 +621,15 @@ hold. Two findings worth keeping, both design gaps rather than loading problems:
 - [ ] Whether the 100 KB SQL statement limit is per statement or per `exec` string.
 - [ ] Which affinity functions the demo compares, given the import takes it as a parameter. Note
       that 48% of simplewiki pages have no category, so `category` is half a fallback to `namespace`.
+      And now a harder constraint than a comparison: **raw first-category affinity is not usable at
+      scale at all**, because one key took 68.2% of a 10,000-page subset's edges and
+      `Category:Living people` would take ~1M pages on enwiki. A bounded key — a membership cap
+      spilling to the title hash, or a category composed with a hash bucket — is the thing to compare
+      `hash` against. See *The affinity key that ate the cluster*.
+- [ ] How many index vshards the real load needs. Four funnelled every title insert through four
+      Durable Objects and the platform refused with `Durable Object is overloaded`; `indexVshards` is
+      fixed when the directory first opens and there is no truncate to undo it. It belongs in the
+      pre-load decision beside `HLEKK_VSHARDS`.
 - [x] `records()` is a generator, with `writeRecords` spilling to a file only on request. A page's
       edges split into continuation records at 50,000 so a high-degree page does not materialize its
       whole list; folding them back reproduces the unsplit records exactly, and streaming 22.3 M

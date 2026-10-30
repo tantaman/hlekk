@@ -31,8 +31,9 @@ import {
   pageLinks,
   titleKey,
 } from "../src/worker/wiki.ts";
-// The import side, as a generator. This is the seam being exercised.
-import { records } from "./import-enwiki.mjs";
+// The subset selection, shared with the deployed ingest so the two runs load the same pages.
+import { selectSubset } from "./wiki-subset.ts";
+import type { Rec } from "./wiki-subset.ts";
 
 const args = new Map<string, string>();
 for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i].replace(/^--/, ""), process.argv[i + 1]);
@@ -58,43 +59,11 @@ const ATYPE = {
 
 // ---- read the records the import emits
 
-interface Rec {
-  key: string;
-  affinity: string;
-  fields: { ns: number; title: string; redirect: boolean; len: number };
-  edges: { type: string; to: string; time?: number }[];
-}
-
-// Scanned, then narrowed to the most-linked pages. A subset of the first N page ids keeps almost no
-// edges — measured at 1.2% for 400 pages — because pages link across the whole wiki. Hub pages
-// interlink densely, so the same N of them keeps far more of its edges, and they are the data the
-// demo is actually about.
-const scanned = new Map<string, Rec>();
-const WINDOW = Number(args.get("window") ?? Math.min(200_000, PAGES * 40));
-for await (const r of records({ work: WORK, maxEdges: 100_000 })) {
-  const rec = r as Rec;
-  const held = scanned.get(rec.key);
-  if (held) held.edges.push(...rec.edges); // a continuation record
-  else {
-    if (scanned.size >= WINDOW) break;
-    scanned.set(rec.key, { ...rec, edges: [...rec.edges] });
-  }
-}
-const indegree = (rec: Rec) => rec.edges.reduce((n, e) => n + (e.type === linkedFrom.name ? 1 : 0), 0);
-const subset = new Map(
-  [...scanned.entries()].sort((a, b) => indegree(b[1]) - indegree(a[1])).slice(0, PAGES),
-);
-scanned.clear();
-// Only edges whose target is also in the subset can be written, since the other end has no id. Both
-// directions are filtered by the same rule, so the two stay symmetric.
-let kept = 0;
-let dropped = 0;
-for (const rec of subset.values()) {
-  const inside = rec.edges.filter((e) => subset.has(e.to));
-  dropped += rec.edges.length - inside.length;
-  kept += inside.length;
-  rec.edges = inside;
-}
+const { subset, kept, dropped } = await selectSubset({
+  work: WORK,
+  pages: PAGES,
+  window: args.has("window") ? Number(args.get("window")) : undefined,
+});
 log(
   `${subset.size.toLocaleString()} pages, ${kept.toLocaleString()} edges inside the subset, ` +
     `${dropped.toLocaleString()} pointing outside it (${((dropped / (kept + dropped)) * 100).toFixed(1)}%)`,

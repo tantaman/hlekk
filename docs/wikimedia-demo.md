@@ -205,6 +205,25 @@ filter makes the static product loose, and the scan cap is its own piece of work
 None of this blocks the Wikipedia UI, whose queries are fixed and written by us. It all blocks the
 editor.
 
+**Built, and two of the three holes are now unrepresentable rather than guarded.** `src/worker/wiki-query.ts`
+takes a *nested description* of a query instead of a `Plan`, which settles the open question below in
+the direction that removes the holes. A hop holds its children, so there is no frame index for an
+author to get wrong (hole 3), and no way to name an ancestor and make a cycle (hole 2) — and
+`Query.compile()` reserves a frame before emitting its children, so every child index is strictly
+greater than its parent's, which is a proof rather than a sample. The tests assert that property of
+the compiled plan instead of asserting that a cycle was caught.
+
+Hole 1 is the one that needs the arithmetic, and it is the static guard this doc specified: multiply
+the limits down each root-to-leaf path, sum what every node materializes, refuse past a budget. The
+numbers are stated in one place and served to the client, so the editor prices a query as it is typed
+and shows the same figure the server would refuse it with. The demo doc's own case — depth 4 at limit
+100 — is refused as *101,010,101 answer nodes* before any I/O. 20 tests cover it.
+
+**What is still true and unfixed:** a selective filter walks its whole edge list, so `where` on a
+high-degree page reads the whole list — `len > 20000` over `Country` took 1,393 ms and 12 host
+requests on the pilot. `maxLimit` is not a bound on that, and *A scan cap per query, returning a
+cursor* is still not built.
+
 ## Not needed for this
 
 Moves, the placement controller, rebalancing, outbox delivery, epoch transitions, the `changes` log,
@@ -214,9 +233,23 @@ demo later wants it.
 ## Sequence
 
 1. ~~Plumb `N`, prove the query plane at 50 hosts with trivial data.~~ Done, d763a4f.
-2. **Chunked ingest.** The real primitive, and independent of the dump's schema. Also the move fix.
-3. **The loader**, against the import branch's emitted shape. Prove at ~3 GB, then scale.
-4. **The demo query surface** — title lookup, then a page view with links, backlinks and counts.
+2. ~~Prove the whole path on a real deployment at low scale.~~ Done. Not in the original list, and it
+   belonged there: `npm run ingest:deployed` against `wrangler.wiki.jsonc` runs this demo's schema,
+   record shape, title entry point and page card over 43 real host Durable Objects, real KV and real
+   RPC, 9/9. It found two bugs that every local test passed and two constraints that change steps 2
+   and 3, which is the entire argument for doing it before them rather than after. See
+   [`wikimedia-import.md`](wikimedia-import.md#the-same-ingest-deployed-which-also-works).
+3. **Chunked ingest.** The real primitive, and independent of the dump's schema. Also the move fix.
+   **Now load-bearing rather than preferable:** the ordinary write path is measured at ~6,300 edge
+   writes/s deployed, which is ~6,400 hours for enwiki's 3.5 billion edges. It is one durable commit
+   per edge, so it is the wrong primitive rather than a slow one.
+4. **The loader**, against the import branch's emitted shape. Prove at ~3 GB, then scale. Two things
+   it must do that this doc did not know to ask for: **batch per host in key order** (shuffled
+   inserts fell to ~23 writes/s per host as the tables grew and the platform eventually refused the
+   writes outright), and **use a bounded affinity key** (raw first-category put 68.2% of a subset's
+   edges on one host, and no placement could have spread it).
+5. ~~The demo query surface~~ — title lookup, then a page view with links, backlinks and counts.
+   Done, served at `/` from the Worker, plus paging through every relation and a query editor.
 
 ## Costs to know before step 3
 
@@ -241,8 +274,10 @@ demo later wants it.
       sort cheaply on their join keys.
 - [ ] Whether the demo needs any read the unique-index entry point cannot reach — which would mean
       the deferred non-unique global index, and is the one thing here that is real added scope.
-- [ ] The query editor's limits policy: maximum depth, maximum limit per frame, and the budget a
-      path's product of limits may not exceed. The mechanism is cheap; the numbers are a judgement
-      about what a stranger may spend.
-- [ ] Whether the editor accepts a `Plan` directly or only a builder-produced query. Accepting plans
-      is what puts the validator on the critical path.
+- [x] The query editor's limits policy, as a first set of numbers in `wiki-query.ts`: depth 4, limit
+      100 per hop, 16 frames, **20,000 materialized answer nodes**, 4 filters and 4 counts per hop.
+      Served to the client so an author sees the budget being spent. Still a judgement rather than a
+      derivation.
+- [x] Whether the editor accepts a `Plan` directly or only a builder-produced query: **only a
+      builder-produced query**, which is what makes the cycle and the dangling frame index
+      unrepresentable instead of guarded.

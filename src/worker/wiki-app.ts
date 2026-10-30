@@ -1,0 +1,432 @@
+// The Wikimedia demo on real Cloudflare: a Worker over the wiki catalog spread across many host
+// Durable Objects, with the ingest endpoints a driver feeds it through.
+//
+// WHAT THIS IS FOR. `scripts/ingest-local.ts` proved the schema, the record shape and the title
+// entry point against a LocalCluster — one process, real SQLite, no network. Everything below the
+// client was the same code a deployment runs, but the transport was not, so what it could not say
+// anything about is exactly what this says something about: DO RPC, the published map in real KV,
+// routing across tens of real Durable Objects, and the one number docs/wikimedia-import.md calls
+// the only figure worth planning on — `databaseSize` after a pilot load.
+//
+// WHAT THIS IS NOT. Still not the loader wikimedia-demo.md asks for. The ingest routes write one
+// mutation per row through the ordinary client, so the chunked snapshot remains untouched and
+// nothing here is a throughput claim for 300 GB. What they add over the local script is that every
+// one of those mutations now crosses a real RPC boundary to a real Durable Object.
+//
+// Ingest is two passes over HTTP, for the reason the demo doc gives: ids must exist before edges can
+// reference them. The driver keeps the `page_id -> hlekk id` map between them, which is also what
+// keeps this Worker stateless.
+
+import { Hlekk } from "../client/client.ts";
+import { ValueTaken } from "../client/client.ts";
+import { vshardOf } from "../host/ids.ts";
+import type { Id, Json } from "../query/types.ts";
+import { databaseOf, directoryStub, hostStub } from "../do/bindings.ts";
+import type { Env } from "../do/bindings.ts";
+import { call } from "../do/rpc.ts";
+import { cloudflareTransport } from "../do/transport.ts";
+import { WIKI_UI } from "./wiki-ui.ts";
+import { QueryRefused, build as buildQuery, check as checkQuery, price as priceQuery, schemaView } from "./wiki-query.ts";
+import type { QuerySpec } from "./wiki-query.ts";
+import {
+  LOCK,
+  Page,
+  TITLE_IDX,
+  categoryPages,
+  linkedFrom,
+  pageCategories,
+  pageLinks,
+  titleKey,
+} from "./wiki.ts";
+
+export { HlekkHostDO } from "../do/host.ts";
+export { HlekkDirectoryDO } from "../do/directory.ts";
+
+const json = (body: unknown, status = 200): Response =>
+  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+/** The edge types by the name the import emits, which is the only vocabulary the driver has. An
+ *  unknown name is a mismatch between the two sides and is refused rather than skipped. */
+const ATYPE: Record<string, number> = {
+  [pageLinks.name]: pageLinks.atype,
+  [linkedFrom.name]: linkedFrom.atype,
+  [pageCategories.name]: pageCategories.atype,
+  [categoryPages.name]: categoryPages.atype,
+};
+
+/** The relations `/relation` will page through, by schema name. Separate from ATYPE because paging
+ *  needs the typed edge rather than its integer. */
+const RELATION: Record<string, typeof pageLinks> = {
+  [pageLinks.name]: pageLinks,
+  [linkedFrom.name]: linkedFrom,
+  [pageCategories.name]: pageCategories,
+  [categoryPages.name]: categoryPages,
+};
+
+/** A page as the import emits it, with its edges stripped off by the driver. */
+interface PageIn {
+  key: string;
+  affinity: string;
+  fields: { ns: number; title: string; redirect: boolean; len: number; extract?: string };
+}
+
+/** An edge with both ends already resolved to hlekk ids: `[type, from, to, time]`. A tuple rather
+ *  than an object because at 46.9 bytes per edge in JSON the field names are most of the payload. */
+type EdgeIn = [string, Id, Id, number];
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const db = Hlekk.from(cloudflareTransport(env));
+    const directory = directoryStub(env);
+    const body = async <T>(): Promise<T> => (await request.json()) as T;
+    const num = (k: string, fallback: number) => Number(url.searchParams.get(k) ?? fallback);
+
+    try {
+      // ---- the demo you can look at
+
+      /** The page view. Served from the Worker as one document so the demo has nothing to build and
+       *  no asset host to depend on; it calls the same `/page` route the ingest driver checks. */
+      if (path === "/" || path === "/wiki") {
+        return new Response(WIKI_UI, {
+          headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" },
+        });
+      }
+
+      // ---- operating it
+
+      if (path === "/health") {
+        return json({ ok: true, database: databaseOf(env), vshards: env.HLEKK_VSHARDS ?? null });
+      }
+
+      /** Lays the database out. Once: `init` refuses a second call, because re-spreading vshards
+       *  whose rows have already been adopted would point them at hosts that do not hold them. */
+      if (path === "/admin/init") {
+        return json(await call(directory, "init", LOCK, num("hosts", 50), num("indexVshards", 4)));
+      }
+      if (path === "/admin/where") return json(await call(directory, "where"));
+
+      /** Every host's `databaseSize`, which is the storage multiplier the import doc leaves open.
+       *  Summing payload lengths undercounts real storage by 1.05x to 4.7x, and this is the figure
+       *  that settles which.
+       *
+       *  The hosts come from the directory rather than from a count in the query string. A Durable
+       *  Object is created by being addressed, so asking about a host the directory never created
+       *  brings an empty one into existence and then counts its schema -- a measurement that
+       *  inflates the thing it measures, by 45 KB a time. */
+      if (path === "/admin/size") {
+        const known = await call<{ hosts: { host: number }[] }>(directory, "where");
+        const hosts = known.hosts.map((h) => h.host);
+        const sizes = await pooled(hosts, 16, (h) => call<number>(hostStub(env, h), "size"));
+        const bytes = sizes.map((s) => (s instanceof Error ? -1 : s));
+        const total = bytes.filter((b) => b >= 0).reduce((n, b) => n + b, 0);
+        return json({
+          hosts: bytes.length,
+          total,
+          nonEmpty: bytes.filter((b) => b > 0).length,
+          errors: sizes.filter((s) => s instanceof Error).length,
+          of: hosts,
+          bytes,
+        });
+      }
+
+      /** Burns a counted amount of CPU on purpose. The Workers free plan allows 10 ms per
+       *  invocation and the paid plan 30 seconds, so a request that asks for a second of
+       *  arithmetic and gets an answer has established which plan this account is on — which
+       *  decides whether a 50-host fan-out is possible at all, and has to be known *before*
+       *  `/admin/init`, since init is once-only and a half-completed layout cannot be retried.
+       *
+       *  Counted iterations, not a deadline. `Date.now()` does not advance during synchronous
+       *  execution on Workers — it is pinned to the last I/O — so `while (Date.now() - started <
+       *  ms)` is an infinite loop that terminates only by hitting the CPU limit, whatever the
+       *  limit is. It tells you nothing about which plan you are on. */
+      if (path === "/admin/cpu") {
+        const mops = num("mops", 1);
+        let spins = 0;
+        for (let m = 0; m < mops; m++) for (let i = 0; i < 1_000_000; i++) spins += i & 7;
+        return json({ mops, spins });
+      }
+
+      // ---- ingest, pass A: the pages, each through the global unique index on title
+
+      if (path === "/ingest/pages" && request.method === "POST") {
+        const { pages, concurrency = 16 } = await body<{ pages: PageIn[]; concurrency?: number }>();
+        const started = Date.now();
+        const results = await pooled(pages, concurrency, async (p) => {
+          const key = titleKey(p.fields.ns, p.fields.title);
+          try {
+            return { id: await db.createUnique(TITLE_IDX, key, Page.otype, { ...p.fields }, { affinity: p.affinity }) };
+          } catch (e) {
+            // A retried batch finds its own earlier writes. Resumability matters more than
+            // throughput here — wikimedia-demo.md says so about the real loader — so a title that
+            // is already taken resolves to the id holding it instead of failing the run.
+            if (e instanceof ValueTaken || (e as Error).name === "ValueTaken") {
+              const held = await db.lookupUnique(TITLE_IDX, key);
+              if (held !== null) return { id: held, existed: true };
+            }
+            throw e;
+          }
+        });
+
+        const ids: Record<string, Id> = {};
+        let existed = 0;
+        // Every failed key, not a sample of them. A caller can only retry what it is told about,
+        // and `Durable Object is overloaded` is transient — the index vshards are few and every
+        // title insert writes through one, so under load they queue. Truncating this list to a
+        // sample is what turns a retryable batch into a failed load.
+        const failedKeys: string[] = [];
+        const failures: { key: string; error: string }[] = [];
+        results.forEach((r, i) => {
+          if (r instanceof Error) {
+            failedKeys.push(pages[i].key);
+            if (failures.length < 5) failures.push({ key: pages[i].key, error: `${r.name}: ${r.message}` });
+          } else {
+            ids[pages[i].key] = r.id;
+            if (r.existed) existed++;
+          }
+        });
+        return json({ ids, existed, failed: failedKeys.length, failedKeys, failures, ms: Date.now() - started });
+      }
+
+      // ---- ingest, pass B: both directions of both relations, as the import emitted them
+
+      if (path === "/ingest/edges" && request.method === "POST") {
+        const { edges, concurrency = 16 } = await body<{ edges: EdgeIn[]; concurrency?: number }>();
+        const started = Date.now();
+        const unknown = [...new Set(edges.map((e) => e[0]))].filter((t) => ATYPE[t] === undefined);
+        if (unknown.length > 0) return json({ error: `unknown edge types: ${unknown.join(", ")}` }, 400);
+
+        const results = await pooled(edges, concurrency, ([type, from, to, time]) =>
+          db.assocAdd(ATYPE[type]!, from, to, time),
+        );
+        // Positions, so the caller retries exactly the edges that failed. An edge write is an
+        // upsert whose count is bumped only when the edge is new, so a retry cannot double-count.
+        const failed: number[] = [];
+        const failures: { edge: EdgeIn; error: string }[] = [];
+        results.forEach((r, i) => {
+          if (r instanceof Error) {
+            failed.push(i);
+            if (failures.length < 5) failures.push({ edge: edges[i], error: `${r.name}: ${r.message}` });
+          }
+        });
+        return json({
+          written: edges.length - failed.length,
+          failed: failed.length,
+          failedIndexes: failed,
+          failures,
+          ms: Date.now() - started,
+        });
+      }
+
+      // ---- the demo's read surface
+
+      /** Title lookup alone, for checking that every page can be entered by `(ns, title)` without
+       *  paying for a card to find out. Several titles per call, since the question is asked of a
+       *  sample rather than of one page. */
+      if (path === "/lookup") {
+        const titles = (url.searchParams.get("titles") ?? "").split("|").filter(Boolean);
+        const ns = num("ns", 0);
+        const found = await pooled(titles, 8, (t) => {
+          // `ns:title`, so a sample can span namespaces in one call. Titles hold no `:` in
+          // MediaWiki's `page_title` form; a namespace prefix is a separate column.
+          const at = t.indexOf(":");
+          const [n, title] = at < 0 ? [ns, t] : [Number(t.slice(0, at)), t.slice(at + 1)];
+          return db.lookupUnique(TITLE_IDX, titleKey(n, title));
+        });
+        return json({
+          ids: Object.fromEntries(titles.map((t, i) => [t, found[i] instanceof Error ? null : found[i]])),
+          errors: found.filter((f) => f instanceof Error).length,
+        });
+      }
+
+      /** Title lookup, then the page card. The only way in: there is no scan and no non-unique
+       *  index, and for a wiki that is a fit rather than a compromise. */
+      if (path === "/page") {
+        const ns = num("ns", 0);
+        const title = url.searchParams.get("title") ?? "";
+        const limit = num("limit", 25);
+        const lookupStarted = Date.now();
+        const id = await db.lookupUnique(TITLE_IDX, titleKey(ns, title));
+        const lookupMs = Date.now() - lookupStarted;
+        if (id === null) return json({ found: false, ns, title, lookupMs }, 404);
+
+        const stats = { rounds: 0, requests: 0 };
+        const started = Date.now();
+        const rows = await Page.gen(id)
+          .countAs("linkCount", pageLinks)
+          .countAs("backlinkCount", linkedFrom)
+          .countAs("categoryCount", pageCategories)
+          .countAs("memberCount", categoryPages)
+          .related("links", pageLinks, (q) => q.limit(limit))
+          .related("categories", pageCategories, (q) => q.limit(limit))
+          .run(db, { driver: url.searchParams.get("driver") === "rounds" ? "rounds" : "async", stats });
+        const ms = Date.now() - started;
+
+        // Which hosts the answer was assembled from. Not something an application would ask; it is
+        // the claim the demo exists to make.
+        const ids = idsIn(rows as unknown as Json);
+        await db.routes.routeAll([...new Set(ids.map(vshardOf))]);
+        const hosts = [...new Set(ids.map((i) => db.routes.peek(vshardOf(i))?.host))].filter((h) => h !== undefined);
+        return json({
+          found: true,
+          id,
+          page: rows[0] ?? null,
+          read: { ...stats, ms, lookupMs, objects: ids.length, hosts: hosts.sort((a, b) => a - b) },
+        });
+      }
+
+      /** One relation of one page, as a page of rows with a cursor to continue from.
+       *
+       *  `/page` reads a fixed card; this is how the rest of a list is read. A hub page here has
+       *  thousands of backlinks, so "show more" is the only way to see the whole detail of a page,
+       *  and `relatedPage` is what carries the cursor — only the gathered graph knows whether a list
+       *  was exhausted, since the rows handed back are the ones that fit a limit. */
+      if (path === "/relation") {
+        const id = url.searchParams.get("id") ?? "";
+        const name = url.searchParams.get("edge") ?? "";
+        const edge = RELATION[name];
+        if (!edge) return json({ error: `no edge "${name}"; have ${Object.keys(RELATION).join(", ")}` }, 400);
+        const limit = Math.max(1, Math.min(100, num("limit", 50)));
+        const after = url.searchParams.get("after");
+        const stats = { rounds: 0, requests: 0 };
+        const started = Date.now();
+        const rows = (await Page.gen(id)
+          .relatedPage("items", edge, (q) => (after ? q.limit(limit).after(after) : q.limit(limit)))
+          .run(db, { stats })) as unknown as { items: { items: { id: Id; title: string; ns: number }[]; cursor: string | null; more: boolean } }[];
+        const page = rows[0]?.items ?? { items: [], cursor: null, more: false };
+        const ids = page.items.map((i) => i.id);
+        await db.routes.routeAll([...new Set(ids.map(vshardOf))]);
+        const hosts = [...new Set(ids.map((i) => db.routes.peek(vshardOf(i))?.host))].filter((h) => h !== undefined);
+        return json({
+          ...page,
+          read: { ...stats, ms: Date.now() - started, hosts: hosts.sort((a, b) => a - b) },
+        });
+      }
+
+      // ---- the query editor
+      //
+      // A different exposure from the page view, and treated as one: see wiki-query.ts for the three
+      // holes a typed plan can reach in the engine and which of them are guarded versus made
+      // unrepresentable. The editor submits a nested description, never a Plan.
+
+      /** What the editor autocompletes from, and the budget it prices against. The same values the
+       *  guard uses, so an author is never shown a limit the server does not apply. */
+      if (path === "/schema") return json(schemaView());
+
+      /** The cost of a query without running it, so an editor can price what is being typed —
+       *  including something over budget, which `check` refuses but an author still wants to see. */
+      if (path === "/price" && request.method === "POST") {
+        return json(priceQuery(await body<QuerySpec>()));
+      }
+
+      /** Runs an authored query. Checked before any I/O, then entered by title like every other read
+       *  here, then compiled through the typed builder. */
+      if (path === "/query" && request.method === "POST") {
+        const spec = await body<QuerySpec>();
+        let cost;
+        try {
+          cost = checkQuery(spec);
+        } catch (e) {
+          if (e instanceof QueryRefused) return json({ refused: e.message, at: e.at }, 400);
+          throw e;
+        }
+        const id = await db.lookupUnique(TITLE_IDX, titleKey(spec.from.ns, spec.from.title));
+        if (id === null) {
+          return json({ refused: `no page "${spec.from.title}" in namespace ${spec.from.ns}`, at: "from" }, 404);
+        }
+        const stats = { rounds: 0, requests: 0 };
+        const started = Date.now();
+        const rows = await buildQuery(spec, id).run(db, {
+          driver: url.searchParams.get("driver") === "rounds" ? "rounds" : "async",
+          stats,
+        });
+        const ms = Date.now() - started;
+        const ids = idsIn(rows as unknown as Json);
+        await db.routes.routeAll([...new Set(ids.map(vshardOf))]);
+        const hosts = [...new Set(ids.map((i) => db.routes.peek(vshardOf(i))?.host))].filter((h) => h !== undefined);
+        return json({
+          rows,
+          cost,
+          read: { ...stats, ms, objects: ids.length, hosts: hosts.sort((a, b) => a - b) },
+        });
+      }
+
+      /** The four maintained counts for one id, which is the exact-count oracle's question. A
+       *  counter rather than a `COUNT(*)`, which is what makes a 5,000-backlink page cheap. */
+      if (path === "/counts") {
+        const ids = (url.searchParams.get("ids") ?? "").split(",").filter(Boolean);
+        const rows = await pooled(ids, 8, async (id) => {
+          const [row] = (await Page.gen(id)
+            .countAs("links", pageLinks)
+            .countAs("backlinks", linkedFrom)
+            .countAs("cats", pageCategories)
+            .countAs("members", categoryPages)
+            .run(db)) as unknown as Record<string, number>[];
+          return row;
+        });
+        return json({
+          counts: Object.fromEntries(
+            ids.map((id, i) => [id, rows[i] instanceof Error ? { error: String(rows[i]) } : rows[i]]),
+          ),
+        });
+      }
+
+      /** Where a set of ids actually lives, so a spread can be checked from outside. */
+      if (path === "/admin/route") {
+        const ids = (url.searchParams.get("ids") ?? "").split(",").filter(Boolean);
+        await db.routes.routeAll([...new Set(ids.map(vshardOf))]);
+        return json({
+          hosts: Object.fromEntries(ids.map((id) => [id, db.routes.peek(vshardOf(id))?.host ?? null])),
+        });
+      }
+
+      return json({ error: `no route for ${request.method} ${path}` }, 404);
+    } catch (e) {
+      const error = e instanceof Error ? e : new Error(String(e));
+      return json({ error: error.message, name: error.name }, 500);
+    }
+  },
+};
+
+/**
+ * Runs `f` over `items` with at most `limit` in flight, keeping each result in its item's place and
+ * returning a rejection as a value rather than losing the rest of the batch to it.
+ *
+ * Bounded rather than `Promise.all`: a batch is sized for the subrequest budget, not for how many
+ * sockets a Worker will open at once, and a thousand simultaneous DO calls would queue anyway.
+ */
+async function pooled<T, R>(
+  items: readonly T[],
+  limit: number,
+  f: (item: T, index: number) => Promise<R>,
+): Promise<(R | Error)[]> {
+  const out = new Array<R | Error>(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+      for (;;) {
+        const i = next++;
+        if (i >= items.length) return;
+        try {
+          out[i] = await f(items[i], i);
+        } catch (e) {
+          out[i] = e instanceof Error ? e : new Error(String(e));
+        }
+      }
+    }),
+  );
+  return out;
+}
+
+/** Every id in an answer, so the demo can say which hosts it was assembled from. */
+function idsIn(value: Json): Id[] {
+  if (Array.isArray(value)) return value.flatMap(idsIn);
+  if (value === null || typeof value !== "object") return [];
+  const out: Id[] = [];
+  for (const [k, v] of Object.entries(value)) {
+    if (k === "id" && typeof v === "string") out.push(v);
+    else out.push(...idsIn(v));
+  }
+  return out;
+}

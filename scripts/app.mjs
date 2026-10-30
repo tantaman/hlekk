@@ -90,6 +90,7 @@ try {
   );
 
   // ---- an application that names no host
+  const publishedAfterInit = (await hit("/admin/where")).publishes;
   const alice = (await hit("/users", { name: "alice" })).id;
   const bob = (await hit("/users", { name: "bob" })).id;
   const issues = [];
@@ -111,6 +112,20 @@ try {
     "writes land without the caller naming a host",
     issues.length === 12 && comments.length === 48,
     `${issues.length} issues, ${comments.length} comments, 2 users`,
+  );
+
+  // The shard map is published when routes change, not when objects are created. 38 of the writes
+  // above go through `place`, and `place` used to publish on every one of them: the guard meant to
+  // say "only if the allocator opened something" tested a list that had already been spliced empty,
+  // so it was always true. Classic KV allows one write per second per key, so that is a 429 and a
+  // failed load on a real deployment -- which is where it was found, because local KV rate limits
+  // nothing and every local run passed. A route genuinely opening is rare, hence the small margin
+  // rather than zero.
+  const publishedAfterWrites = (await hit("/admin/where")).publishes;
+  check(
+    "creating objects does not republish the map",
+    publishedAfterWrites - publishedAfterInit <= 2,
+    `${publishedAfterWrites - publishedAfterInit} publish(es) for 62 objects, 38 of them placed`,
   );
 
   // ---- the data really is spread
