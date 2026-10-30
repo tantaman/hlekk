@@ -142,6 +142,54 @@ is one round trip or fifty, and here it is mattering." It argues for a **configu
 function in the loader**, so the database can be loaded twice and compared, rather than the knob being
 discovered after 300 GB is in place.
 
+## The query editor is a different risk surface
+
+A fixed page view and a box a stranger types a query into are not the same exposure, and the engine
+is ready for the first but not the second. Measured against a 60-page graph on 8 hosts, with plans
+submitted directly rather than built through the typed builder.
+
+**What is already safe.** A limit of 10,000 over a 400-row list is clamped by the list: 8 requests,
+121 nodes. A filter matching nothing returns one node and reads its list once. A negative limit
+yields nothing. A predicate on a field that does not exist matches nothing rather than throwing. And
+`MAX_ROUNDS` catches a query that will not converge. `MIN_RATE`, `MAX_AHEAD` and `MAX_PAGE` do their
+job per step.
+
+**What is not.** Three holes, all reachable from a plan a user can type:
+
+| Plan | Reads | Answer | Outcome |
+| --- | --- | --- | --- |
+| chain depth 10, limit 3 | 32 reqs, 58 objects | 177,145 nodes | 0.9 s |
+| chain depth 12, limit 3 | 32 reqs, 58 objects | 1,594,321 nodes | **16.5 s** |
+| chain depth 14, limit 3 | 32 reqs, 58 objects | — | **OOM** |
+| `f1 → f2 → f1` through edge frames | — | — | **never returns, OOM** |
+| child naming a frame that does not exist | — | — | raw `TypeError` |
+
+1. **The answer is exponential in depth, and no budget sees it.** A chain of `related` levels
+   materializes the product of its limits — 3^depth — so depth 14 at limit 3 exhausts the heap. The
+   decisive detail is the columns that *don't* move: **storage reads stay flat at 58 objects and 32
+   requests across all three rows.** The coordinator re-walks the same 60 pages along every path. So
+   a budget on reads, requests, rounds or objects would never fire, and those are the budgets one
+   reaches for first. **The guard has to count materialized answer nodes.**
+2. **Frame cycles do not terminate.** A cycle through two edge frames recurses until the heap is
+   gone. A cycle through an `ids` frame *is* self-limiting, because `ObjectsById` yields nothing
+   without explicit ids — which is exactly why a casual test of "what if a frame points at itself"
+   comes back clean and proves nothing.
+3. **A dangling child frame index** is an unvalidated read of `plan.frames[i]`.
+
+**And one that is bounded here but not at Wikimedia scale.** A selective filter walks its whole edge
+list — 60 rows and 8 requests in the probe, but the entire list on a page with a million backlinks.
+[`design.md`](design.md#filtered-limits-across-hosts) already names this: *"A scan cap per query,
+returning a cursor, is not built yet."* High-degree pages make it live rather than theoretical.
+
+**The cheap guard is static.** Multiply the limits along each root-to-leaf path through the frame
+graph; reject the plan if the product exceeds a budget. That catches the explosion before any I/O,
+costs nothing, and falls out of the same walk that has to check the graph is a DAG and that every
+child index exists. A runtime cap on materialized nodes is still worth having behind it, because a
+filter makes the static product loose, and the scan cap is its own piece of work.
+
+None of this blocks the Wikipedia UI, whose queries are fixed and written by us. It all blocks the
+editor.
+
 ## Not needed for this
 
 Moves, the placement controller, rebalancing, outbox delivery, epoch transitions, the `changes` log,
@@ -170,3 +218,8 @@ demo later wants it.
 - [ ] Whether the loader is one pass with buffered references or two passes over the dump.
 - [ ] Whether the demo needs any read the unique-index entry point cannot reach — which would mean
       the deferred non-unique global index, and is the one thing here that is real added scope.
+- [ ] The query editor's limits policy: maximum depth, maximum limit per frame, and the budget a
+      path's product of limits may not exceed. The mechanism is cheap; the numbers are a judgement
+      about what a stranger may spend.
+- [ ] Whether the editor accepts a `Plan` directly or only a builder-produced query. Accepting plans
+      is what puts the validator on the critical path.
