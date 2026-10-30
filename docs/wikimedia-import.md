@@ -261,6 +261,54 @@ relation.** Nothing fails when they differ; matches are just missed.
 
 The fix moved link resolution from 17,257,881 to 19,163,989 and memberships from 0 to 2,244,809.
 
+## A low-scale ingest, which works
+
+`npm run ingest:local` — `scripts/ingest-local.ts`. A `LocalCluster`: the directory, the hosts, the
+allocator and the query plane in one process over real SQLite, fed real records from the import
+generator. It is **not** the loader `wikimedia-demo.md` asks for and says nothing about scale — it
+writes one mutation per row through the ordinary client, and the chunked snapshot is untouched. What
+it establishes is that the schema, the record shape and the entry point are right, which is worth
+knowing first and costs a minute.
+
+At 10,000 pages and 3,125,310 edges over 128 vshards and 50 hosts, in 64 seconds, **7/7**:
+
+| Check | Result |
+| --- | --- |
+| Every emitted edge written | 3,125,310 of 3,125,310 |
+| No outbox op needed | 0 queued — nothing is a pair, as intended |
+| Pages spread across hosts | 43 of 50 |
+| Every page findable by `(ns, title)` | 10,000 found, 0 wrong |
+| Maintained counts equal the records' degrees | 25/25 sampled, e.g. `France` 209 links / 3,697 backlinks |
+| A page card reads across hosts | `Stub`: 14 links, **5,861 backlinks**, from 13 hosts in 13 requests |
+| A limit is honoured against the real list | 14 of 14, limit 25 |
+
+The count check is the exact-count oracle this doc promised, at a scale where the right answer is
+derivable from the records. A page with 5,861 backlinks answering from a counter rather than a scan
+is the demo's own claim, met on real data.
+
+**Three things it turned up.**
+
+- **A subset of a link graph keeps very few of its edges**, and this is an artifact of subsetting
+  rather than data loss. The first 400 pages by id keep 1.2% of their edges; the 10,000
+  most-linked keep 33.9%, because hub pages interlink and peripheral ones point outward. So the
+  script selects by in-degree over a scanned window, and no subset figure here should be read as a
+  red-link share — `report.json` has that separately.
+- **A category-less page must not fall back to one affinity key.** `ns:${ns}` was the fallback, and
+  48% of pages have no category, so nearly half the wiki shared one key — which is one vshard on one
+  host. It now falls back to the title hash, which spreads, while pages that do have a category still
+  cluster by it.
+- **Write throughput, with heavy caveats: ~76,000 edge writes/sec** in process, one mutation each
+  through client → directory → host → SQLite. No network, no DO RPC, no per-object request ceiling,
+  so it is an upper bound on the engine rather than a figure for a deployment. It is the first number
+  of its kind this repo has, and build-plan step 1 still owes the real one.
+
+**And one thing it did not explain.** The first run reported pages on 4 of 16 hosts, which failed the
+spread check. It does not reproduce: the same arguments now give 16 of 16. An A/B of the two
+plausible causes — opening index vshards before versus after `scatter` — gives an identical active
+set and an identical spread either way, because `grow()` already places a batch lightest-first. So
+the reorder in the script is tidiness, not the fix, and the original is recorded as unexplained
+rather than given a mechanism it did not have.
+
 ## What it costs
 
 | Component | Rows | Each | Total |
