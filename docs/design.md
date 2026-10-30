@@ -417,6 +417,10 @@ A 40-bit sequence exhausting in four months under a realistic tenant import is w
 - Big-endian bytes sort in unsigned numeric order. One vshard's rows are therefore one contiguous key range.
 - A missed conversion yields an `ArrayBuffer`, which fails loudly, instead of a silently rounded number.
 
+**Two of those four are now historical, and two are load-bearing.** Reserving the sign bit (see Layout) put every id below 2^63, so the first reason — REAL coercion making two distinct ids compare equal — can no longer happen. And because every id is positive, signed integer order equals unsigned order, so the third reason's contiguous key range would hold for an INTEGER column too. What still forbids INTEGER is the second reason, on a different threshold that did not move: `SqlStorageValue` is `ArrayBuffer | string | number | null` with no BigInt, so an INTEGER column read back through `ctx.storage.sql` is a JS number and rounds above **2^53**, where ids run to 2^63−1. The fourth reason then inverts against INTEGER rather than merely being lost: with INTEGER a missed conversion *is* that silent rounding, where a blob fails loudly.
+
+The shape that would let blobs go is `(vshard, seq)` as two INTEGER columns — 65,536 and 2^47 both sit under 2^53, and the pair sorts identically to the packed id, making a vshard `WHERE vshard = ?` rather than a `BETWEEN`. The cost is that `id1` and `id2` each become two columns, widening every edge row and the index that serves `related()`, while the API boundary still packs and unpacks. Recorded as considered, not planned.
+
 ```ts
 const SEQ_BITS = 40n;
 
