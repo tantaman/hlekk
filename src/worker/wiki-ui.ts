@@ -122,6 +122,26 @@ select.hw-input{font-family:var(--font-mono);font-size:13px}
   background:var(--white);border:1px solid var(--line2);border-radius:6px;padding:3px 7px}
 .hw-hosts{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px}
 
+/* ---- the cluster: every host in the database, not only the ones that answered.
+   A count of the hosts that served a read says nothing without the ones that did not -- fourteen
+   reads as impressive or alarming depending on whether the database has fifteen hosts or fifty.
+   So the denominator is drawn and the numerator lit inside it. A held cell is deliberately the
+   same white-on-line2 as .hw-host above; orange, this design's only accent, marks the read. */
+.hw-cluster{display:flex;flex-wrap:wrap;gap:4px;margin-top:11px}
+.hw-cluster .hw-h{width:30px;height:26px;border-radius:6px;border:1px solid var(--line2);
+  background:var(--white);font-family:var(--font-mono);font-size:10.5px;letter-spacing:.02em;
+  color:var(--ink-d);display:flex;align-items:center;justify-content:center;
+  transition:background-color 140ms ease,color 140ms ease}
+.hw-cluster .hw-h.is-lit{background:var(--orange);border-color:var(--orange);color:var(--white)}
+.hw-cluster .hw-h.is-empty{background:transparent;border-style:dashed;color:var(--ink-f);opacity:.6}
+.hw-legend{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:13px;font-family:var(--font-mono);
+  font-size:11px;letter-spacing:.04em;color:var(--ink-d)}
+.hw-legend i{font-style:normal;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.hw-legend b{width:11px;height:11px;border-radius:3px;border:1px solid var(--line2);
+  background:var(--white);flex:none}
+.hw-legend .k-lit{background:var(--orange);border-color:var(--orange)}
+.hw-legend .k-empty{background:transparent;border-style:dashed}
+
 .hw-rel{margin:3.4vh 0 0}
 .hw-rel .hw-sh{margin:0 0 12px}
 .hw-rel .hw-sh em{font-style:normal;text-transform:none;letter-spacing:0;color:var(--ink-d);font-family:var(--font-mono);font-size:11.5px}
@@ -186,6 +206,8 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
   /* Finger-sized: 6px of padding is a comfortable mouse target and a poor thumb one. */
   .hw-mini{padding:9px 13px}
   .hw-chips a{padding:6px 12px}
+  .hw-cluster{gap:3px}
+  .hw-cluster .hw-h{width:26px;height:24px;font-size:10px}
   .qedit{min-height:150px}
   .hw-hero{padding-top:3.4vh}
 }
@@ -203,7 +225,7 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
 <main class="hw-wrap">
   <section id="pane-browse">
     <div class="hw-hero">
-      <p class="hw-ey">read-only · 43 host durable objects</p>
+      <p class="hw-ey" id="ey">read-only · 43 host durable objects</p>
       <h1 class="hw-h1">A Wikipedia mirror spread across many Durable Objects.</h1>
       <p class="hw-lead">One database, laid out over host Durable Objects in advance, entered by title
         and traversed. No single object holds it. Every answer reports which hosts it was assembled
@@ -277,6 +299,51 @@ const stored = (t) => {
 const nf = (n) => Number(n).toLocaleString();
 
 let SCHEMA = null;
+// The host roster: every host in the database, with what it holds. Read once, because it costs a
+// call per host and does not change while the demo is being looked at. If it cannot be had the grid
+// degrades to the chip row it replaced rather than failing the page -- the read's own figures are
+// what matter, and they do not come from here.
+let CLUSTER = null;
+
+async function loadCluster() {
+  try {
+    const d = await fetch("/admin/where").then((r) => r.json());
+    if (!Array.isArray(d.hosts)) return;
+    CLUSTER = { hosts: d.hosts, indexVshards: (d.indexVshards || []).length };
+    // The hero's host count was a literal, written when the pilot had 43. The grid below now draws
+    // the real roster, so a stale number there is a page contradicting itself in two places a
+    // viewer can see at once. Same source for both.
+    const ey = document.getElementById("ey");
+    if (ey) ey.textContent = "read-only · " + d.hosts.length + " host durable objects";
+  } catch (e) { /* the grid is a nicety; a failed roster must not take the page with it */ }
+}
+
+/** Every host in the database, with the ones that served this answer lit.
+ *
+ *  'serving' is the host list the read reported. The point of drawing the others is that "17 hosts"
+ *  means nothing without knowing whether the database has 18 or 50 -- it reads as impressive or
+ *  alarming depending on a number the viewer does not have. Shown this way a narrow read is visibly
+ *  narrow and a wide one visibly wide. */
+function clusterGrid(serving) {
+  const lit = new Set((serving || []).map(Number));
+  // Without a roster, fall back to lighting just what answered: still true, merely less informative.
+  const hosts = CLUSTER ? CLUSTER.hosts : [...lit].sort((a, b) => a - b).map((h) => ({ host: h, objects: 1 }));
+  const held = hosts.filter((h) => h.objects > 0).length;
+  const cells = hosts.map((h) => {
+    // A held cell carries no modifier: it is the base .hw-h, which is this design's own host chip.
+    const cls = lit.has(Number(h.host)) ? "hw-h is-lit" : h.objects > 0 ? "hw-h" : "hw-h is-empty";
+    const title = "host " + h.host + " \u00b7 " + nf(h.objects) + " objects \u00b7 " + nf(h.vshards || 0)
+      + " vshards" + (lit.has(Number(h.host)) ? " \u00b7 served this read" : "");
+    return '<div class="' + cls + '" title="' + esc(title) + '">' + h.host + "</div>";
+  }).join("");
+  const legend = '<div class="hw-legend">'
+    + '<i><b class="k-lit"></b>served this read (' + lit.size + ")</i>"
+    + "<i><b></b>holds data, not read (" + Math.max(0, held - lit.size) + ")</i>"
+    + (CLUSTER ? '<i><b class="k-empty"></b>empty (' + (hosts.length - held) + ")</i>" : "")
+    + (CLUSTER ? "<i>" + hosts.length + " hosts in the database</i>" : "<i>roster unavailable</i>")
+    + "</div>";
+  return legend + '<div class="hw-cluster">' + cells + "</div>";
+}
 
 // ---------------------------------------------------------------- tabs
 
@@ -335,6 +402,18 @@ async function show(title, ns) {
     + '<div class="hw-kv">'
       + kv(p.linkCount, "links out") + kv(p.backlinkCount, "links in")
       + kv(p.categoryCount, "categories") + kv(p.memberCount, "members")
+    + "</div>"
+    // Directly under the counts, above the article content, because it is the claim this demo
+    // exists to make. At the foot of the panel it was the last thing on a page whose first screen
+    // read as an ordinary encyclopedia article, which is the one reading this demo cannot afford.
+    // No rule above it here: it follows the counts rather than closing the panel.
+    + '<div class="hw-read" style="border-top:none;margin-top:3.4vh;padding-top:0">'
+      + "<p>Assembled from <b>" + r.hosts.length + "</b> host" + (r.hosts.length === 1 ? "" : "s")
+      + " in <b>" + r.requests + "</b> request" + (r.requests === 1 ? "" : "s")
+      + " over <b>" + r.objects + "</b> objects — <b>" + r.ms + " ms</b>, plus " + r.lookupMs
+      + " ms to turn the title into an id. The counts above come from maintained counters, so a page "
+      + "with thousands of backlinks costs no more to count than one with three.</p>"
+      + clusterGrid(r.hosts)
     + "</div>";
 
   // Every relation, each paged on demand. A hub page here has thousands of backlinks, so the card
@@ -352,14 +431,7 @@ async function show(title, ns) {
       + "</div>";
   }
 
-  html += '<div class="hw-read">'
-    + "<p>Assembled from <b>" + r.hosts.length + "</b> host" + (r.hosts.length === 1 ? "" : "s")
-    + " in <b>" + r.requests + "</b> request" + (r.requests === 1 ? "" : "s")
-    + " over <b>" + r.objects + "</b> objects — <b>" + r.ms + " ms</b>, plus " + r.lookupMs
-    + " ms to turn the title into an id. The counts above come from maintained counters, so a page "
-    + "with thousands of backlinks costs no more to count than one with three.</p>"
-    + '<div class="hw-hosts">' + r.hosts.map((h) => '<span class="hw-host">host ' + h + "</span>").join("") + "</div>"
-    + "</div></div>";
+  html += "</div>";
 
   out.innerHTML = html;
   history.replaceState(null, "", "?ns=" + encodeURIComponent(ns) + "&title=" + encodeURIComponent(stored(p.title)));
@@ -684,7 +756,7 @@ async function run() {
     + (r.hosts.length === 1 ? "" : "s") + " in <b>" + r.requests + "</b> request"
     + (r.requests === 1 ? "" : "s") + " over <b>" + r.objects + "</b> objects — <b>" + r.ms
     + " ms</b>. Priced at " + nf(d.cost.nodes) + " answer nodes across " + d.cost.frames + " frames.</p>"
-    + '<div class="hw-hosts">' + r.hosts.map((h) => '<span class="hw-host">host ' + h + "</span>").join("") + "</div>"
+    + clusterGrid(r.hosts)
     + '<div style="margin-top:18px"></div>'
     + '<pre class="hw-code"><code>' + esc(JSON.stringify(d.rows, null, 2)) + "</code></pre></div>";
 }
@@ -700,6 +772,9 @@ exSel.addEventListener("change", () => {
 // ---------------------------------------------------------------- start
 
 (async () => {
+  // Started here and awaited below, so the roster's cost -- one call per host -- overlaps the schema
+  // fetch and the editor's setup instead of being added to them.
+  const roster = loadCluster();
   SCHEMA = await (await fetch("/schema")).json();
   nsbox.innerHTML = SCHEMA.entry.namespaces.map((n) =>
     '<option value="' + n.value + '">' + esc(n.label) + "</option>").join("");
@@ -712,6 +787,7 @@ exSel.addEventListener("change", () => {
   ta.value = EXAMPLES[Object.keys(EXAMPLES)[0]];
   paint();
   void reprice();
+  await roster; // before any grid is drawn, so a deep link does not render the fallback
 
   const params = new URLSearchParams(location.search);
   if (params.get("title")) {
