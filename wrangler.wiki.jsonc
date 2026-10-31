@@ -23,13 +23,17 @@
     // name is a new set of empty objects. There is no import, export or truncate for a deployed
     // Durable Object's SQLite, which makes the name the only reset switch there is -- and an empty
     // baseline is what the storage multiplier has to be read against.
-    "HLEKK_DATABASE": "wiki-pilot2",
+    "HLEKK_DATABASE": "wiki-simple-cat",
     // 128 vshards over ~50 hosts: 2-3 per host, ~2 GB apiece at the demo's target size, and the
     // shape src/client/fanout.test.ts measured at 61-81 host requests for a ~500-object read. The
     // count is read once, when the directory first opens, so it is chosen before the load and
     // cannot be changed by editing this afterwards.
     "HLEKK_VSHARDS": "128"
   },
+  // The control deployment, holding the same wiki under a title-hash placement. `?placement=b` is
+  // forwarded to it, so the comparison is same-origin for the browser and never leaves Cloudflare.
+  // It has to be deployed first: a service binding names a Worker that must already exist.
+  "services": [{ "binding": "HLEKK_ALT", "service": "hlekk-wiki-hash" }],
   // HLEKK_SHED_BYTES is deliberately absent. It lowers the placement controller's threshold so a
   // demo can be watched rebalancing, and this database must not rebalance: wikimedia-demo.md puts
   // moves and epoch transitions out of scope and keeps every vshard at epoch 0, which is what keeps

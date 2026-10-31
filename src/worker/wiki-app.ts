@@ -74,10 +74,60 @@ interface PageIn {
  *  than an object because at 46.9 bytes per edge in JSON the field names are most of the payload. */
 type EdgeIn = [string, Id, Id, number];
 
+/**
+ * The wiki demo's own bindings, on top of what the database layer needs.
+ */
+interface WikiEnv extends Env {
+  /**
+   * A second deployment of this same Worker, holding the same wiki under a placement that buys no
+   * locality. `?placement=b` is forwarded to it; absent the binding, that parameter is an error
+   * rather than a quietly wrong answer.
+   *
+   * WHY A WHOLE DEPLOYMENT, and not a parameter picking a second database name. A Durable Object's
+   * env comes from the deployment that defines its namespace, never from whoever called it: a
+   * Worker can address the object named `other/h-3` perfectly well, but that object then resolves
+   * *its* peers and *its* KV chunk key from *its own* HLEKK_DATABASE. So a Worker holding two
+   * database names does not get two databases. It gets one set of host objects that the second
+   * database's directory adopts vshards on, and one set of map chunks that the second database
+   * publishes over the first's. That was tried, and workerd showed it as
+   * `indexLookup: host does not hold index vshard 155`, with two "databases" sharing all 43 hosts.
+   *
+   * The database name is therefore deployment-wide by construction, and a second placement is a
+   * second deployment — which is also how a second tenant would really be run. A service binding
+   * keeps that off the public internet and out of the browser's CORS rules, and the control
+   * deployment has no binding of its own, so a forward cannot loop.
+   */
+  HLEKK_ALT?: { fetch(request: Request): Promise<Response> };
+}
+
+/**
+ * Where a request goes when it asks for the control placement, or null to serve it here.
+ *
+ * The parameter is stripped on the way: the control deployment runs this same code, and a forward
+ * that kept it would be a request asking to be forwarded again.
+ */
+export function altTarget(url: URL): URL | null {
+  if (url.searchParams.get("placement") !== "b") return null;
+  const to = new URL(url);
+  to.searchParams.delete("placement");
+  return to;
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: WikiEnv): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    // Before anything else, and before any binding is touched: this deployment holds one database,
+    // and the other placement is somewhere else entirely.
+    const alt = altTarget(url);
+    if (alt !== null) {
+      if (env.HLEKK_ALT === undefined) {
+        return json({ error: "no control deployment is bound to this one", placement: "b" }, 503);
+      }
+      return env.HLEKK_ALT.fetch(new Request(alt, request));
+    }
+
     const db = Hlekk.from(cloudflareTransport(env));
     const directory = directoryStub(env);
     const body = async <T>(): Promise<T> => (await request.json()) as T;
@@ -97,7 +147,14 @@ export default {
       // ---- operating it
 
       if (path === "/health") {
-        return json({ ok: true, database: databaseOf(env), vshards: env.HLEKK_VSHARDS ?? null });
+        return json({
+          ok: true,
+          database: databaseOf(env),
+          // Whether the comparison is reachable from here at all, which is what the A/B tab needs
+          // to know before it offers one.
+          alt: env.HLEKK_ALT === undefined ? null : "bound",
+          vshards: env.HLEKK_VSHARDS ?? null,
+        });
       }
 
       /** Lays the database out. Once: `init` refuses a second call, because re-spreading vshards
@@ -105,7 +162,9 @@ export default {
       if (path === "/admin/init") {
         return json(await call(directory, "init", LOCK, num("hosts", 50), num("indexVshards", 4)));
       }
-      if (path === "/admin/where") return json(await call(directory, "where"));
+      if (path === "/admin/where") {
+        return json({ ...(await call<object>(directory, "where")), database: databaseOf(env) });
+      }
 
       /** Every host's `databaseSize`, which is the storage multiplier the import doc leaves open.
        *  Summing payload lengths undercounts real storage by 1.05x to 4.7x, and this is the figure
