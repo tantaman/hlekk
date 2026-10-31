@@ -151,6 +151,37 @@ export class HlekkHostDO {
           return { bytes, vshards };
         },
 
+        /**
+         * Can a Durable Object read R2 at all, and can it read a byte range?
+         *
+         * Both questions, because docs/wikimedia-import.md records that an R2 binding inside a
+         * Durable Object is *undocumented* — KV from a DO has its own example and R2 does not — and
+         * says to verify it before resting a plan on it. The plan it would carry is the bulk import:
+         * each host pulling its own pre-partitioned slice instead of a Worker pushing mutations
+         * through `createUnique`, which is what pins a load to one directory object. A range read is
+         * the second half, since a slice is pulled in chunks with the offset as a cursor.
+         *
+         * Kept deliberately: it costs nothing when nothing is bound, and it is the one answer a
+         * reader cannot get from the platform's own documentation.
+         */
+        r2probe: async (key: string, offset?: number | null, length?: number | null) => {
+          const bucket = this.#env.HLEKK_BULK;
+          if (bucket === undefined) return { bound: false };
+          // `null`, not just `undefined`: an absent argument arrives as null over this RPC. See
+          // `call` in rpc.ts -- a `!== undefined` check here is what made the unranged probe a 500.
+          const ranged = offset !== undefined && offset !== null;
+          const object = await bucket.get(
+            key,
+            ranged ? { range: { offset, length: length ?? undefined } } : undefined,
+          );
+          if (object === null) return { bound: true, found: false, ranged };
+          const body = await object.arrayBuffer();
+          // The first bytes as text, because a length alone cannot tell a range that landed where it
+          // was asked from one that quietly returned the head of the object.
+          const head = new TextDecoder().decode(new Uint8Array(body, 0, Math.min(24, body.byteLength)));
+          return { bound: true, found: true, ranged, size: object.size, read: body.byteLength, head };
+        },
+
         /** Drains the outbox now, for a caller that would rather not wait for an alarm. */
         drain: () => this.#drain(),
         pending: () => host.pending().length,

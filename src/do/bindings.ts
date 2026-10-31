@@ -25,6 +25,20 @@ export interface Kv {
   delete(key: string): Promise<void>;
 }
 
+/**
+ * An R2 bucket, as narrowly as a bulk load needs it.
+ *
+ * Ranged `get` is the part that matters: a bulk payload is pulled in chunks a Durable Object can
+ * insert inside one invocation, with the offset held as a cursor in its own storage, so progress
+ * survives eviction and the whole load is resumable without a coordinator.
+ */
+export interface Bucket {
+  get(
+    key: string,
+    options?: { range: { offset: number; length?: number } },
+  ): Promise<{ size: number; arrayBuffer(): Promise<ArrayBuffer> } | null>;
+}
+
 /** A Durable Object's own context: its storage, and its alarm. */
 export interface Ctx {
   storage: DoStorage & {
@@ -55,6 +69,9 @@ export interface Env {
   /** Lowers the placement controller's byte threshold, so a demo can reach a rebalance without
    *  writing gigabytes. */
   HLEKK_SHED_BYTES?: string;
+  /** Where bulk payloads are staged, for a load that bypasses the mutation path. Optional, because
+   *  only a deployment doing a bulk import binds it. */
+  HLEKK_BULK?: Bucket;
   /** The initial vshard count, and the size of each later batch. A database keeps the value it was
    *  created with: the count is read once, when the directory first opens, and changing it afterwards
    *  moves nothing. Left unset it is INITIAL_VSHARDS. */

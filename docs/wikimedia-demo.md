@@ -433,6 +433,20 @@ count is.
    every edge pointing outside the subset, and holds it all in memory. Right for a subset, wrong for
    a wiki — but it still proves a deployment at low scale in minutes.
 
+   **An interrupted load can strand objects, and nothing can find them afterwards.** The completed
+   load reported 950,423 objects for 950,421 pages, and the two are accounted for exactly.
+   `createUnique` is reserve → create → confirm across two hosts; if the process dies between the
+   create and the confirm, the client's own recovery (delete the object, release the reservation)
+   dies with it. The reservation lapses after `RESERVATION_TTL_MS` and frees the title, but the
+   object stays — with no index entry pointing at it, in a system whose only entry point is that
+   index. The first load crashed having written 297,749 objects against 297,743 checkpointed ids;
+   on resume, 4 of those 6 resolved through the index as *already present* and were reused, and the
+   other 2 had never been confirmed, so pass A minted fresh objects for their titles and left the
+   originals unreachable. So `objects == pages` is not an invariant across a crash, there is no
+   garbage collection for the difference, and `/admin/wipe` is the only thing that can reclaim it —
+   by erasing the whole database. The check is left to fail rather than widened, because the
+   discrepancy is real.
+
    Three hazards it had to be taught, two of which this doc did not know to ask for:
    - **Batch per host in key order.** Shuffled inserts fell to ~23 writes/s per host as the tables
      grew and the platform eventually refused outright.

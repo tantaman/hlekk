@@ -279,6 +279,20 @@ export default {
         });
       }
 
+      /** Asks a host whether it can read R2, and a byte range of it. See `r2probe` on the host for
+       *  why this is worth a route: it is the undocumented fact a bulk import would rest on. */
+      if (path === "/admin/r2probe") {
+        const key = url.searchParams.get("key") ?? "probe.bin";
+        const host = num("host", 0);
+        const offset = url.searchParams.has("offset") ? num("offset", 0) : undefined;
+        const length = url.searchParams.has("length") ? num("length", 0) : undefined;
+        return json({
+          host,
+          key,
+          ...(await call<object>(hostStub(env, host), "r2probe", key, offset, length)),
+        });
+      }
+
       /** Burns a counted amount of CPU on purpose. The Workers free plan allows 10 ms per
        *  invocation and the paid plan 30 seconds, so a request that asks for a second of
        *  arithmetic and gets an answer has established which plan this account is on — which
