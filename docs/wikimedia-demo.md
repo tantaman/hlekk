@@ -299,25 +299,88 @@ the figure to check rather than to quote.
 throws, because a batch is one unit and so can only say *that* it failed, while a resumable load
 needs to know *which* edge did.
 
-### Which makes pass A the bottleneck, and it is a decision taken once
+### Which makes pass A the bottleneck — though not for the reason given here first
 
-With edges off the critical path, the remaining cost is pass A: 950,421 pages at the measured
-**~280/s**, about **57 minutes**, and now the dominant term. That rate is not timidity — a
-`createUnique` funnels through the **four** index vshards in the database, and *`indexVshards` is
-fixed when the directory first opens and cannot be raised afterwards*.
+With edges off the critical path, pass A is the dominant term. This section used to say that a
+`createUnique` funnels through the database's **four** index vshards, that `indexVshards` is fixed
+when the directory first opens, and that the irreversible decision was therefore to open more of
+them. The middle clause is true. **The conclusion is wrong, and measuring it was cheap.**
 
-**So the irreversible decision comes before the load, not during it.** Init the database for the
-pilot with more index vshards than four. Nothing else here can be got wrong and fixed later.
+A database was init'd with **64** index vshards and pass A run against it on real Cloudflare:
 
-Batching the index path the way the edge path is now batched is the real fix and is not built:
-`createUnique` is reserve → create → confirm across two hosts, so it is a three-phase protocol rather
-than one transaction, and it is more work than `assocAddMany` was.
+| Index vshards | Pages in flight | Pass A |
+| --- | --- | --- |
+| 4 | 96 | ~280/s |
+| 64 | 96 | 390/s |
+| 64 | 384 | **590/s** |
+| 64 | 768 (batch 600) | 552/s |
+
+Sixteen times the index vshards bought **1.4x**, and concurrency past ~384 bought nothing at all. At
+590 pages/s each of the 64 index vshards is taking 2 × 590 / 64 ≈ **18 commits/s**, against the
+**525–570/s** a single host sustained for per-edge writes in the table above — a 30x headroom — and
+each of the 43 hosts is taking 590 / 43 ≈ **14 creates/s**. Nothing in the index is near saturation.
+
+What is saturated is **one object**, and it is not an index vshard. `createUnique` is four sequential
+hops, not three:
+
+```
+indexVshardFor(key)  ->  the DIRECTORY DO   <- one per database, single-threaded
+indexReserve         ->  an index vshard
+create               ->  the page's host
+indexConfirm         ->  an index vshard
+```
+
+`Hlekk.createUnique` opens with `await this.#transport.indexVshardFor(key)`, and
+`cloudflareTransport` serves that by calling the **directory** Durable Object — of which there is
+exactly one per database. Every page in pass A queues behind it whatever the index vshard count is,
+and ~590/s is that one object's ceiling. It is also why local workerd shows *no* scaling across 4,
+16, 32 and 64 index vshards (741 / 685 / 689 / 704 pages/s, all at 96 in flight): an invariant
+bottleneck is invariant there too, which is why workerd could not have settled this question and the
+deployed run had to.
+
+**So opening more index vshards is not the fix, and the one-way decision at `init` matters far less
+than this doc claimed.** The fix is that `indexVshardFor` should not be a network call at all. It is
+`set[indexHash(key) % set.length]` (`directory/directory.ts`) — a pure function of the key and the
+index vshard list. The list lives in the directory's own meta and is **not** published in the shard
+map (`directory/map.ts` carries no index entries), which is the only reason a client has to ask for
+it. Publishing it removes the hop and the serialization point together, and is worth about 4x on
+pass A by the table above.
+
+It is not free, which is why it has not simply been done here: a client holding a stale list after
+the set grows would hash a title into a different index vshard than its neighbours do, and
+uniqueness is the one thing that index exists to guarantee. It needs the shard map's versioning, not
+a cache — the same epoch machinery, applied to a second published fact.
+
+Batching the index path the way the edge path is batched remains the other half: `createUnique` is
+reserve → create → confirm across two hosts, a three-phase protocol rather than one transaction, and
+more work than `assocAddMany` was.
+
+64 index vshards were chosen for the pilot regardless. They cost ~2.9 MB of empty schema, they come
+*additionally* out of the grown batch rather than out of `HLEKK_VSHARDS`, they did remove real
+queueing (280 → 390 at equal concurrency), and they are the shape that pays off the day the
+directory hop goes away.
 
 ### What it costs and what it cannot show
 
-Two loads — `category` and the `hash` control — are the comparison, and the second is cheap: the
-importer re-runs as `--passes 0b,5` in a measured 58 seconds, because varying affinity changes a
-per-page field and leaves every edge alone. ~4.6 GB of storage, under $1/month.
+Two loads — `category` and the `hash` control — are the comparison. The second needs **no re-import
+at all**: `affinityOf` is called when a record is *read*, not when the wiki was imported, so
+`records({ affinity: "hash" })` over the same intermediates is the control. The 58-second
+`--passes 0b,5` re-merge is only needed to materialize `records.jsonl`, which a streaming loader
+does not use. ~4.6 GB of storage, under $1/month.
+
+**The comparison costs a second deployment, not a second variable, and this is forced.** A Durable
+Object's env comes from the deployment that defines its namespace, never from whoever called it. A
+Worker can address the object named `other/h-3` perfectly well — but that object then resolves *its*
+peers and *its* KV chunk key from *its own* `HLEKK_DATABASE`. So a Worker holding two database names
+does not get two databases: it gets one set of hosts that the second database's directory adopts
+vshards on, and one set of map chunks that the second database publishes over the first's. That was
+tried, and workerd reported it as `indexLookup: host does not hold index vshard 155`, with two
+"databases" sharing all 43 hosts and each having overwritten the other.
+
+So `wrangler.wiki-hash.jsonc` is a second deployment with its own `migrations`, and therefore its own
+host and directory namespaces. `hlekk-wiki` binds it as a service and forwards `?placement=b` to it,
+which keeps the comparison same-origin for the browser and off the public internet. The control has
+no such binding, so a forward cannot loop.
 
 **The honest limit: 2.3 GB fits inside one Durable Object**, well under the 9 GB vshard cap. So this
 pilot cannot carry *a size no single host could hold* — that claim still needs enwiki, and so still
@@ -343,13 +406,45 @@ count is.
    so what makes this load-bearing is repeatability — the affinity comparison means loading twice —
    not impossibility. **It is also not what stands between this branch and a demo that lands:** see
    *A cheaper path to the demo beat*.
-4. **The loader**, against the import branch's emitted shape. Prove at ~3 GB — which is *all* of
-   simplewiki, see *A cheaper path to the demo beat* — then scale. Edges are batched now, so the
-   binding constraint is pass A and the `indexVshards` count chosen at `init`. Two things
-   it must do that this doc did not know to ask for: **batch per host in key order** (shuffled
-   inserts fell to ~23 writes/s per host as the tables grew and the platform eventually refused the
-   writes outright), and **use a bounded affinity key** (raw first-category put 68.2% of a subset's
-   edges on one host, and no placement could have spread it).
+4. **The loader.** Built, as `scripts/load-wiki.ts`:
+
+   ```bash
+   node scripts/load-wiki.ts --base "$BASE"                      # the whole wiki, category affinity
+   node scripts/load-wiki.ts --base "$ALT" --affinity hash        # the control, into the other deployment
+   node scripts/load-wiki.ts --base "$BASE" --pass A --pages 10000   # probe a setting
+   ```
+
+   It streams `records()` and never materializes it; the only thing it holds for the run is the
+   `page_id -> hlekk id` map, which pass B cannot avoid because an edge names its target by page id
+   and only pass A knows what id that page got. Two passes, because ids must exist before an edge
+   can reference one. Batches per `(host, vshard)` in key order with **one batch in flight per
+   host**, since a vshard is one contiguous key range and a Durable Object is single-threaded.
+   Continuation records are folded, so a page whose edge list exceeded the importer's cap is one
+   page and not several.
+
+   **Resumable, which it needs to be:** pass A appends every `key -> id` it mints to a checkpoint
+   (which is also where pass B reads its map), and pass B checkpoints a watermark — a page key below
+   which every edge is acknowledged, held back by anything still buffered or in flight, so a resume
+   can only redo work and never skip it. Proven by killing a run mid-pass-A: 5,550 ids were
+   checkpointed against 6,600 objects actually written, and pass A's idempotency absorbed the gap
+   (`1,800 already present`) for 6/6 checks and exactly 20,000 objects.
+
+   `ingest-deployed.ts` is kept and is *not* this: `selectSubset` scans at most 200,000 keys, drops
+   every edge pointing outside the subset, and holds it all in memory. Right for a subset, wrong for
+   a wiki — but it still proves a deployment at low scale in minutes.
+
+   Three hazards it had to be taught, two of which this doc did not know to ask for:
+   - **Batch per host in key order.** Shuffled inserts fell to ~23 writes/s per host as the tables
+     grew and the platform eventually refused outright.
+   - **Use a bounded affinity key.** Raw first-category put 68.2% of a subset's edges on one host.
+   - **Retry pass A for longer than a reservation lives.** `createUnique` reserves the title, creates,
+     then confirms. If a batch's response is lost after the reservations are taken, the retry meets
+     its own predecessor's reservations — and an unconfirmed reservation is the one state
+     `lookupUnique` cannot resolve, so the Worker rethrows `ValueTaken: already taken by a
+     reservation in flight`. Nothing clears it but the reservation lapsing. A 12.4 s retry window
+     against `RESERVATION_TTL_MS` of 30 s killed a load **290,400 pages in**, on a title that
+     appears exactly once in the dump: the collision was the loader meeting itself. The window is
+     now derived from the constant and checked at startup.
 5. ~~The demo query surface~~ — title lookup, then a page view with links, backlinks and counts.
    Done, served at `/` from the Worker, plus paging through every relation and a query editor.
 
@@ -368,9 +463,10 @@ count is.
 - [x] Redirects as pages, 15,551,165 of them (counted, not estimated). A redirect has its own title,
       its own `page` row and its own outbound link, and `pagelinks` resolves through `linktarget` to
       *titles* — so demoting one to a field breaks link resolution for every link pointing at it.
-- [ ] Which affinity functions the demo compares. The import takes it as a parameter already
-      (`--affinity category|namespace|initial|hash`, `hash` being the no-locality control), so
-      loading twice is a decision rather than a rebuild.
+- [x] Which affinity functions the demo compares: **`category` against `hash`**, the latter being
+      the no-locality control. Chosen because they are the two ends of the axis — one buys whatever
+      locality the link graph has, the other provably none — and because the mode is applied when a
+      record is read, so the second load needs no re-import.
 - [x] Two passes over the dump, not one with buffered references: ids must exist before edges can
       reference them, and the alternative buffers 1.78 billion unresolved references. Both dumps
       sort cheaply on their join keys.

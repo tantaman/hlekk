@@ -34,6 +34,21 @@ describe("the inline UI", () => {
     assert.equal(hit, -1, hit === -1 ? "" : `template interpolation near: ${scripts[0]!.slice(Math.max(0, hit - 60), hit + 60)}`);
   });
 
+  it("serves the placement comparison, with a roster for each side", () => {
+    // The A/B passes each database's own roster to the grid; without the second argument both sides
+    // would be shaded against the primary and a host holding control data would draw as empty.
+    assert.match(scripts[0]!, /function clusterGrid\(serving, roster\)/);
+    assert.match(scripts[0]!, /clusterGrid\(r\.hosts, roster\)/);
+    assert.match(scripts[0]!, /placement=b/);
+    assert.match(scripts[0]!, /async function compare\(/);
+  });
+
+  it("gives the placement tab a pane to show", () => {
+    for (const id of ["tab-ab", "pane-ab", "abouts", "abq", "abns", "abf"]) {
+      assert.ok(WIKI_UI.includes('id="' + id + '"'), "missing #" + id);
+    }
+  });
+
   it("serves the cluster grid the page card depends on", () => {
     // The card calls clusterGrid(); if it were renamed on one side only, the page would throw at
     // render time and the test suite would otherwise never know.

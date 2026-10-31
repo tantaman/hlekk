@@ -150,6 +150,20 @@ select.hw-input{font-family:var(--font-mono);font-size:13px}
   background:var(--white);border:1px solid var(--line2);border-radius:999px;padding:4px 11px}
 .hw-chips a:hover{border-color:var(--orange);color:var(--orange)}
 .hw-shown{font-family:var(--font-mono);font-size:11px;color:var(--ink-f);margin-left:9px}
+/* ---- the A/B: two clusters, side by side.
+   Side by side rather than one after the other, and this is the whole point: the claim is that the
+   same query lights one grid narrow and the other wide, and a reader can only see that if both are
+   on screen at once. Stacked, it is two numbers to remember and compare, which is the version of
+   this demo that does not land. */
+.hw-ab{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:2.4vh;align-items:start}
+.hw-abc{background:var(--panel);border:1px solid var(--line2);border-radius:14px;padding:18px 18px 20px}
+.hw-abc.is-wide{border-color:var(--orange)}
+.hw-abh{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+.hw-abt{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-f);margin:0}
+.hw-abn{font-family:var(--font-mono);font-size:30px;font-weight:500;margin:0;line-height:1}
+.hw-abn em{font-style:normal;font-size:12px;color:var(--ink-f);letter-spacing:.04em}
+.hw-verdict{margin-top:2.4vh;padding:16px 18px;border-left:3px solid var(--orange);
+  background:var(--panel);border-radius:0 14px 14px 0}
 .hw-read{border-top:1px solid var(--line);margin-top:3.4vh;padding-top:16px}
 .hw-read p{margin:0;font-size:13.5px;line-height:1.55;color:var(--ink-d)}
 .hw-read b{font-family:var(--font-mono);font-weight:500;color:var(--ink)}
@@ -208,6 +222,9 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
   .hw-chips a{padding:6px 12px}
   .hw-cluster{gap:3px}
   .hw-cluster .hw-h{width:26px;height:24px;font-size:10px}
+  /* One column: two grids side by side at this width are two grids nobody can read. The comparison
+     survives stacking here because each card still carries its own request count. */
+  .hw-ab{grid-template-columns:1fr}
   .qedit{min-height:150px}
   .hw-hero{padding-top:3.4vh}
 }
@@ -219,6 +236,7 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
   <nav class="hw-nav">
     <button id="tab-browse" aria-selected="true">browse</button>
     <button id="tab-query" aria-selected="false">query</button>
+    <button id="tab-ab" aria-selected="false">placement</button>
   </nav>
 </div></header>
 
@@ -274,6 +292,28 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
       <span><kbd>tab</kbd> accepts</span> <span><kbd>⌘</kbd>+<kbd>↩</kbd> runs</span></p>
     <div id="qout"></div>
   </section>
+
+  <section id="pane-ab" hidden>
+    <div class="hw-hero">
+      <p class="hw-ey">placement</p>
+      <h1 class="hw-h1">The knob that decides whether a read is one round trip or fifty.</h1>
+      <p class="hw-lead">The same wiki, loaded twice. On the left, pages are placed by their first
+        category, so pages that link to each other tend to land on the same host. On the right, by a
+        hash of the title, which spreads perfectly and buys no locality at all. Same query, same
+        data, same number of hosts — look at how many of them each answer had to touch.</p>
+    </div>
+
+    <form class="hw-entry" id="abf">
+      <input class="hw-input" type="search" id="abq" placeholder="Page title, e.g. Country" autocomplete="off">
+      <select class="hw-input" id="abns" aria-label="Namespace"></select>
+      <button class="hw-btn" type="submit">compare</button>
+    </form>
+    <p class="hw-note">A hub page shows it best, because the cost is in the fan-out. Try
+      <a href="#" data-ab="Country">Country</a>, <a href="#" data-ab="Europe">Europe</a>,
+      <a href="#" data-ab="Earth">Earth</a> or <a href="#" data-ab="Water">Water</a>.</p>
+
+    <div id="abouts"></div>
+  </section>
 </main>
 
 <footer class="hw-foot">
@@ -324,10 +364,14 @@ async function loadCluster() {
  *  means nothing without knowing whether the database has 18 or 50 -- it reads as impressive or
  *  alarming depending on a number the viewer does not have. Shown this way a narrow read is visibly
  *  narrow and a wide one visibly wide. */
-function clusterGrid(serving) {
+function clusterGrid(serving, roster) {
   const lit = new Set((serving || []).map(Number));
+  // Which database's roster to shade against. The A/B passes the control's, because the two hold the
+  // same hosts but not the same spread of objects over them, and shading one against the other would
+  // draw a host as empty while it is being read.
+  const which = roster !== undefined && roster !== null ? roster : CLUSTER;
   // Without a roster, fall back to lighting just what answered: still true, merely less informative.
-  const hosts = CLUSTER ? CLUSTER.hosts : [...lit].sort((a, b) => a - b).map((h) => ({ host: h, objects: 1 }));
+  const hosts = which ? which.hosts : [...lit].sort((a, b) => a - b).map((h) => ({ host: h, objects: 1 }));
   const held = hosts.filter((h) => h.objects > 0).length;
   const cells = hosts.map((h) => {
     // A held cell carries no modifier: it is the base .hw-h, which is this design's own host chip.
@@ -339,16 +383,24 @@ function clusterGrid(serving) {
   const legend = '<div class="hw-legend">'
     + '<i><b class="k-lit"></b>served this read (' + lit.size + ")</i>"
     + "<i><b></b>holds data, not read (" + Math.max(0, held - lit.size) + ")</i>"
-    + (CLUSTER ? '<i><b class="k-empty"></b>empty (' + (hosts.length - held) + ")</i>" : "")
-    + (CLUSTER ? "<i>" + hosts.length + " hosts in the database</i>" : "<i>roster unavailable</i>")
+    + (which ? '<i><b class="k-empty"></b>empty (' + (hosts.length - held) + ")</i>" : "")
+    + (which ? "<i>" + hosts.length + " hosts in the database</i>" : "<i>roster unavailable</i>")
     + "</div>";
   return legend + '<div class="hw-cluster">' + cells + "</div>";
 }
 
 // ---------------------------------------------------------------- tabs
 
-const panes = { browse: document.getElementById("pane-browse"), query: document.getElementById("pane-query") };
-const tabs = { browse: document.getElementById("tab-browse"), query: document.getElementById("tab-query") };
+const panes = {
+  browse: document.getElementById("pane-browse"),
+  query: document.getElementById("pane-query"),
+  ab: document.getElementById("pane-ab"),
+};
+const tabs = {
+  browse: document.getElementById("tab-browse"),
+  query: document.getElementById("tab-query"),
+  ab: document.getElementById("tab-ab"),
+};
 function tab(which) {
   for (const k of Object.keys(panes)) {
     panes[k].hidden = k !== which;
@@ -357,6 +409,7 @@ function tab(which) {
 }
 tabs.browse.onclick = () => tab("browse");
 tabs.query.onclick = () => tab("query");
+tabs.ab.onclick = () => tab("ab");
 
 // ---------------------------------------------------------------- browse
 
@@ -483,6 +536,116 @@ document.addEventListener("click", (e) => {
   tab("browse");
   show(a.dataset.go, ns);
   window.scrollTo({ top: 0, behavior: "smooth" });
+});
+
+// ---------------------------------------------------------------- placement A/B
+
+// The control database's roster, fetched the first time the comparison is asked for rather than at
+// boot: it costs a call per host, and most visitors never open this tab.
+let CLUSTER_B = null;
+
+async function loadClusterB() {
+  if (CLUSTER_B) return;
+  try {
+    const d = await fetch("/admin/where?placement=b").then((r) => r.json());
+    if (Array.isArray(d.hosts)) CLUSTER_B = { hosts: d.hosts, indexVshards: (d.indexVshards || []).length };
+  } catch (e) { /* as with the other roster, a failed one degrades the grid rather than the page */ }
+}
+
+const abOut = document.getElementById("abouts");
+const abq = document.getElementById("abq");
+const abns = document.getElementById("abns");
+
+/** One side of the comparison: the headline number, what it cost, and the grid. */
+function abSide(label, lead, d, roster, wide) {
+  const head = '<div class="hw-abc' + (wide ? " is-wide" : "") + '">'
+    + '<div class="hw-abh"><p class="hw-abt">' + esc(label) + "</p></div>";
+  // Three ways this side can have nothing to show, and they mean different things: no control
+  // deployment is bound, it is bound but holds nothing yet, or it holds a wiki without this page.
+  if (d && d.error) {
+    return head + '<p class="hw-note" style="margin-top:12px">Unavailable: ' + esc(d.error) + "</p></div>";
+  }
+  if (!d || !d.found) {
+    return head + '<p class="hw-note" style="margin-top:12px">Not here. The control deployment is '
+      + "reachable but has no page by this title — it needs the same wiki loaded into it.</p></div>";
+  }
+  const r = d.read;
+  const total = roster ? roster.hosts.length : null;
+  return head
+    + '<p class="hw-abn">' + r.hosts.length + " <em>of " + (total === null ? "?" : total) + " hosts</em></p>"
+    + '<p class="hw-note" style="margin-top:12px">' + esc(lead) + "</p>"
+    + '<p class="hw-note" style="margin-top:10px"><b>' + nf(r.requests) + "</b> host request"
+    + (r.requests === 1 ? "" : "s") + " · " + nf(r.rounds) + " round" + (r.rounds === 1 ? "" : "s")
+    + " · <b>" + nf(r.ms) + " ms</b> · " + nf(r.objects) + " objects</p>"
+    + clusterGrid(r.hosts, roster)
+    + "</div>";
+}
+
+async function compare(title, ns) {
+  if (!title) return;
+  abOut.innerHTML = '<div class="hw-panel"><p class="hw-note">Reading ' + esc(pretty(title))
+    + " from both placements…</p></div>";
+  await loadClusterB();
+  const q = "?ns=" + encodeURIComponent(ns) + "&title=" + encodeURIComponent(stored(title)) + "&limit=25";
+  let a = null, b = null;
+  try {
+    // Both at once: the two reads are independent, and running them in series would make the slower
+    // placement look even slower by however long the other one took.
+    const got = await Promise.all([fetch("/page" + q), fetch("/page" + q + "&placement=b")]);
+    a = await got[0].json();
+    b = await got[1].json();
+  } catch (e) {
+    abOut.innerHTML = '<p class="hw-err">Request failed: ' + esc(e.message) + "</p>";
+    return;
+  }
+  if (!a || !a.found) {
+    abOut.innerHTML = '<div class="hw-panel"><h2 class="hw-title">Not found</h2>'
+      + '<p class="hw-note" style="margin-top:12px">No page titled <b>' + esc(pretty(title))
+      + "</b> in namespace " + esc(ns) + ".</p></div>";
+    return;
+  }
+
+  let html = '<div class="hw-ab">'
+    + abSide("clustered · by category", "Pages placed by their first category, so a page and the "
+      + "pages it links to tend to share a host.", a, CLUSTER, false)
+    + abSide("spread · by title hash", "Pages placed by a hash of the title. Perfectly even, and "
+      + "every neighbour is somewhere else.", b, CLUSTER_B, true)
+    + "</div>";
+
+  // The verdict, stated in the numbers the two sides actually reported rather than in adjectives.
+  // Only when both answered: half a comparison is not one.
+  if (!b || !b.found) {
+    html += '<div class="hw-verdict"><p class="hw-note">Only one side answered, so there is no '
+      + "comparison to draw yet.</p></div>";
+  } else {
+    const ra = a.read, rb = b.read;
+    const times = ra.hosts.length > 0 ? (rb.hosts.length / ra.hosts.length) : 0;
+    html += '<div class="hw-verdict"><p class="hw-note">Same page, same ' + nf(ra.objects)
+      + " objects, same cluster. Clustered touched <b>" + ra.hosts.length + "</b> host"
+      + (ra.hosts.length === 1 ? "" : "s") + " in <b>" + nf(ra.requests) + "</b> request"
+      + (ra.requests === 1 ? "" : "s") + "; spread touched <b>" + rb.hosts.length + "</b> in <b>"
+      + nf(rb.requests) + "</b>"
+      + (times >= 1.15
+        ? " — <b>" + times.toFixed(1) + "x</b> the hosts for the same answer."
+        : ". On this page the two are close; a page whose links are spread thinly across categories "
+          + "has little locality to find.")
+      + " Nothing about the data differs. The only difference is where it was put.</p></div>";
+  }
+
+  abOut.innerHTML = html;
+}
+
+document.getElementById("abf").addEventListener("submit", (e) => {
+  e.preventDefault();
+  compare(abq.value, abns.value);
+});
+// The example links in this pane, which carry a title rather than navigating.
+document.getElementById("pane-ab").addEventListener("click", (e) => {
+  const link = e.target.closest("a[data-ab]");
+  if (!link) return;
+  e.preventDefault();
+  abq.value = pretty(link.dataset.ab);
+  compare(link.dataset.ab, abns.value);
 });
 
 // ---------------------------------------------------------------- the query editor
@@ -778,6 +941,7 @@ exSel.addEventListener("change", () => {
   SCHEMA = await (await fetch("/schema")).json();
   nsbox.innerHTML = SCHEMA.entry.namespaces.map((n) =>
     '<option value="' + n.value + '">' + esc(n.label) + "</option>").join("");
+  abns.innerHTML = nsbox.innerHTML;
   // The editor's whole vocabulary, read off the schema so the popup cannot offer a name the engine
   // would not resolve -- the one property of this editor worth stating.
   EDGE_SHORT = SCHEMA.edges.map((e) => e.name.replace(/^wiki\./, ""));

@@ -1,0 +1,38 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "hlekk-wiki-hash",
+  // The control half of the Wikimedia demo: the same wiki, the same code, the same host count, and
+  // a placement that buys no locality at all.
+  //
+  // WHY A SECOND DEPLOYMENT AND NOT A SECOND VAR. A Durable Object's env comes from the deployment
+  // that defines its namespace, not from whoever called it, so a Worker holding two database names
+  // does not get two databases -- the second one's directory adopts vshards on the first one's hosts
+  // and publishes its map over the first one's chunks. See the HLEKK_ALT note in wiki-app.ts, which
+  // records what that looked like when it was tried. The database name is deployment-wide, so a
+  // second placement is a second deployment.
+  //
+  // Its own `migrations` is the point: it gives this script its own HlekkHostDO and HlekkDirectoryDO
+  // namespaces, so `wiki-simple-hash/h-0` here is a different object from anything in hlekk-wiki.
+  "main": "src/worker/wiki-app.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "HLEKK_HOSTS", "class_name": "HlekkHostDO" },
+      { "name": "HLEKK_DIRECTORY", "class_name": "HlekkDirectoryDO" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HlekkHostDO", "HlekkDirectoryDO"] }],
+  // The same namespace as hlekk-wiki, which is safe because a chunk key is `m/${database}/${index}`
+  // and the two databases are differently named. Sharing it keeps the pair to one piece of
+  // infrastructure to create and one to tear down.
+  "kv_namespaces": [{ "binding": "HLEKK_MAP", "id": "af144fc56d0541699307352f0a63ab76" }],
+  "vars": {
+    "HLEKK_DATABASE": "wiki-simple-hash",
+    // The same count as the clustered side. The comparison is of placement and nothing else, so
+    // every other number that could move has to be held still.
+    "HLEKK_VSHARDS": "128"
+  },
+  // Deliberately no HLEKK_ALT: this is the far side of the forward, and without a binding of its own
+  // a `?placement=b` that somehow reached here is refused rather than sent round again.
+  "observability": { "enabled": true }
+}
