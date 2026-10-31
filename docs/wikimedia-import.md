@@ -397,6 +397,15 @@ the narrowest part of the write path. **It belongs in the pre-load decision besi
 and there is no import, export or truncate for a deployed Durable Object's SQLite to fix it after the
 fact — only a new `HLEKK_DATABASE` name and a reload.
 
+Two corrections to that paragraph, both measured since. The index vshard count turned out **not** to
+be the narrow part of the write path — the directory DO is, because `createUnique` asks it which
+index vshard a title belongs to, and there is one per database. See *Which makes pass A the
+bottleneck* in [`wikimedia-demo.md`](wikimedia-demo.md). And a new `HLEKK_DATABASE` name is no longer
+the end of the story: it still *abandons* the old database rather than removing it, but
+`POST /admin/wipe?database=<name>` now tells each of that database's objects to erase itself, which is
+the only way to reclaim the storage. It is armed by `HLEKK_WIPE` in the deployment's own vars and
+refuses any database that var does not name.
+
 **4. An empty host Durable Object weighs 45,056 bytes deployed, not the 40,960 it weighs on
 workerd.** Measured across 43 of them with the schema in place and nothing stored. A 10% difference
 that matters twice: the figure below is a ratio counted from this floor, and `wrangler.app.jsonc` set
@@ -663,10 +672,12 @@ hold. Two findings worth keeping, both design gaps rather than loading problems:
       `Category:Living people` would take ~1M pages on enwiki. A bounded key — a membership cap
       spilling to the title hash, or a category composed with a hash bucket — is the thing to compare
       `hash` against. See *The affinity key that ate the cluster*.
-- [ ] How many index vshards the real load needs. Four funnelled every title insert through four
-      Durable Objects and the platform refused with `Durable Object is overloaded`; `indexVshards` is
-      fixed when the directory first opens and there is no truncate to undo it. It belongs in the
-      pre-load decision beside `HLEKK_VSHARDS`.
+- [x] How many index vshards the real load needs: **64 for this pilot, and the count was the wrong
+      question.** Four did funnel every title insert through four Durable Objects and did provoke
+      `Durable Object is overloaded`, but 64 bought only 1.4x — because `createUnique` opens by
+      asking the *directory* DO which index vshard a title belongs to, and there is one of those per
+      database. ~590 pages/s is that one object's ceiling, not the index's. See *Which makes pass A
+      the bottleneck* in [`wikimedia-demo.md`](wikimedia-demo.md) for the table and the fix.
 - [x] `records()` is a generator, with `writeRecords` spilling to a file only on request. A page's
       edges split into continuation records at 50,000 so a high-degree page does not materialize its
       whole list; folding them back reproduces the unsplit records exactly, and streaming 22.3 M

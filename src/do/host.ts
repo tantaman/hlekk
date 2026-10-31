@@ -131,6 +131,26 @@ export class HlekkHostDO {
         },
         indexSweep: (vshard: string, now: number, ttlMs: number) => host.indexSweep(vshard, now, ttlMs),
 
+        /**
+         * Erases everything this host holds. Irreversible, and the point: see
+         * `Ctx.storage.deleteAll` for why nothing else can reclaim the storage.
+         *
+         * The size is read before the erase, because afterwards there is nothing to measure and the
+         * bytes reclaimed are the only evidence the call did anything.
+         */
+        wipe: async () => {
+          const bytes = host.size();
+          const vshards = host.vshards().length;
+          await this.#ctx.storage.deleteAlarm();
+          await this.#ctx.storage.deleteAll();
+          // Both caches describe a schema that no longer exists. Dropped rather than reused, so the
+          // next call to this object — if there ever is one — opens an empty host instead of reading
+          // through a Host bound to tables that have gone.
+          this.#host = null;
+          this.#client = null;
+          return { bytes, vshards };
+        },
+
         /** Drains the outbox now, for a caller that would rather not wait for an alarm. */
         drain: () => this.#drain(),
         pending: () => host.pending().length,

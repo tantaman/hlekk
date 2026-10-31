@@ -8,7 +8,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { altTarget } from "./wiki-app.ts";
+import { altTarget, wipeTarget } from "./wiki-app.ts";
+import type { Env } from "../do/bindings.ts";
 
 const at = (query: string) => altTarget(new URL("https://wiki.example.com/page" + query));
 
@@ -41,5 +42,52 @@ describe("altTarget", () => {
     for (const q of ["", "?placement=a", "?placement=alt", "?placement=hash", "?placement=", "?placement=B"]) {
       assert.equal(at(q), null, q === "" ? "(no parameter)" : q);
     }
+  });
+});
+
+// Erasing a database is the one irreversible thing this Worker can do, and the only way to reclaim a
+// Durable Object's storage -- so the guard in front of it is worth more tests than the operation.
+// Two independent facts have to agree: the deployment names a victim in configuration, and the
+// request names the same one. Neither alone does anything.
+describe("wipeTarget", () => {
+  const armed = { HLEKK_WIPE: "wiki-pilot2" } as unknown as Env;
+  const url = (q: string) => new URL("https://wiki.example.com/admin/wipe" + q);
+
+  it("wipes the armed database when the request names it", () => {
+    assert.equal(wipeTarget(armed, url("?database=wiki-pilot2")), "wiki-pilot2");
+  });
+
+  it("arms several databases from one list, since abandoned ones accumulate", () => {
+    const many = { HLEKK_WIPE: "wiki, wiki-pilot ,wiki-pilot2" } as unknown as Env;
+    for (const name of ["wiki", "wiki-pilot", "wiki-pilot2"]) {
+      assert.equal(wipeTarget(many, url("?database=" + name)), name, name);
+    }
+    // And nothing beyond the list, including the live database and a prefix of a listed name.
+    for (const name of ["wiki-simple-cat", "wiki-pilot3", "wiki-", "pilot"]) {
+      assert.equal(wipeTarget(many, url("?database=" + name)), null, name);
+    }
+  });
+
+  it("refuses when nothing is armed, which is the committed state", () => {
+    for (const env of [{}, { HLEKK_WIPE: "" }, { HLEKK_DATABASE: "wiki-simple-cat" }]) {
+      assert.equal(wipeTarget(env as unknown as Env, url("?database=wiki-simple-cat")), null);
+      assert.equal(wipeTarget(env as unknown as Env, url("?database=wiki-pilot2")), null);
+    }
+  });
+
+  it("refuses a request that names any other database", () => {
+    // Including the live one, a near-miss, and the shapes that would reach another tenant's objects
+    // if the name were ever taken from the request rather than merely matched against it.
+    for (const asked of [
+      "wiki-simple-cat", "wiki-pilot", "wiki-pilot2 ", "WIKI-PILOT2", "", "demo",
+      "../wiki-simple-cat", "wiki-pilot2/h-0", "*",
+    ]) {
+      assert.equal(wipeTarget(armed, url("?database=" + encodeURIComponent(asked))), null, asked);
+    }
+  });
+
+  it("refuses a request that names nothing at all", () => {
+    assert.equal(wipeTarget(armed, url("")), null);
+    assert.equal(wipeTarget(armed, url("?confirm=wiki-pilot2")), null);
   });
 });
