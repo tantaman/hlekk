@@ -844,10 +844,18 @@ check(
   occupied.length > HOSTS / 2,
   `${occupied.length} of ${HOSTS} hosts hold pages`,
 );
+// An excess is almost always objects stranded by an interrupted load: `createUnique` creates the
+// object and then confirms the title, and a process that dies in between cannot run its own
+// recovery. The reservation lapses and frees the title, the object does not, and nothing points at
+// it -- so it can never be read, never be found, and never be counted as anything but this.
 check(
   "every page is stored exactly once",
   objects === ids.size,
-  `${n(objects)} objects for ${n(ids.size)} known ids`,
+  `${n(objects)} objects for ${n(ids.size)} known ids` +
+    (objects > ids.size
+      ? `; the ${n(objects - ids.size)} extra are most likely stranded by an interrupted load, ` +
+        `created but never confirmed in the title index, and nothing can reach them`
+      : ""),
 );
 
 // Entry by title is the demo's only way in, and the object count above cannot see the index.

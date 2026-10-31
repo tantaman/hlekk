@@ -625,9 +625,15 @@ once blob ids are inlined as `x'…'` hex literals instead of bound. `exec` take
 separated by semicolons but refuses `BEGIN` and `SAVEPOINT`, so the transaction comes from
 `transactionSync`. Undocumented: whether the 100 KB applies per statement or to a whole
 multi-statement string. Alarms suit a self-feeding ingest — 15-minute wall time, 30 s of CPU to 5
-minutes via `limits.cpu_ms`, self-rescheduling, at-least-once with six retries — but **an R2 binding
-inside a Durable Object is undocumented**, where KV from a DO has its own example, so verify that
-before resting a plan on it.
+minutes via `limits.cpu_ms`, self-rescheduling, at-least-once with six retries — and **an R2 binding
+inside a Durable Object works, ranged reads included**, which was undocumented and is now measured.
+See the open item below.
+
+One trap found while measuring it, and it is this repo's own rather than the platform's: **an
+`undefined` argument to `call` arrives as `null`.** The wire is JSON, and `JSON.stringify` keeps an
+array's length while turning its `undefined` entries into `null`, so a handler's optional parameter
+sees `null`, its default does not apply, and a `!== undefined` guard inside it is wrong. It turned an
+unranged probe into a 500 while the same call with a real offset worked.
 
 ## Later: the dataset that needs paged storage
 
@@ -663,7 +669,14 @@ hold. Two findings worth keeping, both design gaps rather than loading problems:
       coexist. `titleKey` is the stopgap and says so.
 - [ ] Extending `invariants.ts` to check the four unpaired edge types agree as if they were pairs,
       which is the only thing that would catch a half-loaded direction.
-- [ ] Whether an R2 binding works inside a Durable Object. Documented for KV, undocumented for R2.
+- [x] Whether an R2 binding works inside a Durable Object: **yes, and ranged reads land exactly.**
+      Measured against a 1 MiB object of 16,384 stamped 64-byte records, read from three different
+      host DOs on a real deployment: a full read returned all 1,048,576 bytes; `offset 640` returned
+      record 10, `offset 524288` record 8,192, and `offset 1048512` record 16,383. So a host can pull
+      its own slice in chunks with the offset held as a cursor, which is what a bulk import needs —
+      each host pulling a pre-partitioned payload instead of a Worker pushing `createUnique` through
+      the one directory object that bounds pass A at ~590 pages/s. `r2probe` on the host DO is kept
+      for whoever asks next.
 - [ ] Whether the 100 KB SQL statement limit is per statement or per `exec` string.
 - [ ] Which affinity functions the demo compares, given the import takes it as a parameter. Note
       that 48% of simplewiki pages have no category, so `category` is half a fallback to `namespace`.

@@ -27,6 +27,16 @@ export class RemoteError extends Error {
 
 /** Calls one method on one Durable Object. A throw on the far side comes back as one here, with its
  *  name kept, so the client's own error handling — a refusal, a conflict — still sees what it expects. */
+/**
+ * Calls a method on a Durable Object.
+ *
+ * **An `undefined` argument arrives as `null`.** The wire is JSON, and `JSON.stringify` keeps an
+ * array's length while turning its `undefined` entries into `null` — so a handler written with an
+ * optional parameter sees `null`, its default does not apply, and a `!== undefined` guard inside it
+ * is simply wrong. Pass fewer arguments to mean "absent", or have the handler treat `null` as absent.
+ * Found by a probe whose `get(key, { range: { offset: null } })` became a 500 while the same call
+ * with a real offset worked.
+ */
 export async function call<T>(stub: Stub, method: string, ...args: unknown[]): Promise<T> {
   const body: Call = { method, args };
   const res = await stub.fetch(

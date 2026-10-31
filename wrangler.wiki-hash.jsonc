@@ -26,6 +26,10 @@
   // and the two databases are differently named. Sharing it keeps the pair to one piece of
   // infrastructure to create and one to tear down.
   "kv_namespaces": [{ "binding": "HLEKK_MAP", "id": "af144fc56d0541699307352f0a63ab76" }],
+  // Bound here and not on hlekk-wiki, because this deployment is idle: the question being asked is
+  // whether a Durable Object can read R2 at all, and asking it on the Worker that is mid-load would
+  // mean redeploying that Worker to ask.
+  "r2_buckets": [{ "binding": "HLEKK_BULK", "bucket_name": "hlekk-bulk" }],
   "vars": {
     "HLEKK_DATABASE": "wiki-simple-hash",
     // The same count as the clustered side. The comparison is of placement and nothing else, so
