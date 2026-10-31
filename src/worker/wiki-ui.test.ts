@@ -41,6 +41,19 @@ describe("the inline UI", () => {
     assert.match(scripts[0]!, /clusterGrid\(r\.hosts, roster\)/);
     assert.match(scripts[0]!, /placement=b/);
     assert.match(scripts[0]!, /async function compare\(/);
+    // Three sides, not two: the control is the denominator and the other two are what it is
+    // quoting. A pane that read only two would be comparing two guesses against each other.
+    assert.match(scripts[0]!, /placement=" \+ which|placement=c/);
+    assert.match(scripts[0]!, /is-three/);
+    assert.match(scripts[0]!, /let CLUSTER_C = null/);
+  });
+
+  it("reads the comparison at a limit the whole link set fits inside", () => {
+    // A truncated read returns the smallest-id targets, and init lands a contiguous id band on a
+    // contiguous host band -- so limit=25 made the comparison partly a measurement of the id
+    // layout. The pane says so when a page does not fit even this.
+    assert.match(scripts[0]!, /&limit=100/);
+    assert.doesNotMatch(scripts[0]!, /placement=b"\) \+ "&limit=25/);
   });
 
   it("gives the placement tab a pane to show", () => {

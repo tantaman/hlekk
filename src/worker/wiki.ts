@@ -127,6 +127,21 @@ const escape = (c: string): string =>
 export const titleKey = (ns: number, title: string): string =>
   `${ns}:${title.replace(/./gsu, (c) => (c === "%" || c !== c.toLowerCase() ? escape(c) : c))}`;
 
+/**
+ * The key `titleKey` emitted before it escaped by UTF-8 byte. Kept only so that a database loaded
+ * under it stays readable.
+ *
+ * A key decides which index vshard holds its entry, so the entries a load wrote cannot be found
+ * under a different spelling — and the three simplewiki databases were loaded under this one. 99.67%
+ * of their keys are byte-identical either way; this covers the 0.332% that are not, which is every
+ * title holding a non-ASCII capital or a literal `%`.
+ *
+ * Read paths only. A *write* under this would recreate the collision the escape exists to prevent,
+ * which is why `/ingest/pages` does not fall back.
+ */
+export const legacyTitleKey = (ns: number, title: string): string =>
+  `${ns}:${title.replace(/[A-Z]/g, (c) => `%${c.charCodeAt(0).toString(16)}`)}`;
+
 /** The page card the demo renders: the page, its first outlinks and categories, and the two counts
  *  that would each have been a `COUNT(*)`. The outlink *targets* live in their own vshards, so this
  *  is the two-hop case — one request to the page's host, then one batched request per host holding
