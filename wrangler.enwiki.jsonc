@@ -1,0 +1,49 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "hlekk-enwiki",
+  // The demo at scale: English Wikipedia, namespaces 0 and 14, under the link-graph placement.
+  //
+  // WHY A FOURTH DEPLOYMENT, AND ONLY ONE PLACEMENT. The three simplewiki deployments answer the
+  // demo's question -- a key derived from the link graph reads a page from 10.7 hosts of 43 where a
+  // title hash needs 34.7, and a page's first category only gets to 26.2. That comparison needs
+  // three databases loaded from identical records, which at this size costs 20 hours each. So the
+  // comparison stays at simplewiki, where it is complete and cheap to re-run, and this exists to
+  // show the same key holding up two orders of magnitude further out.
+  //
+  // WHAT IS DELIBERATELY NOT HERE: no HLEKK_ALT, so nothing forwards to it and nothing forwards out;
+  // no HLEKK_WIPE, so it carries no route that destroys 200 GB.
+  "main": "src/worker/wiki-app.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "HLEKK_HOSTS", "class_name": "HlekkHostDO" },
+      { "name": "HLEKK_DIRECTORY", "class_name": "HlekkDirectoryDO" }
+    ]
+  },
+  // Its own namespaces. `enwiki/h-0` here is a different object from that name anywhere else.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HlekkHostDO", "HlekkDirectoryDO"] }],
+  // Shared with the simplewiki deployments: a chunk key is `m/${database}/${index}`, and the
+  // database names differ.
+  "kv_namespaces": [{ "binding": "HLEKK_MAP", "id": "af144fc56d0541699307352f0a63ab76" }],
+  "vars": {
+    "HLEKK_DATABASE": "enwiki-graph",
+    /**
+     * 256, where simplewiki used 128, and `/admin/init?hosts=86&indexVshards=128` is the matching
+     * call. Read once, when the directory first opens, so this is chosen before the load and cannot
+     * be changed afterwards -- which is why it is sized from a measurement rather than a guess.
+     *
+     * `init` spreads these 256 across hosts at `per = ceil(256/86) = 3`, giving 86 hosts, then opens
+     * a second batch of 256 and takes the first 128 of it as index vshards. So: 512 vshards, 384 of
+     * them taking data, 128 serving the unique title index, on 86 hosts.
+     *
+     * The sizing. simplewiki measured 61.4 bytes per stored row across all three placements, and
+     * this import is 21,963,892 pages and ~2.8-3.5 billion edges -- 161 to 201 GB. Over 43 hosts
+     * that is 3.75 to 4.68 GB each, and `Allocator.active()` drops a vshard once it passes *half*
+     * the 9 GB cap, so 43 hosts would have run the placement set down to nothing mid-load and
+     * shifted every subsequent `place()`. Over 86 it is 1.88 to 2.34 GB a host and 0.42 to 0.52 GB
+     * a vshard, which leaves the active set whole and the 10 GB per-object ceiling far off.
+     */
+    "HLEKK_VSHARDS": "256"
+  },
+  "observability": { "enabled": true }
+}
