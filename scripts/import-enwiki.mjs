@@ -50,6 +50,28 @@ const WORK = args.get("work") ?? join(".wrangler", `import-${WIKI}-${DATE}`);
 const AFFINITY = args.get("affinity") ?? "category"; // category | graph | namespace | initial | hash
 const SORT_MEM = args.get("sortMem") ?? "2G";
 const LIMIT = Number(args.get("limit") ?? Infinity);
+/**
+ * Which MediaWiki namespaces to keep, comma separated, or every one of them when unset.
+ *
+ * Unset is what simplewiki was imported under, and the figures in docs/wikimedia-demo.md are from
+ * that. It exists for enwiki, where the whole dump is 66.5 M pages and the namespaces a reader
+ * never sees are most of the cost: ns 3 (User talk) alone is 31% of simplewiki's pages, and nothing
+ * in the demo reads one.
+ *
+ * `0,14` is the encyclopedia and its categories — articles, the redirects that resolve to them, and
+ * the category pages a page card shows. That is the whole of what the page view touches.
+ *
+ * The filter is applied where pages are read, which is enough to make it total: pass 1 resolves a
+ * link target by joining `linktarget` against `pages.tsv`, so a link into a namespace that is not
+ * kept finds no page and becomes a red link, exactly as a link to a title that was never written
+ * does. It is applied to `pagelinks` as well, for cost rather than correctness — 1.78 billion rows
+ * whose source is not a kept page would otherwise be written and sorted before anything dropped
+ * them.
+ */
+const NAMESPACES = args.has("namespaces")
+  ? new Set(args.get("namespaces").split(",").map((n) => Number(n.trim())))
+  : null;
+const keptNs = (ns) => NAMESPACES === null || NAMESPACES.has(Number(ns));
 const PASSES = new Set((args.get("passes") ?? "0,0b,1,2,3,4,5").split(","));
 
 const path = (f) => join(WORK, f);
@@ -234,10 +256,15 @@ class LtMap {
 async function pass0() {
   const out = writer(path("pages-raw.tsv"));
   let n = 0;
+  let skipped = 0;
   // page: (page_id, page_namespace, page_title, page_is_redirect, page_is_new, page_random,
   //        page_touched, page_links_updated, page_latest, page_len, page_content_model, page_lang)
   for await (const f of rows(await dump("page"))) {
     expect("page", f, 12);
+    if (!keptNs(f[1])) {
+      skipped++;
+      continue;
+    }
     await out.write(`${f[0]}\t${f[1]}\t${f[2]}\t${f[3]}\t${f[9] ?? 0}\n`);
     if (++n % 5_000_000 === 0) log(`pass 0: ${n.toLocaleString()} pages`);
     if (n >= LIMIT) break;
@@ -245,7 +272,13 @@ async function pass0() {
   await out.end();
   await sorted(path("pages-raw.tsv"), path("pages.tsv"), ["1,1n"]);
   report.pages = n;
-  log(`pass 0: ${n.toLocaleString()} pages`);
+  report.pagesSkipped = skipped;
+  log(
+    `pass 0: ${n.toLocaleString()} pages` +
+      (NAMESPACES === null
+        ? ""
+        : `, ${skipped.toLocaleString()} outside namespaces ${[...NAMESPACES].join(",")}`),
+  );
 }
 
 /**
@@ -367,15 +400,27 @@ async function extractPagelinks() {
   const out = writer(raw);
   let n = 0;
   // pagelinks: (pl_from, pl_from_namespace, pl_target_id)
+  let skipped = 0;
   for await (const f of rows(await dump("pagelinks"))) {
     expect("pagelinks", f, 3);
+    // The source's namespace is a column here, so an unkept source costs nothing to drop. The
+    // *target* is not filtered: it is an id into `linktarget`, and pass 1 already resolves it to a
+    // kept page or to nothing.
+    if (!keptNs(f[1])) {
+      skipped++;
+      continue;
+    }
     await out.write(`${f[0]}\t${f[2]}\n`);
     if (++n % 50_000_000 === 0) log(`pagelinks: ${n.toLocaleString()} rows`);
     if (n >= LIMIT) break;
   }
   await out.end();
   report.pagelinks = n;
-  log(`pagelinks: ${n.toLocaleString()} rows`);
+  report.pagelinksSkipped = skipped;
+  log(
+    `pagelinks: ${n.toLocaleString()} rows` +
+      (NAMESPACES === null ? "" : `, ${skipped.toLocaleString()} from an unkept namespace`),
+  );
   return raw;
 }
 
