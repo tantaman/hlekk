@@ -507,6 +507,27 @@ One caveat kept rather than buried: this is a 2,000-page sample whose rows are a
 `databaseSize` moves in 4 KB pages, so it is a floor reading on a small database. The figure to carry
 forward is "at or below 1x", not "0.85".
 
+**Settled at full scale, and the caveat was right.** All 950,421 pages and 42,817,596 edges of
+simplewiki, loaded onto 43 deployed hosts from an empty baseline:
+
+| | |
+| --- | --- |
+| Data bytes | 2,690,924,544 (2.69 GB) |
+| Rows | 43,768,017 |
+| Bytes per row | **61.5** |
+| Bytes per edge | 62.8 (the 2,000-page sample read 54.1) |
+| Multiplier over payload arithmetic | **1.04x** (the sample read 0.85x) |
+| Per host | 62.6 MB against a 9,000 MB vshard cap |
+
+So the multiplier is *just above* 1x rather than below it — which is why the sample's advice to carry
+"at or below 1x" forward was the right call and "0.85" would not have been. It is still at the very
+bottom of the 1.05x-4.7x range this doc originally gave.
+
+**And the enwiki extrapolation holds.** 61.5 bytes/row across 66.5 M pages and 3.5 billion edges is
+**219 GB**, against the ~215 GB this doc predicted from a 2,000-page floor reading. `linked_from`
+stays, with room to spare: the demo's 43 hosts are at 0.7% of the vshard cap, so the shape that
+bounds a 219 GB load is host count and ingest time, not bytes per row.
+
 ### The affinity key that ate the cluster
 
 The 10,000-page load did not finish, and why is the most important thing the pilot found.
