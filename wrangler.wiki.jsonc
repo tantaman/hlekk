@@ -32,10 +32,14 @@
     // cannot be changed by editing this afterwards.
     "HLEKK_VSHARDS": "128"
   },
-  // The control deployment, holding the same wiki under a title-hash placement. `?placement=b` is
-  // forwarded to it, so the comparison is same-origin for the browser and never leaves Cloudflare.
-  // It has to be deployed first: a service binding names a Worker that must already exist.
-  "services": [{ "binding": "HLEKK_ALT", "service": "hlekk-wiki-hash" }],
+  // The other two deployments, holding the same wiki under a title-hash placement and under one
+  // derived from the link graph. `?placement=b` and `?placement=c` are forwarded to them, so the
+  // comparison is same-origin for the browser and never leaves Cloudflare. Both have to be deployed
+  // first: a service binding names a Worker that must already exist.
+  "services": [
+    { "binding": "HLEKK_ALT", "service": "hlekk-wiki-hash" },
+    { "binding": "HLEKK_ALT2", "service": "hlekk-wiki-graph" }
+  ],
   // HLEKK_WIPE is deliberately absent too, and for a sharper reason: it arms POST /admin/wipe, which
   // tells every object of the database it names to erase itself. Without the var the route refuses
   // everything, so this public demo carries no working way to destroy data. Arming it is a

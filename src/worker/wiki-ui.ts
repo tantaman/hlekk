@@ -156,6 +156,7 @@ select.hw-input{font-family:var(--font-mono);font-size:13px}
    on screen at once. Stacked, it is two numbers to remember and compare, which is the version of
    this demo that does not land. */
 .hw-ab{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:2.4vh;align-items:start}
+.hw-ab.is-three{grid-template-columns:1fr 1fr 1fr}
 .hw-abc{background:var(--panel);border:1px solid var(--line2);border-radius:14px;padding:18px 18px 20px}
 .hw-abc.is-wide{border-color:var(--orange)}
 .hw-abh{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
@@ -543,13 +544,23 @@ document.addEventListener("click", (e) => {
 // The control database's roster, fetched the first time the comparison is asked for rather than at
 // boot: it costs a call per host, and most visitors never open this tab.
 let CLUSTER_B = null;
+let CLUSTER_C = null;
+
+async function loadRoster(placement) {
+  try {
+    const d = await fetch("/admin/where?placement=" + placement).then((r) => r.json());
+    if (Array.isArray(d.hosts)) return { hosts: d.hosts, indexVshards: (d.indexVshards || []).length };
+  } catch (e) { /* as with the other roster, a failed one degrades the grid rather than the page */ }
+  return null;
+}
 
 async function loadClusterB() {
-  if (CLUSTER_B) return;
-  try {
-    const d = await fetch("/admin/where?placement=b").then((r) => r.json());
-    if (Array.isArray(d.hosts)) CLUSTER_B = { hosts: d.hosts, indexVshards: (d.indexVshards || []).length };
-  } catch (e) { /* as with the other roster, a failed one degrades the grid rather than the page */ }
+  // Both at once, and only on the first comparison: each costs a call per host, and most visitors
+  // never open this tab.
+  if (CLUSTER_B && CLUSTER_C) return;
+  const got = await Promise.all([CLUSTER_B ? CLUSTER_B : loadRoster("b"), CLUSTER_C ? CLUSTER_C : loadRoster("c")]);
+  CLUSTER_B = got[0];
+  CLUSTER_C = got[1];
 }
 
 const abOut = document.getElementById("abouts");
@@ -584,16 +595,25 @@ function abSide(label, lead, d, roster, wide) {
 async function compare(title, ns) {
   if (!title) return;
   abOut.innerHTML = '<div class="hw-panel"><p class="hw-note">Reading ' + esc(pretty(title))
-    + " from both placements…</p></div>";
+    + " from all three placements…</p></div>";
   await loadClusterB();
-  const q = "?ns=" + encodeURIComponent(ns) + "&title=" + encodeURIComponent(stored(title)) + "&limit=25";
-  let a = null, b = null;
+  // limit=100, not 25. A truncated read returns the *smallest-id* targets, and init places a
+  // contiguous id band on a contiguous host band -- so a truncated comparison partly measures the
+  // id layout rather than the placement. 100 covers the whole link set of most articles; where it
+  // does not, the verdict below says so rather than quoting a number it cannot stand behind.
+  const q = "?ns=" + encodeURIComponent(ns) + "&title=" + encodeURIComponent(stored(title)) + "&limit=100";
+  let a = null, b = null, c = null;
   try {
-    // Both at once: the two reads are independent, and running them in series would make the slower
-    // placement look even slower by however long the other one took.
-    const got = await Promise.all([fetch("/page" + q), fetch("/page" + q + "&placement=b")]);
+    // All three at once: the reads are independent, and running them in series would make each
+    // placement look slower by however long the others took.
+    const got = await Promise.all([
+      fetch("/page" + q),
+      fetch("/page" + q + "&placement=b"),
+      fetch("/page" + q + "&placement=c"),
+    ]);
     a = await got[0].json();
     b = await got[1].json();
+    c = await got[2].json();
   } catch (e) {
     abOut.innerHTML = '<p class="hw-err">Request failed: ' + esc(e.message) + "</p>";
     return;
@@ -605,31 +625,45 @@ async function compare(title, ns) {
     return;
   }
 
-  let html = '<div class="hw-ab">'
-    + abSide("clustered · by category", "Pages placed by their first category, so a page and the "
-      + "pages it links to tend to share a host.", a, CLUSTER, false)
-    + abSide("spread · by title hash", "Pages placed by a hash of the title. Perfectly even, and "
-      + "every neighbour is somewhere else.", b, CLUSTER_B, true)
+  let html = '<div class="hw-ab is-three">'
+    + abSide("by category", "Pages placed by their first category. A category describes a page; its "
+      + "links point away from it, so there is less here to colocate than it sounds.", a, CLUSTER, false)
+    + abSide("by title hash · control", "Pages placed by a hash of the title. Perfectly even, and "
+      + "every neighbour is somewhere else. This is the baseline the others are quoted against.",
+      b, CLUSTER_B, true)
+    + abSide("by link graph", "Pages placed by partitioning the link graph itself, so a page and "
+      + "the pages it actually links to are put on one host.", c, CLUSTER_C, false)
     + "</div>";
 
   // The verdict, stated in the numbers the two sides actually reported rather than in adjectives.
   // Only when both answered: half a comparison is not one.
   if (!b || !b.found) {
-    html += '<div class="hw-verdict"><p class="hw-note">Only one side answered, so there is no '
-      + "comparison to draw yet.</p></div>";
+    html += '<div class="hw-verdict"><p class="hw-note">The control did not answer, so there is '
+      + "nothing to quote a ratio against yet.</p></div>";
   } else {
-    const ra = a.read, rb = b.read;
-    const times = ra.hosts.length > 0 ? (rb.hosts.length / ra.hosts.length) : 0;
-    html += '<div class="hw-verdict"><p class="hw-note">Same page, same ' + nf(ra.objects)
-      + " objects, same cluster. Clustered touched <b>" + ra.hosts.length + "</b> host"
-      + (ra.hosts.length === 1 ? "" : "s") + " in <b>" + nf(ra.requests) + "</b> request"
-      + (ra.requests === 1 ? "" : "s") + "; spread touched <b>" + rb.hosts.length + "</b> in <b>"
-      + nf(rb.requests) + "</b>"
-      + (times >= 1.15
-        ? " — <b>" + times.toFixed(1) + "x</b> the hosts for the same answer."
-        : ". On this page the two are close; a page whose links are spread thinly across categories "
-          + "has little locality to find.")
-      + " Nothing about the data differs. The only difference is where it was put.</p></div>";
+    // The control is the denominator: it provably buys no locality, so a ratio against it is the
+    // locality a placement found rather than a difference between two guesses.
+    const rb = b.read;
+    const ratio = (d) => (d && d.found && d.read.hosts.length > 0 ? rb.hosts.length / d.read.hosts.length : null);
+    const say = (label, d) => {
+      if (!d || !d.found) return "";
+      const r = ratio(d);
+      return " " + label + " touched <b>" + d.read.hosts.length + "</b>"
+        + (r !== null && r >= 1.15 ? " (<b>" + r.toFixed(1) + "x</b> fewer)" : "") + ".";
+    };
+    // A page whose link set did not fit the limit is not a fair comparison: each side returned its
+    // own smallest-id slice. Say so instead of quoting the ratio as though it were clean.
+    const whole = (d) => !d || !d.found
+      || (d.page.links.length === d.page.linkCount && d.page.categories.length === d.page.categoryCount);
+    const fair = whole(a) && whole(b) && whole(c);
+    html += '<div class="hw-verdict"><p class="hw-note">Same page, same ' + nf(rb.objects)
+      + " objects, same cluster, same code. The control touched <b>" + rb.hosts.length + "</b> host"
+      + (rb.hosts.length === 1 ? "" : "s") + " of " + (CLUSTER_B ? CLUSTER_B.hosts.length : "?") + "."
+      + say("Category", a) + say("The link graph", c)
+      + " Nothing about the data differs. The only difference is where it was put."
+      + (fair ? "" : " <b>This page's links do not all fit the limit</b>, so each side read its own "
+        + "slice of them and the counts are not strictly comparable — try a page with fewer links.")
+      + "</p></div>";
   }
 
   abOut.innerHTML = html;

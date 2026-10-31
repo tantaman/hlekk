@@ -9,7 +9,7 @@ import { describe, it } from "node:test";
 import { normalize } from "../client/client.ts";
 import { LIMITS, QueryRefused, build, check, parseQuery, planOf, price, schemaView, unparse } from "./wiki-query.ts";
 import type { QuerySpec } from "./wiki-query.ts";
-import { categoryPages, linkedFrom, pageCategories, pageLinks, titleKey } from "./wiki.ts";
+import { categoryPages, legacyTitleKey, linkedFrom, pageCategories, pageLinks, titleKey } from "./wiki.ts";
 
 const from = { ns: 0, title: "France" };
 const refusal = (spec: unknown): QueryRefused => {
@@ -444,5 +444,25 @@ describe("the title index key", () => {
 
   it("separates namespaces, so a Talk page and an article may share a title", () => {
     assert.notEqual(key(0, "France"), key(1, "France"));
+  });
+
+  // The read-path fallback, which is what lets the fix ship without re-keying a loaded database.
+  describe("the key a loaded database may be holding", () => {
+    const legacy = (ns: number, title: string) => normalize(legacyTitleKey(ns, title));
+
+    it("agrees with the current key wherever the current key did not change", () => {
+      // 99.67% of simplewiki's titles. A lookup that hits on the first try never pays for the
+      // fallback, which is the only reason it is affordable on the demo's one entry point.
+      for (const t of ["France", "Ash", "ASH", "Tom_Baker", "Liberal_arts", "1836"]) {
+        assert.equal(legacy(0, t), key(0, t), t);
+      }
+    });
+
+    it("still collides where it always did, which is why it is read-only", () => {
+      // Writing under this key is what merged the seven pairs. The fallback exists so those pages
+      // stay *findable* in a database already loaded this way -- not so that another load can
+      // reproduce the defect.
+      for (const [a, b] of COLLIDED) assert.equal(legacy(0, a), legacy(0, b), `${a} / ${b}`);
+    });
   });
 });

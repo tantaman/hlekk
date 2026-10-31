@@ -1,10 +1,11 @@
 // How the wiki Worker decides that a request is not its to answer.
 //
-// The demo's claim is a comparison between two placements, and a placement is a property of a whole
-// database: one deployment holds exactly one. So `?placement=b` is a forward, not a lookup, and the
-// two things worth testing are that only that one value forwards, and that the parameter does not
-// survive the trip -- the control deployment runs this same code, so a forward that kept it would
-// ask to be forwarded again, and the loop would be a Worker calling itself until it ran out.
+// The demo's claim is a comparison between three placements, and a placement is a property of a
+// whole database: one deployment holds exactly one. So `?placement=b` and `?placement=c` are
+// forwards, not lookups, and the things worth testing are that only those two values forward, that
+// each names its own binding, and that the parameter does not survive the trip -- the other
+// deployments run this same code, so a forward that kept it would ask to be forwarded again, and
+// the loop would be a Worker calling itself until it ran out.
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
@@ -15,31 +16,44 @@ const at = (query: string) => altTarget(new URL("https://wiki.example.com/page" 
 
 describe("altTarget", () => {
   it("forwards the control placement", () => {
-    const to = at("?ns=0&title=Country&placement=b");
-    assert.ok(to !== null);
-    assert.equal(to.pathname, "/page");
+    const alt = at("?ns=0&title=Country&placement=b");
+    assert.ok(alt !== null);
+    assert.equal(alt.to.pathname, "/page");
+    assert.equal(alt.which, "b");
+  });
+
+  it("forwards the graph placement to its own binding", () => {
+    // Which binding, not just that it forwards: the control and the placement under test are not
+    // interchangeable, and sending one to the other would quote a ratio of a database against
+    // itself.
+    const alt = at("?ns=0&title=Country&placement=c");
+    assert.ok(alt !== null);
+    assert.equal(alt.to.pathname, "/page");
+    assert.equal(alt.which, "c");
   });
 
   it("strips the parameter, so the forward cannot bounce back", () => {
-    const to = at("?title=Country&placement=b");
-    assert.ok(to !== null);
-    assert.equal(to.searchParams.get("placement"), null);
-    assert.equal(altTarget(to), null, "the forwarded URL must be one the other side answers itself");
+    for (const which of ["b", "c"]) {
+      const alt = at("?title=Country&placement=" + which);
+      assert.ok(alt !== null);
+      assert.equal(alt.to.searchParams.get("placement"), null);
+      assert.equal(altTarget(alt.to), null, "the forwarded URL must be one the other side answers itself");
+    }
   });
 
   it("carries everything else across unchanged", () => {
-    const to = at("?ns=14&title=Cancer_deaths_in_Canada&limit=25&placement=b&driver=rounds");
-    assert.ok(to !== null);
-    assert.equal(to.searchParams.get("ns"), "14");
-    assert.equal(to.searchParams.get("title"), "Cancer_deaths_in_Canada");
-    assert.equal(to.searchParams.get("limit"), "25");
-    assert.equal(to.searchParams.get("driver"), "rounds");
+    const alt = at("?ns=14&title=Cancer_deaths_in_Canada&limit=25&placement=b&driver=rounds");
+    assert.ok(alt !== null);
+    assert.equal(alt.to.searchParams.get("ns"), "14");
+    assert.equal(alt.to.searchParams.get("title"), "Cancer_deaths_in_Canada");
+    assert.equal(alt.to.searchParams.get("limit"), "25");
+    assert.equal(alt.to.searchParams.get("driver"), "rounds");
   });
 
   it("answers everything else itself", () => {
-    // Including the names an earlier design accepted as aliases. One spelling, so there is one
-    // answer to "did this request go to the other database".
-    for (const q of ["", "?placement=a", "?placement=alt", "?placement=hash", "?placement=", "?placement=B"]) {
+    // Including the names an earlier design accepted as aliases. One spelling per placement, so
+    // there is one answer to "did this request go to another database".
+    for (const q of ["", "?placement=a", "?placement=alt", "?placement=hash", "?placement=", "?placement=B", "?placement=C", "?placement=graph", "?placement=d"]) {
       assert.equal(at(q), null, q === "" ? "(no parameter)" : q);
     }
   });

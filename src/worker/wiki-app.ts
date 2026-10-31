@@ -37,6 +37,7 @@ import {
   linkedFrom,
   pageCategories,
   pageLinks,
+  legacyTitleKey,
   titleKey,
 } from "./wiki.ts";
 
@@ -101,6 +102,16 @@ interface WikiEnv extends Env {
   HLEKK_ALT?: { fetch(request: Request): Promise<Response> };
 
   /**
+   * A third deployment of this same Worker, holding the same wiki under a placement derived from the
+   * link graph. `?placement=c` is forwarded to it, on the same reasoning as `HLEKK_ALT`.
+   *
+   * Separate from `HLEKK_ALT` rather than a list, because the two are not interchangeable to a
+   * reader: one is the no-locality control every number is quoted against, the other is the
+   * placement under test.
+   */
+  HLEKK_ALT2?: { fetch(request: Request): Promise<Response> };
+
+  /**
    * Arms `/admin/wipe` for the databases this names, comma separated, and for no others.
    *
    * Absent — which is the committed state — the route refuses everything, so a public demo does not
@@ -138,11 +149,12 @@ export function wipeTarget(env: WikiEnv, url: URL): string | null {
  * The parameter is stripped on the way: the control deployment runs this same code, and a forward
  * that kept it would be a request asking to be forwarded again.
  */
-export function altTarget(url: URL): URL | null {
-  if (url.searchParams.get("placement") !== "b") return null;
+export function altTarget(url: URL): { to: URL; which: "b" | "c" } | null {
+  const which = url.searchParams.get("placement");
+  if (which !== "b" && which !== "c") return null;
   const to = new URL(url);
   to.searchParams.delete("placement");
-  return to;
+  return { to, which };
 }
 
 export default {
@@ -154,16 +166,32 @@ export default {
     // and the other placement is somewhere else entirely.
     const alt = altTarget(url);
     if (alt !== null) {
-      if (env.HLEKK_ALT === undefined) {
-        return json({ error: "no control deployment is bound to this one", placement: "b" }, 503);
+      const to = alt.which === "b" ? env.HLEKK_ALT : env.HLEKK_ALT2;
+      if (to === undefined) {
+        const what = alt.which === "b" ? "control" : "graph";
+        return json({ error: `no ${what} deployment is bound to this one`, placement: alt.which }, 503);
       }
-      return env.HLEKK_ALT.fetch(new Request(alt, request));
+      return to.fetch(new Request(alt.to, request));
     }
 
     const db = Hlekk.from(cloudflareTransport(env));
     const directory = directoryStub(env);
     const body = async <T>(): Promise<T> => (await request.json()) as T;
     const num = (k: string, fallback: number) => Number(url.searchParams.get(k) ?? fallback);
+    /**
+     * A title's id, under the current index key or the one this database may have been loaded with.
+     *
+     * One extra index lookup, and only on a miss, so a hit costs nothing. See `legacyTitleKey` for
+     * why a loaded database cannot simply be re-keyed. The second lookup is skipped when the two
+     * spellings agree, which is 99.67% of simplewiki's titles.
+     */
+    const byTitle = async (n: number, t: string): Promise<Id | null> => {
+      const key = titleKey(n, t);
+      const id = await db.lookupUnique(TITLE_IDX, key);
+      if (id !== null) return id;
+      const legacy = legacyTitleKey(n, t);
+      return legacy === key ? null : db.lookupUnique(TITLE_IDX, legacy);
+    };
 
     try {
       // ---- the demo you can look at
@@ -185,6 +213,7 @@ export default {
           // Whether the comparison is reachable from here at all, which is what the A/B tab needs
           // to know before it offers one.
           alt: env.HLEKK_ALT === undefined ? null : "bound",
+          alt2: env.HLEKK_ALT2 === undefined ? null : "bound",
           vshards: env.HLEKK_VSHARDS ?? null,
         });
       }
@@ -428,7 +457,7 @@ export default {
           // MediaWiki's `page_title` form; a namespace prefix is a separate column.
           const at = t.indexOf(":");
           const [n, title] = at < 0 ? [ns, t] : [Number(t.slice(0, at)), t.slice(at + 1)];
-          return db.lookupUnique(TITLE_IDX, titleKey(n, title));
+          return byTitle(n, title);
         });
         return json({
           ids: Object.fromEntries(titles.map((t, i) => [t, found[i] instanceof Error ? null : found[i]])),
@@ -443,7 +472,7 @@ export default {
         const title = url.searchParams.get("title") ?? "";
         const limit = num("limit", 25);
         const lookupStarted = Date.now();
-        const id = await db.lookupUnique(TITLE_IDX, titleKey(ns, title));
+        const id = await byTitle(ns, title);
         const lookupMs = Date.now() - lookupStarted;
         if (id === null) return json({ found: false, ns, title, lookupMs }, 404);
 
@@ -539,7 +568,7 @@ export default {
           if (e instanceof QueryRefused) return json({ refused: e.message, at: e.at, offset: e.offset }, 400);
           throw e;
         }
-        const id = await db.lookupUnique(TITLE_IDX, titleKey(spec.from.ns, spec.from.title));
+        const id = await byTitle(spec.from.ns, spec.from.title);
         if (id === null) {
           return json({ refused: `no page "${spec.from.title}" in namespace ${spec.from.ns}`, at: "from" }, 404);
         }
