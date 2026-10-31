@@ -3,7 +3,7 @@
 
 import type { Catalog } from "../catalog/catalog.ts";
 // Type-only, and erased, so naming the host here makes no runtime cycle with it.
-import type { ExecReply, Host, OutboxOp, Reply, Routed } from "../host/host.ts";
+import type { AssocAddManyEdge, ExecReply, Host, OutboxOp, Reply, Routed } from "../host/host.ts";
 import type { Route } from "../directory/map.ts";
 import type { Fields, Id, Miss, Plan } from "../query/types.ts";
 
@@ -13,6 +13,9 @@ export type Mutation =
   | { kind: "update"; id: Id; data: Fields; expect?: number }
   | { kind: "delete"; id: Id }
   | { kind: "assocAdd"; atype: number; id1: Id; id2: Id; time?: number; data?: Fields | null }
+  // Many adds, one transaction, one durable commit. Every edge must share a vshard, because the
+  // batch is routed and fenced by the first of them; `Client.assocAddMany` is what groups them.
+  | { kind: "assocAddMany"; edges: readonly AssocAddManyEdge[] }
   | { kind: "assocRemove"; atype: number; id1: Id; id2: Id }
   | { kind: "apply"; op: OutboxOp }
   | { kind: "indexReserve"; vshard: string; idx: number; key: string; now: number; ttlMs: number }
@@ -30,6 +33,12 @@ export function anchorOf(m: Mutation): { kind: "vshard"; vshard: string } | { ki
     case "assocAdd":
     case "assocRemove":
       return { kind: "id", id: m.id1 };
+    case "assocAddMany": {
+      const first = m.edges[0];
+      // An empty batch has no anchor, so it cannot be routed. Refusing beats picking a host.
+      if (first === undefined) throw new TypeError("assocAddMany needs at least one edge to route by");
+      return { kind: "id", id: first.id1 };
+    }
     case "apply":
       return { kind: "id", id: m.op.kind === "delete" ? m.op.id : m.op.id1 };
     case "indexReserve":
@@ -54,6 +63,8 @@ export function applyTo(host: Host, m: Mutation, epoch: number): Reply<unknown> 
       return host.delete({ id: m.id, epoch });
     case "assocAdd":
       return host.assocAdd({ atype: m.atype, id1: m.id1, id2: m.id2, time: m.time, data: m.data, epoch });
+    case "assocAddMany":
+      return host.assocAddMany({ edges: m.edges, epoch });
     case "assocRemove":
       return host.assocRemove({ atype: m.atype, id1: m.id1, id2: m.id2, epoch });
     case "apply":

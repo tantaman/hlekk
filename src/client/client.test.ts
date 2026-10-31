@@ -309,3 +309,57 @@ describe("unroutable ids", () => {
     await assert.rejects(() => db.update(makeId(5000n, 1n), { x: 1 }), /no host owns vshard 5000/);
   });
 });
+
+// A batch is one transaction on one host, so the client has to split one by vshard before it can
+// send it. These check that the splitting is right and invisible: the caller hands over a flat list
+// of edges whose sources live anywhere in the database and gets what the per-edge path would give.
+describe("a batched edge add", () => {
+  const seed = async (db: ReturnType<LocalCluster["client"]>, vshard: string, n: number) => {
+    const issue = await db.create(ISSUE, { title: `i${vshard}` }, { vshard });
+    const edges = [];
+    for (let k = 0; k < n; k++) {
+      const comment = await db.create(COMMENT, { body: `c${k}`, authorId: "0" }, { with: issue });
+      edges.push({ atype: ISSUE_COMMENT, id1: issue, id2: comment, time: k + 1 });
+    }
+    return { issue, edges };
+  };
+
+  it("splits a batch across vshards and writes every edge", async () => {
+    const c = await cluster();
+    const db = c.client();
+    const seeded = [];
+    for (const v of ["1", "2", "3", "17", "33", "49"]) seeded.push(await seed(db, v, 4));
+    // More than one vshard really is in play, or this proves nothing about grouping.
+    assert.ok(new Set(seeded.map((s) => vshardOf(s.issue))).size > 1, "issues should span vshards");
+
+    const written = await db.assocAddMany(seeded.flatMap((s) => s.edges));
+    assert.equal(written, 24);
+
+    const out = (await db.query(ISSUE_PAGE, seeded.map((s) => s.issue))) as {
+      commentCount: number;
+      comments: { body: string }[];
+    }[];
+    assert.equal(out.length, 6);
+    for (const row of out) {
+      assert.equal(row.commentCount, 4);
+      assert.equal(row.comments.length, 4);
+    }
+  });
+
+  it("agrees with the per-edge path", async () => {
+    const mk = async (batched: boolean) => {
+      const c = await cluster();
+      const db = c.client();
+      const { issue, edges } = await seed(db, "5", 5);
+      if (batched) await db.assocAddMany(edges);
+      else for (const e of edges) await db.assocAdd(e.atype, e.id1, e.id2, e.time);
+      return await db.query(ISSUE_PAGE, [issue]);
+    };
+    assert.deepEqual(await mk(true), await mk(false));
+  });
+
+  it("writes nothing, and asks nothing of the router, for an empty batch", async () => {
+    const c = await cluster();
+    assert.equal(await c.client().assocAddMany([]), 0);
+  });
+});

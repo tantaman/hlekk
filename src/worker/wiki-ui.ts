@@ -216,7 +216,8 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
       <button class="hw-btn" type="submit">look up</button>
     </form>
     <p class="hw-note">Entry is exact <code>(namespace, title)</code> against a unique index. There is
-      no scan and no prefix search, so there is nothing to suggest titles from. Try
+      no scan and no prefix search, so there is nothing to suggest titles from. The first letter is
+      capitalized for you, as MediaWiki does; nothing else is. Try
       <a href="#" data-go="Country">Country</a>, <a href="#" data-go="Europe">Europe</a>,
       <a href="#" data-go="Earth">Earth</a> or <a href="#" data-go="Water">Water</a>.</p>
 
@@ -264,7 +265,15 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 // Displayed with spaces, queried with underscores: the index key is the stored page_title.
 const pretty = (t) => String(t).replace(/_/g, " ");
-const stored = (t) => String(t).trim().replace(/ /g, "_");
+// MediaWiki capitalizes the first letter of a title in every standard namespace, so the stored
+// page_title for "country" is "Country". titleKey is deliberately case-*sensitive* (it percent-
+// escapes uppercase to survive the lowercasing normalizer), so without this a visitor typing a
+// title in lower case gets "Not found" for a page that is there -- the most likely first
+// interaction with the demo, failing. This is MediaWiki's own rule, not a fuzzy search.
+const stored = (t) => {
+  const u = String(t).trim().replace(/ /g, "_");
+  return u.charAt(0).toUpperCase() + u.slice(1);
+};
 const nf = (n) => Number(n).toLocaleString();
 
 let SCHEMA = null;

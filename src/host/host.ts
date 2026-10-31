@@ -151,6 +151,20 @@ export interface AssocAddOp extends RoutedAt {
   data?: Fields | null;
 }
 
+/** One edge in a batched add. Identical to `AssocAddOp` minus the epoch, which the batch carries
+ *  once for all of them because they are routed and fenced together. */
+export interface AssocAddManyEdge {
+  atype: number;
+  id1: Id;
+  id2: Id;
+  time?: number;
+  data?: Fields | null;
+}
+
+export interface AssocAddManyOp extends RoutedAt {
+  edges: readonly AssocAddManyEdge[];
+}
+
 export interface AssocRemoveOp extends RoutedAt {
   atype: number;
   id1: Id;
@@ -356,6 +370,50 @@ export class Host {
       if (inverse !== undefined) {
         this.#dispatch(vshardOf(op.id1), { kind: "add", atype: inverse, id1: op.id2, id2: op.id1, time, data });
       }
+    });
+  }
+
+  /** Many edge adds in one transaction. This is the primitive a bulk load needs, and the one thing
+   *  batching the *request* cannot provide.
+   *
+   *  `assocAdd` is one mutation, and every mutation commits in one transaction (the note at the top
+   *  of this file), so a thousand edges are a thousand durable commits. That is what the ~6,300
+   *  edges/s ceiling in `wikimedia-import.md` measures, and it is a property of the commit rather
+   *  than of SQLite: the statements inside a transaction are cheap and the durability round trip at
+   *  the end of one is not. `/ingest/edges` already accepted a thousand edges per request and then
+   *  spent them one `assocAdd` at a time, so the batching stopped at the HTTP boundary and bought
+   *  only concurrency against a single-threaded Durable Object. Here N edges cost one commit.
+   *
+   *  Every invariant `assocAdd` holds is held here, in the same order and through the same helpers:
+   *  the maintained-edge refusal, the ownership fence, the idempotent upsert, a count bumped only
+   *  when the edge is new, and an inverse handed to the outbox. What the batch adds is that it is one
+   *  unit — a throw writes nothing — and since `#putEdge` is an upsert whose count moves only for a
+   *  new edge, retrying a whole batch cannot double-count. That is what makes a resumable load safe
+   *  to retry coarsely, which `wikimedia-demo.md` puts above throughput.
+   *
+   *  The fence is claimed once per distinct vshard, not once per edge: `#claim` is a `SELECT`, and a
+   *  thousand edges over two or three vshards should pay three reads rather than a thousand. The
+   *  caller routes a batch by its first edge, so in practice every edge here shares one vshard; the
+   *  set is what keeps that an optimization rather than an assumption. */
+  assocAddMany(op: AssocAddManyOp): Reply<number> {
+    return this.#write(() => {
+      const claimed = new Set<bigint>();
+      for (const e of op.edges) {
+        this.#own(e.atype);
+        const vshard = vshardOf(e.id1);
+        if (!claimed.has(vshard)) {
+          this.#claim(vshard, op.epoch);
+          claimed.add(vshard);
+        }
+        const time = e.time ?? this.clock.now();
+        const data = e.data ?? null;
+        this.#putEdge(e.atype, e.id1, e.id2, time, data);
+        const inverse = this.#catalog.inverseOf(e.atype);
+        if (inverse !== undefined) {
+          this.#dispatch(vshard, { kind: "add", atype: inverse, id1: e.id2, id2: e.id1, time, data });
+        }
+      }
+      return op.edges.length;
     });
   }
 

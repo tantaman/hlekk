@@ -571,3 +571,91 @@ describe("what a vshard costs", () => {
     assert.ok(bytesOf(h, "2") > one * 10, "and vshard 2 is charged for all of it");
   });
 });
+
+// The batched add exists for one reason — one durable commit instead of N — so what these check is
+// that buying that costs none of the guarantees the per-edge path gives. The load-bearing one is the
+// first: the batch is held to the per-edge path's own answer rather than to a hand-written
+// expectation, so a divergence in counts, ordering or payloads shows up as a difference rather than
+// as two tests that were both written wrong.
+describe("a batched edge add", () => {
+  const seedTwo = () => {
+    const a = open("1");
+    const b = open("1");
+    const mk = (h: Host) => {
+      const issue = ok(h.create({ otype: ISSUE, data: { title: "i" }, vshard: "1", epoch: 0 }));
+      const comments = [1, 2, 3, 4, 5].map((t) =>
+        ok(h.create({ otype: COMMENT, data: { body: `c${t}` }, with: issue, epoch: 0 })),
+      );
+      return { issue, comments };
+    };
+    return { a, b, ia: mk(a), ib: mk(b) };
+  };
+
+  it("agrees with the per-edge path on rows, order and counts", async () => {
+    const { a, b, ia, ib } = seedTwo();
+    // a: one mutation per edge. b: all of them in one.
+    ia.comments.forEach((c, i) => ok(a.assocAdd({ atype: ISSUE_COMMENT, id1: ia.issue, id2: c, time: i + 1, epoch: 0 })));
+    const written = ok(
+      b.assocAddMany({
+        edges: ib.comments.map((c, i) => ({ atype: ISSUE_COMMENT, id1: ib.issue, id2: c, time: i + 1 })),
+        epoch: 0,
+      }),
+    );
+    assert.equal(written, 5);
+
+    const pa = known(await a.store().edges(ia.issue, ISSUE_COMMENT, null, 10));
+    const pb = known(await b.store().edges(ib.issue, ISSUE_COMMENT, null, 10));
+    // Ids are per-host but allocated identically from the same seeded vshard, so the lists compare.
+    assert.deepEqual(pb.rows.map((e) => e.id2), pa.rows.map((e) => e.id2));
+    assert.deepEqual(pb.rows.map((e) => e.time), pa.rows.map((e) => e.time));
+    assert.equal(pb.complete, pa.complete);
+    assert.equal(
+      await b.store().count(ib.issue, ISSUE_COMMENT),
+      await a.store().count(ia.issue, ISSUE_COMMENT),
+    );
+    assert.equal(await b.store().count(ib.issue, ISSUE_COMMENT), 5);
+  });
+
+  it("is one unit: a refusal in the middle writes none of the batch", async () => {
+    const { b, ib } = seedTwo();
+    // COMMENT_ISSUE is maintained, so #own refuses it — mid-batch, after a good edge.
+    const r = b.assocAddMany({
+      edges: [
+        { atype: ISSUE_COMMENT, id1: ib.issue, id2: ib.comments[0]!, time: 1 },
+        { atype: COMMENT_ISSUE, id1: ib.comments[1]!, id2: ib.issue, time: 2 },
+        { atype: ISSUE_COMMENT, id1: ib.issue, id2: ib.comments[2]!, time: 3 },
+      ],
+      epoch: 0,
+    });
+    assert.equal(r.ok, false);
+    // The good first edge is gone with the rest of it, which is the whole point of one transaction.
+    const page = known(await b.store().edges(ib.issue, ISSUE_COMMENT, null, 10));
+    assert.deepEqual(page.rows, []);
+    assert.equal(await b.store().count(ib.issue, ISSUE_COMMENT), 0);
+  });
+
+  it("can be retried whole without double-counting", async () => {
+    const { b, ib } = seedTwo();
+    const edges = ib.comments.map((c, i) => ({ atype: ISSUE_COMMENT, id1: ib.issue, id2: c, time: i + 1 }));
+    ok(b.assocAddMany({ edges, epoch: 0 }));
+    ok(b.assocAddMany({ edges, epoch: 0 })); // the coarse retry a resumable load makes
+    assert.equal(await b.store().count(ib.issue, ISSUE_COMMENT), 5);
+    const page = known(await b.store().edges(ib.issue, ISSUE_COMMENT, null, 10));
+    assert.equal(page.rows.length, 5);
+  });
+
+  it("holds the ownership fence, at the batch's epoch", () => {
+    const { b, ib } = seedTwo();
+    const r = b.assocAddMany({
+      edges: [{ atype: ISSUE_COMMENT, id1: ib.issue, id2: ib.comments[0]!, time: 1 }],
+      epoch: 7, // the host owns this vshard at epoch 0
+    });
+    assert.equal(r.ok, false);
+  });
+
+  it("writes nothing for an empty batch", async () => {
+    const { b, ib } = seedTwo();
+    assert.equal(ok(b.assocAddMany({ edges: [], epoch: 0 })), 0);
+    assert.equal(await b.store().count(ib.issue, ISSUE_COMMENT), 0);
+  });
+});
