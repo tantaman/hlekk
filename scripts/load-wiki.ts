@@ -46,7 +46,7 @@
 // edge has been acknowledged, held back by anything still buffered or in flight, so a resume can
 // only ever redo work and never skip it.
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { records } from "./import-enwiki.mjs";
 import { RESERVATION_TTL_MS } from "../src/client/client.ts";
@@ -353,14 +353,36 @@ log(
     `${PLACEMENT === "" ? "" : `, placement ${PLACEMENT}`}${PAGES === Infinity ? "" : `, first ${n(PAGES)} pages`}`,
 );
 
-/** Checkpoints are named after the database, not the wiki. The ids in them are the ids *that*
- *  database minted, so pointing a second database at the first one's map would write edges between
- *  ids that do not exist in it. The A/B control is a second database, so this is not hypothetical. */
-const slug = health.database.replace(/[^a-zA-Z0-9._-]/g, "_");
+/**
+ * Checkpoints are named after the database *and the deployment serving it*.
+ *
+ * After the database, because the ids in them are the ids that database minted: pointing a second
+ * database at the first one's map would write edges between ids that do not exist in it, and the A/B
+ * control is a second database.
+ *
+ * After the deployment too, because a database name is not unique across deployments — and that is
+ * not a hypothetical either. A local `wrangler dev` run of wrangler.wiki.jsonc serves
+ * `wiki-simple-cat`, the same name production serves, so a 400-page local test with `--fresh`
+ * deleted the checkpoint of a 950,421-page production load *that was running at the time*, and then
+ * wrote its own ids and watermark into it. The running load was unharmed, holding its map in memory,
+ * but it resumed pass B from the local run's watermark and silently skipped the first 14 pages'
+ * edges, and the file it left behind mixed local ids with production ones.
+ */
+const slug = `${health.database}@${new URL(BASE).host}`.replace(/[^a-zA-Z0-9._@-]/g, "_");
 const IDS_FILE = args.get("checkpoint") ?? `${WORK}/ids-${slug}.tsv`;
 const POS_FILE = `${WORK}/edges-${slug}.pos`;
 mkdirSync(dirname(IDS_FILE), { recursive: true });
 if (args.has("fresh")) {
+  // A checkpoint that was written seconds ago is one another loader is probably still appending to,
+  // and deleting it out from under that run is how the incident above happened. Refused rather than
+  // warned: the cost of being wrong is a corrupted map, and waiting a minute is free.
+  const live = existsSync(IDS_FILE) ? Date.now() - statSync(IDS_FILE).mtimeMs : Infinity;
+  if (live < 60_000) {
+    throw new Error(
+      `${IDS_FILE} was written ${(live / 1000).toFixed(0)}s ago, so another load is probably using ` +
+        `it; --fresh refuses to delete a live checkpoint`,
+    );
+  }
   rmSync(IDS_FILE, { force: true });
   rmSync(POS_FILE, { force: true });
   log(`--fresh: cleared ${IDS_FILE} and ${POS_FILE}`);

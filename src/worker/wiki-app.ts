@@ -21,6 +21,7 @@ import { Hlekk } from "../client/client.ts";
 import { ValueTaken } from "../client/client.ts";
 import { vshardOf } from "../host/ids.ts";
 import type { Id, Json } from "../query/types.ts";
+import { chunkKey } from "../directory/map.ts";
 import { databaseOf, directoryStub, hostStub } from "../do/bindings.ts";
 import type { Env } from "../do/bindings.ts";
 import { call } from "../do/rpc.ts";
@@ -98,6 +99,37 @@ interface WikiEnv extends Env {
    * deployment has no binding of its own, so a forward cannot loop.
    */
   HLEKK_ALT?: { fetch(request: Request): Promise<Response> };
+
+  /**
+   * Arms `/admin/wipe` for the databases this names, comma separated, and for no others.
+   *
+   * Absent — which is the committed state — the route refuses everything, so a public demo does not
+   * carry a working way to destroy data. Setting it is a deliberate deploy, and it is the operator
+   * naming the victims in configuration rather than a request choosing one.
+   *
+   * A list rather than one name because abandoned databases accumulate: changing `HLEKK_DATABASE`
+   * leaves one behind every time, and this account had three of them before anything could erase
+   * any. One name would have meant one deploy per database, and three deploys of a public Worker
+   * carrying a destructive route is worse than one.
+   */
+  HLEKK_WIPE?: string;
+}
+
+/**
+ * The database this deployment may erase, if the request names one of them.
+ *
+ * Both halves are required and neither is sufficient: the var lists which databases may be wiped,
+ * and the request has to name one of that list exactly. So a stray or probing request does nothing,
+ * and a request can never widen the target — the worst it can do is agree with configuration.
+ */
+export function wipeTarget(env: WikiEnv, url: URL): string | null {
+  const armed = (env.HLEKK_WIPE ?? "")
+    .split(",")
+    .map((name) => name.trim())
+    .filter((name) => name !== "");
+  const asked = url.searchParams.get("database");
+  if (asked === null || asked === "") return null;
+  return armed.includes(asked) ? asked : null;
 }
 
 /**
@@ -187,6 +219,63 @@ export default {
           errors: sizes.filter((s) => s instanceof Error).length,
           of: hosts,
           bytes,
+        });
+      }
+
+      /**
+       * Erases a database: its published map first, then every host, then its directory.
+       *
+       * This exists because changing `HLEKK_DATABASE` is how a clean slate is had here, and that
+       * *abandons* the old database rather than removing it — its host objects keep their rows, and
+       * nothing outside a Durable Object can delete one. See `Ctx.storage.deleteAll`.
+       *
+       * The map is unpublished first, deliberately. While a chunk is still readable a client can
+       * still route into those hosts, and a read served out of a half-erased database is a wrong
+       * answer rather than a missing one. POST only, so no link or prefetch can trigger it.
+       *
+       * Addressing another database's objects is sound *here* and is not sound in `init`, which is
+       * worth stating because the two look alike. A Durable Object resolves its peers and its KV key
+       * from its own env, so telling one to act on another database makes it act on the wrong
+       * objects — that is why there is one database per deployment. A wipe resolves nothing: each
+       * object only erases itself, and the host list comes from the dead directory's own
+       * `inventory` rather than from `where`, which would have asked the live database's hosts.
+       */
+      if (path === "/admin/wipe") {
+        if (request.method !== "POST") return json({ error: "wiping is POST only" }, 405);
+        const dead = wipeTarget(env, url);
+        if (dead === null) {
+          return json(
+            { error: "this deployment is not armed to wipe the database named in ?database=" },
+            403,
+          );
+        }
+        const at = { ...env, HLEKK_DATABASE: dead };
+        const inv = await call<{ hosts: number[]; chunks: number[] }>(directoryStub(at), "inventory");
+        for (const i of inv.chunks) await env.HLEKK_MAP.delete(chunkKey(dead, i));
+        const results = await pooled(inv.hosts, 8, (h) =>
+          call<{ bytes: number; vshards: number }>(hostStub(at, h), "wipe"),
+        );
+        const failed: { host: number; error: string }[] = [];
+        let bytes = 0;
+        let wiped = 0;
+        results.forEach((r, i) => {
+          if (r instanceof Error) failed.push({ host: inv.hosts[i]!, error: `${r.name}: ${r.message}` });
+          else {
+            bytes += r.bytes;
+            wiped++;
+          }
+        });
+        // The directory last: until it is gone it is the only record of which hosts to revisit if
+        // any of them refused.
+        const directory = failed.length > 0 ? null : await call<{ bytes: number }>(directoryStub(at), "wipe");
+        return json({
+          database: dead,
+          chunksUnpublished: inv.chunks.length,
+          hosts: inv.hosts.length,
+          wiped,
+          failed,
+          directoryWiped: directory !== null,
+          bytes: bytes + (directory?.bytes ?? 0),
         });
       }
 

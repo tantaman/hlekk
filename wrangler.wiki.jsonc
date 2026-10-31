@@ -20,9 +20,11 @@
   "vars": {
     // A database of its own, so the pilot shares no host DO with the issue-tracker demo. Changing
     // this name is how a clean slate is had: host DOs are named `${HLEKK_DATABASE}/h-${n}`, so a new
-    // name is a new set of empty objects. There is no import, export or truncate for a deployed
-    // Durable Object's SQLite, which makes the name the only reset switch there is -- and an empty
-    // baseline is what the storage multiplier has to be read against.
+    // name is a new set of empty objects, and an empty baseline is what the storage multiplier has
+    // to be read against. There is still no import, export or truncate for a deployed Durable
+    // Object's SQLite -- so a new name *abandons* the old database rather than removing it. What
+    // reclaims it is `POST /admin/wipe`, which asks each of that database's objects to erase itself;
+    // it is armed by HLEKK_WIPE below and refuses anything that var does not name.
     "HLEKK_DATABASE": "wiki-simple-cat",
     // 128 vshards over ~50 hosts: 2-3 per host, ~2 GB apiece at the demo's target size, and the
     // shape src/client/fanout.test.ts measured at 61-81 host requests for a ~500-object read. The
@@ -34,6 +36,12 @@
   // forwarded to it, so the comparison is same-origin for the browser and never leaves Cloudflare.
   // It has to be deployed first: a service binding names a Worker that must already exist.
   "services": [{ "binding": "HLEKK_ALT", "service": "hlekk-wiki-hash" }],
+  // HLEKK_WIPE is deliberately absent too, and for a sharper reason: it arms POST /admin/wipe, which
+  // tells every object of the database it names to erase itself. Without the var the route refuses
+  // everything, so this public demo carries no working way to destroy data. Arming it is a
+  // deliberate deploy -- set it to the comma-separated names of the abandoned databases being
+  // reclaimed, run the wipes, then deploy again without it.
+  //
   // HLEKK_SHED_BYTES is deliberately absent. It lowers the placement controller's threshold so a
   // demo can be watched rebalancing, and this database must not rebalance: wikimedia-demo.md puts
   // moves and epoch transitions out of scope and keeps every vshard at epoch 0, which is what keeps

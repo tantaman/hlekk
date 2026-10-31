@@ -20,6 +20,9 @@ export interface Namespace {
 export interface Kv {
   get(key: string, options: { type: "arrayBuffer" }): Promise<ArrayBuffer | null>;
   put(key: string, value: ArrayBuffer | Uint8Array): Promise<void>;
+  /** Unpublishes a chunk. Only a database being erased needs this: a live map is rewritten in place,
+   *  so a merely stale chunk is overwritten rather than removed. */
+  delete(key: string): Promise<void>;
 }
 
 /** A Durable Object's own context: its storage, and its alarm. */
@@ -27,6 +30,17 @@ export interface Ctx {
   storage: DoStorage & {
     setAlarm(at: number): Promise<void>;
     getAlarm(): Promise<number | null>;
+    /**
+     * Erases everything this object holds, and the only way to reclaim a Durable Object's storage.
+     *
+     * Nothing outside an object can delete it: a `deleted_classes` migration takes the whole
+     * namespace and every database in it, deleting the Worker does the same, and the API has no
+     * per-object delete. So an object can only be reclaimed by being asked to erase itself — which
+     * matters here because changing `HLEKK_DATABASE` is how a clean slate is had, and it *abandons*
+     * the old database rather than removing it.
+     */
+    deleteAll(): Promise<void>;
+    deleteAlarm(): Promise<void>;
   };
 }
 

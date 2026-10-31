@@ -290,6 +290,29 @@ export class HlekkDirectoryDO {
         return this.#ready().mover.inFlight().length;
       },
 
+      /**
+       * What this directory knows it laid out, from its own state and without asking anything.
+       *
+       * `where` cannot serve this purpose for a database other than the deployment's own: it calls
+       * `hostStub(this.#env, h)`, and a Durable Object resolves its peers from *its* env rather than
+       * the caller's — so asked about an abandoned database it would faithfully report the live
+       * one's hosts. A wipe needs the dead database's own host list, which is here.
+       */
+      inventory: () => ({
+        hosts: this.#ready().directory.hostIndexes(),
+        chunks: this.#ready().directory.chunkIndexes(),
+      }),
+
+      /** Erases this directory. The hosts go first; this is the last thing a wipe does. */
+      wipe: async () => {
+        const bytes = this.#ctx.storage.sql.databaseSize;
+        await this.#ctx.storage.deleteAlarm();
+        await this.#ctx.storage.deleteAll();
+        this.#parts = null;
+        this.#opened.splice(0);
+        return { bytes };
+      },
+
       /** Where everything is, for an operator or a test. */
       where: async () => {
         const hosts = this.#ready().directory.hostIndexes();
