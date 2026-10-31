@@ -295,6 +295,14 @@ RPC round trips, request CPU, payload size — and only a deployed run says wher
 has no network between the Worker and its hosts. Carried across at 8x, the pilot's 6,300/s aggregate
 suggests simplewiki's 42,817,596 edges in **roughly 15–30 minutes** rather than 1.9 hours, which is
 the figure to check rather than to quote.
+
+**Checked: 21.1 minutes, at 33,832 edge writes/s aggregate over 43 deployed hosts** — inside the
+predicted window, so the projection was sound. Two things the projection could not have said. The
+rate is not flat: it opens at **90,132/s** against empty hosts and settles toward **~27,500/s** as
+the tables grow, so an aggregate is an average over a decaying curve and the decay past 63 MB/host is
+still unmeasured. And the gain over the per-edge path is **5.4x deployed**, not workerd's 8.4x —
+removing the commits exposed the network, exactly as this paragraph warned. A second run over rows
+that already existed held 33,832/s, so the upsert path costs about what the insert path does.
 `/ingest/edges` takes the batched path by default and falls back to the per-edge write when a batch
 throws, because a batch is one unit and so can only say *that* it failed, while a resumable load
 needs to know *which* edge did.
