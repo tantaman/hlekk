@@ -192,10 +192,42 @@ export default {
       // ---- ingest, pass B: both directions of both relations, as the import emitted them
 
       if (path === "/ingest/edges" && request.method === "POST") {
-        const { edges, concurrency = 16 } = await body<{ edges: EdgeIn[]; concurrency?: number }>();
+        const { edges, concurrency = 16, bulk = true } = await body<{
+          edges: EdgeIn[];
+          concurrency?: number;
+          bulk?: boolean;
+        }>();
         const started = Date.now();
         const unknown = [...new Set(edges.map((e) => e[0]))].filter((t) => ATYPE[t] === undefined);
         if (unknown.length > 0) return json({ error: `unknown edge types: ${unknown.join(", ")}` }, 400);
+
+        // The fast path is one transaction per vshard group rather than one per edge. The slow path
+        // is the old per-edge write, and it is kept because it is the only one that can say *which*
+        // edge failed: a batch is one unit, so a throw indicts all of it. So bulk first, and on a
+        // failure replay that batch edge at a time to find the culprits. A load that is working pays
+        // the fast path; a load that is in trouble pays for precision, which is what it needs.
+        //
+        // Retrying coarsely is safe either way — an edge write is an upsert whose count is bumped
+        // only when the edge is new — so the fallback cannot double-count what the batch landed
+        // before it threw.
+        let bulkError: string | null = null;
+        if (bulk) {
+          try {
+            const written = await db.assocAddMany(
+              edges.map(([type, from, to, time]) => ({ atype: ATYPE[type]!, id1: from, id2: to, time })),
+            );
+            return json({
+              written,
+              failed: 0,
+              failedIndexes: [] as number[],
+              failures: [] as { edge: EdgeIn; error: string }[],
+              path: "bulk",
+              ms: Date.now() - started,
+            });
+          } catch (e) {
+            bulkError = `${(e as Error).name}: ${(e as Error).message}`;
+          }
+        }
 
         const results = await pooled(edges, concurrency, ([type, from, to, time]) =>
           db.assocAdd(ATYPE[type]!, from, to, time),
@@ -215,6 +247,8 @@ export default {
           failed: failed.length,
           failedIndexes: failed,
           failures,
+          path: bulkError === null ? "per-edge" : "per-edge after bulk failed",
+          bulkError,
           ms: Date.now() - started,
         });
       }

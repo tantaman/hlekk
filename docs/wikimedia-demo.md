@@ -256,6 +256,76 @@ Moves, the placement controller, rebalancing, outbox delivery, epoch transitions
 paged storage. Epochs stay 0. Explicitly out of scope, and all of it already built and tested if the
 demo later wants it.
 
+## A cheaper path to the demo beat
+
+The sequence above conflates two goals that need different work: making the demo **big**, and making
+it **land**. Only the first needs enwiki and the chunked snapshot. *The demo beat worth building for*
+is the affinity knob, and the knob is about **requests per query, not bytes** — so it is fully
+visible at a size the existing primitives can load.
+
+**Full simplewiki is that size, and it is already the pilot this doc asks for.** Step 4 says *prove
+at ~3 GB, then scale*; `wikimedia-import.md` reports the whole of simplewiki as 950,421 pages and
+42,817,596 edges, which at the pilot's measured 54.1 bytes/edge is **~2.3 GB**. The "~3 GB pilot" and
+the entire dataset are the same artifact — no subset, and so no subset's distorted edge share to
+explain away.
+
+### Edges are no longer the cost
+
+`Host.assocAddMany` writes many edges in one transaction. `assocAdd` is one mutation and *every
+mutation commits in one transaction*, so a thousand edges were a thousand durable commits; the
+~6,300 edges/s ceiling was measuring the commit, not SQLite. Measured on one host over real SQLite,
+20,000 edges in chunks of 1,000:
+
+| Backing | Per-edge | Batched | |
+| --- | --- | --- | --- |
+| In memory (`LocalCluster`'s) | 62,599/s | 135,010/s | 2.2x |
+| File-backed, `COMMIT` reaching the filesystem | 791/s | 95,080/s | 120x |
+| Through `/ingest/edges` on workerd DO SQLite, one host | **525/s** | **4,425/s** | **8.4x** |
+
+The in-memory row is why `ingest:local` will barely move: it never pays for durability, so it was
+never measuring this. The third row is the one to plan against — it is the whole path, through the
+endpoint, onto Durable Object storage — and the reason to trust it is its per-edge figure: **525/s**,
+against the **~570/s per host** the deployed pilot measured. workerd's per-edge rate and a deployed
+host's are the same number, so the batched rate beside it is a fair proxy for a deployed host, and
+both of its runs were checked by reading the maintained count back at 4,000 of 4,000 rather than by
+trusting the endpoint's own report.
+
+What this does *not* claim is a deployed number. Removing commits exposes whatever is behind them —
+RPC round trips, request CPU, payload size — and only a deployed run says where that sits; workerd
+has no network between the Worker and its hosts. Carried across at 8x, the pilot's 6,300/s aggregate
+suggests simplewiki's 42,817,596 edges in **roughly 15–30 minutes** rather than 1.9 hours, which is
+the figure to check rather than to quote.
+`/ingest/edges` takes the batched path by default and falls back to the per-edge write when a batch
+throws, because a batch is one unit and so can only say *that* it failed, while a resumable load
+needs to know *which* edge did.
+
+### Which makes pass A the bottleneck, and it is a decision taken once
+
+With edges off the critical path, the remaining cost is pass A: 950,421 pages at the measured
+**~280/s**, about **57 minutes**, and now the dominant term. That rate is not timidity — a
+`createUnique` funnels through the **four** index vshards in the database, and *`indexVshards` is
+fixed when the directory first opens and cannot be raised afterwards*.
+
+**So the irreversible decision comes before the load, not during it.** Init the database for the
+pilot with more index vshards than four. Nothing else here can be got wrong and fixed later.
+
+Batching the index path the way the edge path is now batched is the real fix and is not built:
+`createUnique` is reserve → create → confirm across two hosts, so it is a three-phase protocol rather
+than one transaction, and it is more work than `assocAddMany` was.
+
+### What it costs and what it cannot show
+
+Two loads — `category` and the `hash` control — are the comparison, and the second is cheap: the
+importer re-runs as `--passes 0b,5` in a measured 58 seconds, because varying affinity changes a
+per-page field and leaves every edge alone. ~4.6 GB of storage, under $1/month.
+
+**The honest limit: 2.3 GB fits inside one Durable Object**, well under the 9 GB vshard cap. So this
+pilot cannot carry *a size no single host could hold* — that claim still needs enwiki, and so still
+needs the chunked snapshot. What it can carry is the better claim this doc already identified: here
+is the knob that decides whether a graph read is one round trip or fifty, on 950,421 real pages, with
+the same query and the same data on either side of it. The GB count is not the headline; the request
+count is.
+
 ## Sequence
 
 1. ~~Plumb `N`, prove the query plane at 50 hosts with trivial data.~~ Done, d763a4f.
@@ -266,10 +336,16 @@ demo later wants it.
    and 3, which is the entire argument for doing it before them rather than after. See
    [`wikimedia-import.md`](wikimedia-import.md#the-same-ingest-deployed-which-also-works).
 3. **Chunked ingest.** The real primitive, and independent of the dump's schema. Also the move fix.
-   **Now load-bearing rather than preferable:** the ordinary write path is measured at ~6,300 edge
-   writes/s deployed, which is ~6,400 hours for enwiki's 3.5 billion edges. It is one durable commit
-   per edge, so it is the wrong primitive rather than a slow one.
-4. **The loader**, against the import branch's emitted shape. Prove at ~3 GB, then scale. Two things
+   The ordinary write path is measured at ~6,300 edge writes/s deployed, which is **~154 hours (6.4
+   days)** for enwiki's 3.5 billion edges — not the ~6,400 hours an earlier draft gave, which had the
+   unit slipped from days to hours. It is one durable commit per edge, so it is the wrong primitive
+   rather than a slow one; but at 6.4 days it is a *painful* primitive rather than an impossible one,
+   so what makes this load-bearing is repeatability — the affinity comparison means loading twice —
+   not impossibility. **It is also not what stands between this branch and a demo that lands:** see
+   *A cheaper path to the demo beat*.
+4. **The loader**, against the import branch's emitted shape. Prove at ~3 GB — which is *all* of
+   simplewiki, see *A cheaper path to the demo beat* — then scale. Edges are batched now, so the
+   binding constraint is pass A and the `indexVshards` count chosen at `init`. Two things
    it must do that this doc did not know to ask for: **batch per host in key order** (shuffled
    inserts fell to ~23 writes/s per host as the tables grew and the platform eventually refused the
    writes outright), and **use a bounded affinity key** (raw first-category put 68.2% of a subset's

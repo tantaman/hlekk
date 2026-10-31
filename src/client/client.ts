@@ -19,6 +19,7 @@ import { missOwner } from "../query/types.ts";
 import type { Id, Json, Miss, Plan } from "../query/types.ts";
 import { Query } from "../schema/query.ts";
 import type { FieldMap } from "../schema/define.ts";
+import type { Fields } from "../query/types.ts";
 import { systemClock } from "../runtime/runtime.ts";
 import type { Clock } from "../runtime/runtime.ts";
 import { Routes } from "./routes.ts";
@@ -282,6 +283,49 @@ export class Hlekk {
 
   assocAdd(atype: number, id1: Id, id2: Id, time?: number, data?: Record<string, Json> | null): Promise<void> {
     return this.write<void>({ kind: "assocAdd", atype, id1, id2, time, data });
+  }
+
+  /** Adds many edges, grouped so that each group is one transaction on one host.
+   *
+   *  `assocAdd` costs one durable commit per edge, which is the whole of the ~6,300 edges/s ceiling
+   *  a deployed bulk load measured. A transaction cannot span hosts and the ownership fence is per
+   *  vshard, so the grouping is by `vshardOf(id1)` — the same key `anchorOf` routes a single add by.
+   *  Each group is then one request, one transaction and one commit.
+   *
+   *  Groups are issued in sequence rather than in parallel on purpose. `wikimedia-import.md`'s
+   *  second finding is that a shuffled insert collapses as the B-tree outgrows cache, and that
+   *  grouping each batch onto one host in key order took it from ~970/s to ~6,300/s; firing every
+   *  group of a batch at once would reintroduce exactly the interleaving that measurement warns
+   *  about. The parallelism belongs across hosts, in the loader, where it already is.
+   *
+   *  Returns the number of edges written. An edge write is an idempotent upsert whose count moves
+   *  only for a new edge, so a caller that retries a whole batch cannot double-count — but a partial
+   *  failure is reported per group, and the error names how many groups had already landed, because
+   *  a batch spanning vshards is not one unit even though each group is. */
+  async assocAddMany(
+    edges: readonly { atype: number; id1: Id; id2: Id; time?: number; data?: Fields | null }[],
+  ): Promise<number> {
+    if (edges.length === 0) return 0;
+    const groups = new Map<bigint, typeof edges[number][]>();
+    for (const e of edges) {
+      const v = vshardOf(e.id1);
+      const g = groups.get(v);
+      if (g) g.push(e);
+      else groups.set(v, [e]);
+    }
+    let written = 0;
+    let done = 0;
+    for (const group of groups.values()) {
+      try {
+        written += await this.write<number>({ kind: "assocAddMany", edges: group });
+      } catch (e) {
+        (e as Error).message +=
+          ` (after ${done} of ${groups.size} vshard groups, ${written} edges, had been written)`;
+        throw e;
+      }
+      done++;
+    }
+    return written;
   }
 
   assocRemove(atype: number, id1: Id, id2: Id): Promise<void> {

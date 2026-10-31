@@ -432,13 +432,50 @@ The honest figures for the ordinary write path, deployed:
 | Edges, shuffled across 43 hosts | **~970/s** | ~23/s per host, and it fails at ~2 M — see finding 2 |
 | Edges, grouped per host in key order | **~6,300/s** | ~570/s on a single host, a 25x per-host gain |
 | Edges, in process with no network | ~76,000/s | the figure above, for comparison |
+| Edges, batched into one transaction | **not yet deployed** | 95,080/s on one host over a real file; see below |
 
-**What that says about enwiki is the useful part.** At ~6,300 writes/s, 3.5 billion edges is **~6,400
-hours**. Even granting a perfect spread and no skew, the ordinary write path cannot load this dataset
-— not because it is slow but because it is the wrong primitive, one durable commit per edge. This is
-the measurement behind *What the loader owes*: the chunked snapshot is not an optimization to get to
-later, it is the only way the load happens at all. A pilot that had merely succeeded would not have
-said so.
+**What that says about enwiki is the useful part.** At ~6,300 writes/s, 3.5 billion edges is
+**~154 hours, or 6.4 days** of sustained ingest. (An earlier draft of this line said *~6,400 hours*,
+which was the 6.4 with the unit slipped from days to hours — 6,400 hours would imply ~152 writes/s,
+not 6,300. The corrected figure is 41x smaller and weakens the claim below, so it is worth stating
+plainly rather than quietly fixing.)
+
+Even granting a perfect spread and no skew, the ordinary write path is the wrong primitive for this
+dataset — one durable commit per edge, which is what *Every mutation commits in one transaction*
+(`host.ts`) means at 3.5 billion of them. But 6.4 days is not impossible the way 267 days would have
+been, so the honest claim is narrower than the one this section used to make: the chunked snapshot is
+not the only way the load *can* happen, it is the only way it happens **repeatably**. The affinity
+comparison alone means loading twice, and a primitive that makes a reload cost hours instead of a
+working week is what turns the load from a one-shot event into something the demo can iterate on.
+A pilot that had merely succeeded would not have said so.
+
+### What the per-edge ceiling actually was
+
+Every rate above is a rate of **durable commits**, not of inserts. `assocAdd` is one mutation and
+*every mutation commits in one transaction* (`host.ts`), so a thousand edges were a thousand commits,
+and `/ingest/edges` accepting a thousand per request only ever bought concurrency against a
+single-threaded Durable Object — the batching stopped at the HTTP boundary.
+
+`Host.assocAddMany` moves it past that: N edges, one transaction, one commit. Measured on one host
+over real SQLite, 20,000 edges in chunks of 1,000:
+
+| Backing | Per-edge | Batched | |
+| --- | --- | --- | --- |
+| In memory | 62,599/s | 135,010/s | 2.2x |
+| File-backed, `COMMIT` reaching the filesystem | 791/s | 95,080/s | 120x |
+| Through `/ingest/edges` on workerd DO SQLite, one host | **525/s** | **4,425/s** | **8.4x** |
+
+The in-memory row explains why none of this was visible locally: `LocalCluster` is backed by
+`:memory:`, which never pays for durability, so the harness could not have measured the thing that
+bounds a deployment. It also means `ingest:local` will show ~2x and nothing like 120x — the figure
+belongs to the file-backed row, whose per-edge rate of **791/s** sits beside the **~570/s per host**
+measured above. The same number in a local file and on a Durable Object is the evidence that the
+ceiling was commit cost in both places.
+
+This is not a deployed figure and does not claim to be one. Removing commits exposes whatever was
+behind them — RPC round trips, request CPU, the 2 MB payload cap — and only a deployed run locates
+that. What it settles is that the per-edge write is no longer the thing in the way, which moves the
+binding constraint to pass A and the `indexVshards` count fixed at `init`.
 
 ### The storage multiplier, which was the open question
 
