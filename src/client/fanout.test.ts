@@ -5,6 +5,12 @@
 // nothing and almost every hop leaves its host — which makes cross-host assembly the ordinary case
 // here, not the exception the issue-tracker fixtures exercise. What it is testing is that the answer
 // is right anyway, and that the cost is one request per host rather than one per object.
+//
+// "Affinity buys nothing" is a property of the key, not a law, and the last test here is the other
+// half of the claim: given a graph that has structure and a key that matches it, the same fan-out
+// collapses. Which one of those a real wiki gets is a measurement rather than an argument — see
+// docs/wikimedia-demo.md, where a page's first category buys 1.27x and a key derived from the link
+// graph buys 3.2x on the same 950,421 pages.
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
@@ -170,6 +176,57 @@ describe("the query plane over many hosts", () => {
       `${requests} requests for ${objects} objects should be bounded by hosts, not objects`,
     );
     assert.ok(requests < objects / 2, `${requests} requests for ${objects} objects is not batching`);
+  });
+
+  /**
+   * Cross-host links under a planted community structure, placed by whichever key is passed.
+   *
+   * Nine links in ten stay inside a page's group, which is the structure a graph partitioner looks
+   * for and the thing a *metadata* key may or may not happen to line up with. Returns the share of
+   * links whose two ends sit on different hosts — the number a read pays for.
+   */
+  async function crossingShare(groups: number, per: number, degree: number, key: (i: number) => string) {
+    const c = new LocalCluster({ batch: VSHARDS, runtime: deterministic(7) });
+    c.directory.applyLock(LOCK);
+    c.scatter(HOSTS);
+    c.spreadCatalog();
+    await c.publish();
+
+    const db = c.client();
+    const n = groups * per;
+    const pages: Id[] = [];
+    for (let i = 0; i < n; i++) pages.push(await db.create(PAGE, { title: `Page ${i}` }, { affinity: key(i) }));
+
+    const hostOf = (id: Id) => c.directory.resolve(vshardOf(id))!.host;
+    const r = seeded(11);
+    let crossing = 0;
+    let total = 0;
+    for (let i = 0; i < n; i++) {
+      const group = Math.floor(i / per);
+      for (let d = 0; d < degree; d++) {
+        const to = r.int(10) < 9 ? group * per + r.int(per) : r.int(n);
+        if (to === i) continue;
+        total++;
+        if (hostOf(pages[i]) !== hostOf(pages[to])) crossing++;
+      }
+    }
+    return crossing / total;
+  }
+
+  it("collapses cross-host links when the key matches the graph, and not when it only describes it", async () => {
+    // Same graph, same hosts, same code: only the affinity key differs.
+    const byTitle = await crossingShare(40, 20, 12, (i) => `Page ${i}`);
+    const byGroup = await crossingShare(40, 20, 12, (i) => `g${Math.floor(i / 20)}`);
+
+    // A title spreads perfectly, which is exactly what makes it a control and not a placement.
+    assert.ok(byTitle > 0.9, `a title hash should scatter a clustered graph too, got ${(byTitle * 100).toFixed(1)}%`);
+    // The group key is the graph's own structure, so only the 10% of links that leave a group can
+    // leave a host.
+    assert.ok(byGroup < 0.2, `the group key should keep intra-group links local, got ${(byGroup * 100).toFixed(1)}%`);
+    assert.ok(
+      byTitle / byGroup > 4,
+      `placement should be worth a multiple here, got ${(byTitle / byGroup).toFixed(1)}x`,
+    );
   });
 
   it("reads the same answer through both drivers", async () => {

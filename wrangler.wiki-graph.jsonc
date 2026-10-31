@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "hlekk-wiki-graph",
+  // The third placement of the Wikimedia demo: the same wiki, the same code, the same host count,
+  // and an affinity key derived from the link graph instead of from a page's metadata.
+  //
+  // WHY A THIRD DEPLOYMENT. The same reason there is a second one -- a Durable Object's env comes
+  // from the deployment that defines its namespace, so the database name is deployment-wide and a
+  // placement is a deployment. See the HLEKK_ALT note in wiki-app.ts.
+  //
+  // WHY A THIRD PLACEMENT AT ALL. The first two answered the demo's question and the answer was no:
+  // a page's first category buys 1.27x over a title hash, because categories describe a page and
+  // its links point away from it. So the key stopped being guessed from metadata and is computed
+  // from the edge list instead, by scripts/partition-wiki.mjs. The partitioner's objective -- edges
+  // that cross a host -- is the same number the A/B measures, which is the whole reason to derive
+  // the key rather than hunt for a cleverer field.
+  "main": "src/worker/wiki-app.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "HLEKK_HOSTS", "class_name": "HlekkHostDO" },
+      { "name": "HLEKK_DIRECTORY", "class_name": "HlekkDirectoryDO" }
+    ]
+  },
+  // Its own namespaces, so `wiki-simple-graph/h-0` here is a different object from the same name in
+  // either of the other two deployments.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HlekkHostDO", "HlekkDirectoryDO"] }],
+  // Shared with the other two: a chunk key is `m/${database}/${index}`, and the three databases are
+  // differently named.
+  "kv_namespaces": [{ "binding": "HLEKK_MAP", "id": "af144fc56d0541699307352f0a63ab76" }],
+  "vars": {
+    "HLEKK_DATABASE": "wiki-simple-graph",
+    // The same count as the other two placements, and `/admin/init?hosts=50&indexVshards=64` is the
+    // same call. Holding every other number still is what makes this a comparison of placement:
+    // `init` is deterministic, so all three databases have byte-identical shard maps, and the
+    // partition is computed against that map -- one part per host, split across that host's own
+    // vshards. A different shape here would put the partition's parts on the wrong hosts.
+    "HLEKK_VSHARDS": "128"
+  },
+  // Deliberately no HLEKK_ALT and no HLEKK_WIPE: this is a far side of the forward, not the front
+  // door, and it carries no route that destroys data.
+  "observability": { "enabled": true }
+}

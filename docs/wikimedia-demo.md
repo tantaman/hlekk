@@ -397,6 +397,106 @@ is the knob that decides whether a graph read is one round trip or fifty, on 950
 the same query and the same data on either side of it. The GB count is not the headline; the request
 count is.
 
+## What the placement comparison answered
+
+The demo exists to show that placement following the access pattern beats placement ignoring it. Both
+sides were loaded — 950,421 pages and 42,817,596 edges each, same code, same 43 hosts, same 192
+active vshards — and the answer for the key the demo was built around is **no, barely**.
+
+| Placement | Hosts touched by one page's links and categories, of 43 |
+| --- | --- |
+| `category` — the page's first category | **27.0** |
+| `hash` — the title, the no-locality control | **34.2** |
+| ratio | **1.27x** |
+
+Fourteen `ns:0` pages with 57–73 outlinks, the entire link and category set returned on both sides
+and the target lists verified identical. Every one of the fourteen favoured clustering, 1.07x–1.67x,
+so the effect is real. It is just small, and "one round trip or fifty" is not what it says.
+
+**Why, measured rather than argued.** 469,546 of 950,421 pages — **49.4%** — have no category at all
+and fall back to a title hash, so half the corpus is placed at random by construction. The decisive
+part is the other half: a page's ~65 link targets carry **32–50 distinct first categories**. `1068`
+has 73 targets across 50 keys; the best case found, `Number_theory`, is 66 across 32. There is almost
+nothing to colocate, because **a page's categories describe the page and its links point away from
+it** — which is not a flaw in simplewiki but what an encyclopedia is.
+
+The control behaves exactly as a control should, which is the check that makes the rest trustworthy:
+34.2 against a uniform expectation of `43 × (1 − (42/43)^65) = 33.6`.
+
+**A method error worth recording, because the first answer was wrong.** A read with a `limit`
+returns the targets with the smallest ids, and `init` assigns vshards to hosts in contiguous blocks
+(`Math.floor(i / per)`), so a limited sample lands in a narrow band of hosts *whatever* the
+placement. The first run reported 1.39x and had clustering losing on several pages — an artifact of
+sampling, not a result. Only a page whose entire target set fits under the limit compares anything.
+The UI's placement tab reads `limit=25` and has the same bias.
+
+**The knob's larger effect was on writes, in the opposite direction.** Pass B ran at 33,832 edges/s
+clustered against 164,021 spread — **4.8x** — because first-category affinity put **20.9%** of all
+edges on one host (541 MB against 22 MB on the lightest, where even is 2.3%), and the loader keeps
+one batch in flight per host, so the whole load waits on the straggler. Measured, placement cost 4.8x
+of write throughput to buy 1.27x of read fan-out.
+
+### So the key is derived from the graph instead
+
+`scripts/partition-wiki.mjs`. The edge list is a recorded copy of the traversals the demo performs,
+so the key stops being guessed from metadata and is computed from the traversals: partition the graph
+so that few edges cross a host, then name the part. The partitioner's objective — edges cut — **is**
+the number the A/B measures, which is the reason to derive the key rather than hunt for a cleverer
+field.
+
+Capacity-constrained asynchronous label propagation, seeded breadth-first, 42.8 million edges in
+about 8 seconds. Four choices in it are load-bearing:
+
+- **Partition at host granularity, then split within the host.** A read's cost is hosts, so the host
+  boundary is the one the cut must avoid. Partitioning into 192 vshards and grouping those onto 43
+  hosts was tried and is worse — the first level spends its effort on boundaries the second
+  dissolves — and measured 11.2 hosts against 9.1 for partitioning into 43 directly. The split below
+  it only has to balance; a vshard is still the unit of movement, so it is not pointless, it is just
+  not what the question is about.
+- **Balance by degree, not by page count.** Edges are the bytes: 42.8M of them against 950k pages.
+- **Balance as a hard constraint.** Unconstrained label propagation collapses to one label per
+  connected component — a perfect cut score for a useless partition. The category placement is the
+  same failure from the other end.
+- **A nonce in each part's key.** `Allocator.place` does `active[fnv(key) % active.length]`, so the
+  key alone decides the vshard and two parts whose keys collide share one. Collisions merge
+  neighbourhoods the partitioner worked to separate, for reasons having nothing to do with the graph.
+  A few hundred hashes per part buys exact placement through the ordinary affinity seam, with no
+  change to the engine: it chooses a string, and the engine does what it always does with one.
+
+Predicted on 3,013 `ns:0` pages with 50–150 total edges, forward targets only:
+
+| Placement | Hosts touched, of 43 | vs `hash` | Heaviest host's edge share (even is 2.3%) |
+| --- | --- | --- | --- |
+| `category` | 20.8 | 1.33x | 20.9% |
+| `hash` | 27.7 | 1.00x | 3.4% |
+| `graph` | **8.6** | **3.20x** | **2.8%** |
+
+The graph key is also the best *balanced* of the three — 1.20x the mean edge load against the
+control's 1.46x — which matters because a placement that won on balance rather than on locality would
+be answering a different question. Cut is 32.1% of edges and a page's neighbourhood spans 5.2 of 43
+parts.
+
+**Two validations before any of this was deployed**, because an offline model that predicts 3.2x is
+worth nothing on its own:
+
+- The model of `place` reproduces the live `hash` database's object count on **182 of 192 vshards
+  exactly**, total error 10 pages in 950,421.
+- Loaded against local workerd, **3,000 of 3,000 objects landed on the vshard the partition chose** —
+  which also confirms `init` is deterministic, since the local database's active set had to match the
+  production map the partition was computed against. All three deployments have byte-identical shard
+  maps.
+
+What this does not yet include is the live load and the live measurement of the third placement; the
+3.20x above is a prediction from the real graph and the real cluster map, not a reading off a
+deployment.
+
+**What the whole exercise says about the demo's thesis.** Placement is worth a multiple here, but the
+multiple comes from a key derived from the access pattern, not from a field that happens to sit on
+the object. A metadata key is a *guess* that the thing a page is filed under is the thing it is read
+with; on an encyclopedia that guess is wrong, and the demo can only show it is wrong by measuring it.
+The honest headline is 3.2x with a graph-derived key and 1.27x with a category — and the reason the
+second number is small is more interesting than the first number being large.
+
 ## Sequence
 
 1. ~~Plumb `N`, prove the query plane at 50 hosts with trivial data.~~ Done, d763a4f.
@@ -485,10 +585,13 @@ count is.
 - [x] Redirects as pages, 15,551,165 of them (counted, not estimated). A redirect has its own title,
       its own `page` row and its own outbound link, and `pagelinks` resolves through `linktarget` to
       *titles* — so demoting one to a field breaks link resolution for every link pointing at it.
-- [x] Which affinity functions the demo compares: **`category` against `hash`**, the latter being
-      the no-locality control. Chosen because they are the two ends of the axis — one buys whatever
-      locality the link graph has, the other provably none — and because the mode is applied when a
-      record is read, so the second load needs no re-import.
+- [x] Which affinity functions the demo compares: **`category`, `graph` and `hash`**, the last being
+      the no-locality control. `category` against `hash` was the original pair, chosen as the two
+      ends of the axis — one buys whatever locality the link graph has, the other provably none — and
+      because the mode is applied when a record is read, so a second load needs no re-import. It was
+      loaded, measured at **1.27x**, and that answer is why there is a third: `graph`, whose key is
+      computed from the edge list by `scripts/partition-wiki.mjs` rather than read off the page.
+      Predicted 3.20x. See "What the placement comparison answered".
 - [x] Two passes over the dump, not one with buffered references: ids must exist before edges can
       reference them, and the alternative buffers 1.78 billion unresolved references. Both dumps
       sort cheaply on their join keys.

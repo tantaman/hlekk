@@ -9,6 +9,7 @@
 //
 //   node scripts/import-enwiki.mjs --wiki simplewiki --date 20261001
 //   node scripts/import-enwiki.mjs --wiki enwiki --date 20261001 --affinity category
+//   node scripts/import-enwiki.mjs --wiki simplewiki --date 20261001 --affinity graph
 //
 // Run it on `simplewiki` first: same schema, about 1% of the size, finishes in minutes, and every
 // pass either works there or is broken everywhere.
@@ -46,7 +47,7 @@ for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i].replac
 const WIKI = args.get("wiki") ?? "simplewiki";
 const DATE = args.get("date") ?? "20261001";
 const WORK = args.get("work") ?? join(".wrangler", `import-${WIKI}-${DATE}`);
-const AFFINITY = args.get("affinity") ?? "category"; // category | namespace | initial | hash
+const AFFINITY = args.get("affinity") ?? "category"; // category | graph | namespace | initial | hash
 const SORT_MEM = args.get("sortMem") ?? "2G";
 const LIMIT = Number(args.get("limit") ?? Infinity);
 const PASSES = new Set((args.get("passes") ?? "0,0b,1,2,3,4,5").split(","));
@@ -434,14 +435,31 @@ async function passCategories(lt, out) {
   if (n === 0 && dropped > 0) throw new Error(`pass 4: every one of ${dropped} rows dropped; see above`);
 }
 
-/** The affinity key for a page, for the functions that need nothing but the page itself. */
-function affinityOf(ns, title, fromCategory, which = AFFINITY) {
+/**
+ * The affinity key for a page: which objects this one expects to be read with.
+ *
+ * `preKey` is whatever an earlier pass computed for this page and `records` joined back on by page
+ * id -- the first category under `category`, the graph part under `graph`. Everything else needs
+ * only the page itself.
+ */
+function affinityOf(ns, title, preKey, which = AFFINITY) {
   switch (which) {
     case "category":
       // Spread the pages that have no category rather than collapsing them onto one key. 48% of
       // simplewiki pages have none, and `ns:0` for all of them is one affinity key, which is one
       // vshard on one host.
-      return fromCategory ?? affinityOf(ns, title, null, "hash");
+      return preKey ?? affinityOf(ns, title, null, "hash");
+    case "graph":
+      // Placement derived from the link graph: see scripts/partition-wiki.mjs, which writes
+      // partition.tsv. Measured against this wiki it touches 8.6 hosts of 43 where the first
+      // category touches 20.8 and a title hash 27.7 -- because a page's categories describe the
+      // page and its links point away from it, so a category colocates almost nothing a traversal
+      // actually reads.
+      //
+      // The fallback should never fire: partition.tsv covers every page in pages.tsv. It is a hash
+      // rather than a throw because one unpartitioned page is worth a slightly worse placement and
+      // not a failed import -- and `records` counts them, so it cannot pass unnoticed.
+      return preKey ?? affinityOf(ns, title, null, "hash");
     case "namespace":
       return `ns:${ns}`;
     case "initial":
@@ -502,8 +520,15 @@ export async function* records(opts = {}) {
   if (stale) await sorted(raw, sortedFile, ["1,1n"]);
   else if (!existsSync(sortedFile)) throw new Error(`${sortedFile} is missing; run passes 2-4 first`);
 
-  const affIter = lines(at("affinity.tsv"))[Symbol.asyncIterator]();
+  // The side file holding the key an earlier pass computed per page, which differs by mode but not
+  // in shape: `page_id \t key`, ascending by page id, so it merges the same way either way.
+  const sideFile = affinity === "graph" ? "partition.tsv" : "affinity.tsv";
+  if (affinity === "graph" && !existsSync(at(sideFile))) {
+    throw new Error(`--affinity graph needs ${at(sideFile)}; run scripts/partition-wiki.mjs first`);
+  }
+  const affIter = lines(at(sideFile))[Symbol.asyncIterator]();
   let aff = await affIter.next();
+  let unkeyed = 0;
   const edgeIter = lines(at("edges.tsv"))[Symbol.asyncIterator]();
   let edge = await edgeIter.next();
 
@@ -512,17 +537,18 @@ export async function* records(opts = {}) {
     const pageId = Number(pageIdStr);
 
     while (!aff.done && Number(aff.value.slice(0, aff.value.indexOf("\t"))) < pageId) aff = await affIter.next();
-    let fromCategory = null;
+    let preKey = null;
     if (!aff.done) {
       const t = aff.value.indexOf("\t");
-      if (Number(aff.value.slice(0, t)) === pageId) fromCategory = aff.value.slice(t + 1);
+      if (Number(aff.value.slice(0, t)) === pageId) preKey = aff.value.slice(t + 1);
     }
+    if (preKey === null && affinity === "graph") unkeyed++;
 
     while (!edge.done && Number(edge.value.slice(0, edge.value.indexOf("\t"))) < pageId) edge = await edgeIter.next();
 
     const head = {
       key: pageIdStr,
-      affinity: affinityOf(Number(ns), title, fromCategory, affinity),
+      affinity: affinityOf(Number(ns), title, preKey, affinity),
       type: "wiki.page",
       fields: { ns: Number(ns), title, redirect: redirect === "1", len: Number(len) },
     };
@@ -545,6 +571,11 @@ export async function* records(opts = {}) {
       edges = [];
     }
   }
+
+  // A page the partition missed is placed by title hash, which is correct and unplaced. Said out
+  // loud because it is otherwise invisible: the load succeeds and the comparison quietly measures a
+  // mixture of two placements.
+  if (unkeyed > 0) console.warn(`records: ${unkeyed} page(s) absent from ${sideFile}, placed by title hash`);
 }
 
 /** Writes the record stream to `records.jsonl`. A convenience, not the intended path. */
