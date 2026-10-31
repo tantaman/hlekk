@@ -6,9 +6,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { normalize } from "../client/client.ts";
 import { LIMITS, QueryRefused, build, check, parseQuery, planOf, price, schemaView, unparse } from "./wiki-query.ts";
 import type { QuerySpec } from "./wiki-query.ts";
-import { categoryPages, linkedFrom, pageCategories, pageLinks } from "./wiki.ts";
+import { categoryPages, linkedFrom, pageCategories, pageLinks, titleKey } from "./wiki.ts";
 
 const from = { ns: 0, title: "France" };
 const refusal = (spec: unknown): QueryRefused => {
@@ -380,5 +381,68 @@ describe("a count keeps the alias it was written with", () => {
 
   it("still refuses a count on an edge that does not exist", () => {
     assert.match(refusal({ from: { ns: 0, title: "X" }, counts: [{ as: "n", edge: "wiki.nope" }] }).message, /no edge/);
+  });
+});
+
+// The unique title index's key, which is the demo's only entry point: `/page?title=` resolves
+// through it, and a key that two different pages share means one of them has no object at all.
+//
+// The fixtures are the seven real collisions, found by running the shipped key over all 950,421
+// simplewiki titles and confirmed against three independently loaded databases. Kept as data rather
+// than as a property test because each one names a different way `toLowerCase()` folds a capital —
+// Latin with a diacritic, a Cyrillic letter, and the German sharp s, whose uppercase form is a
+// separate code point.
+describe("the title index key", () => {
+  /** What the index actually compares: the key, after the global normalizer has had it. */
+  const key = (ns: number, title: string) => normalize(titleKey(ns, title));
+
+  const COLLIDED: [string, string][] = [
+    ["Coup_d'état", "Coup_d'État"],
+    ["Abdullah_Öcalan", "Abdullah_öcalan"],
+    ["MØ", "Mø"],
+    ["ß", "ẞ"],
+    ["Русский_Язык", "Русский_язык"],
+    ["Pусский_язык", "Pусский_Язык"],
+    ["Esta_É_a_Nossa_Pátria_Bem_Amada", "Esta_é_a_Nossa_Pátria_Bem_Amada"],
+  ];
+
+  it("separates pages that differ only by the case of a non-ASCII letter", () => {
+    for (const [a, b] of COLLIDED) {
+      assert.notEqual(key(0, a), key(0, b), `${a} and ${b} are different pages and must key differently`);
+    }
+  });
+
+  it("still separates pages that differ only by ASCII case, which is what it always did", () => {
+    assert.notEqual(key(0, "Ash"), key(0, "ASH"));
+    assert.notEqual(key(0, "Cat"), key(0, "CAT"));
+  });
+
+  it("keys a title the same whatever case the normalizer is handed it in", () => {
+    // The whole point of escaping: the key must survive `toLowerCase()` unchanged, or a lookup
+    // cannot find what a load wrote.
+    for (const t of ["Coup_d'État", "ẞ", "Русский_Язык", "Ash"]) {
+      assert.equal(titleKey(0, t), normalize(titleKey(0, t)), `${t} must already be lowercase-stable`);
+    }
+  });
+
+  it("escapes by UTF-8 byte, because a bare code point's hex is ambiguous", () => {
+    // The first attempt at this fix escaped to `%` plus the code point's hex, which is
+    // variable-width: `A1` became `%411` and so did `Б` (U+0411). It fixed 7 collisions and
+    // introduced 23. Two hex digits per byte is uniquely decodable, so these have to differ.
+    for (const [a, b] of [["A1", "Б"], ["Ad", "Н"], ["Ae", "О"], ["Bd", "Э"]]) {
+      assert.notEqual(key(0, a), key(0, b), `${a} and ${b} must key differently`);
+    }
+    // And the ASCII form is unchanged, which is what keeps the blast radius to the 0.332% of
+    // simplewiki titles that hold a non-ASCII capital or a literal %.
+    assert.equal(titleKey(0, "Ash"), "0:%41sh");
+  });
+
+  it("escapes % as well, or the escape is not injective", () => {
+    // `Cat` escapes to `%43at`, so a page actually named `%43at` would otherwise key identically.
+    assert.notEqual(key(0, "Cat"), key(0, "%43at"));
+  });
+
+  it("separates namespaces, so a Talk page and an article may share a title", () => {
+    assert.notEqual(key(0, "France"), key(1, "France"));
   });
 });

@@ -91,14 +91,41 @@ export const TITLE_IDX = 1;
  * character — `Ash` and `ASH` are different enwiki pages. Keyed on the title as written, the second
  * page of such a pair is refused with `ValueTaken` and the loader silently drops it.
  *
- * So the key is made lowercase-stable instead: every uppercase ASCII letter becomes `%` plus its
- * lowercase hex code, which `toLowerCase()` then leaves alone. Lossless, and ugly for a reason —
- * the honest fix is for normalization to be a property of the index rather than one global
- * function, which is recorded as open in docs/demo-dataset.md. Underscores are kept as MediaWiki
- * stores them, so the caller passes a title in `page_title` form.
+ * So the key is made lowercase-stable instead: every character `toLowerCase()` would change is
+ * percent-encoded, one `%xx` per UTF-8 byte in lowercase hex, which `toLowerCase()` then leaves
+ * alone. Underscores are kept as MediaWiki stores them, so the caller passes a title in
+ * `page_title` form.
+ *
+ * Percent-encoding rather than a bare code point, because a code point's hex is variable-width and
+ * `%` + hex is then ambiguous: `A1` would escape to `%411` and so would `Б` (U+0411), and the same
+ * for `Ad`/`Н`, `Ae`/`О` and `Bd`/`Э`. Measured, that trade is a bad one — it fixes 7 collisions
+ * and introduces 23. Two hex digits per byte is uniquely decodable, and it leaves `A` as `%41`,
+ * exactly what the ASCII-only version emitted.
+ *
+ * Escaping only `[A-Z]` was not enough, and the gap was measured rather than argued. It left every
+ * *non-ASCII* capital for the normalizer to fold, which collapsed 7 pairs of distinct simplewiki
+ * pages onto 7 objects — `Coup_d'état` with `Coup_d'État`, `ß` with `ẞ`, `Русский_Язык` with
+ * `Русский_язык`. The loser of each pair got no object at all, its edges were written onto the
+ * winner's, and asking for its title served the other page. Seven in 950,421 here, and ~490 at the
+ * same rate in enwiki — a floor, since enwiki's titles are less often pure ASCII.
+ *
+ * `%` is escaped too, or the escape is not injective: a page actually named `%43at` would key the
+ * same as `Cat`. 13 simplewiki titles contain a `%` and none of them collides, which is luck.
+ *
+ * Still ugly for the reason it always was — the honest fix is for normalization to be a property of
+ * the index rather than one global function, recorded as open in docs/demo-dataset.md.
+ *
+ * CHANGING THIS INVALIDATES A LOADED DATABASE'S TITLE INDEX, because the key decides which index
+ * vshard holds the entry as well as what is stored in it. This version leaves 99.67% of simplewiki's
+ * keys byte-identical; the other 0.332% — 3,157 titles — would stop resolving by title if a Worker
+ * serving an already-loaded database were redeployed onto it.
  */
+const ESCAPER = new TextEncoder();
+const escape = (c: string): string =>
+  [...ESCAPER.encode(c)].map((b) => `%${b.toString(16).padStart(2, "0")}`).join("");
+
 export const titleKey = (ns: number, title: string): string =>
-  `${ns}:${title.replace(/[A-Z]/g, (c) => `%${c.charCodeAt(0).toString(16)}`)}`;
+  `${ns}:${title.replace(/./gsu, (c) => (c === "%" || c !== c.toLowerCase() ? escape(c) : c))}`;
 
 /** The page card the demo renders: the page, its first outlinks and categories, and the two counts
  *  that would each have been a `COUNT(*)`. The outlink *targets* live in their own vshards, so this
