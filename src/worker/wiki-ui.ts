@@ -75,7 +75,6 @@ main.hw-wrap{padding-bottom:6vh}
 .hw-hero{padding-top:5vh;padding-bottom:2.4vh}
 .hw-ey{font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--orange);margin:0 0 18px}
 .hw-h1{font-weight:800;font-size:clamp(28px,4.4vw,48px);line-height:1.03;letter-spacing:-.02em;margin:0 0 20px;max-width:22ch}
-.hw-lead{font-size:clamp(15px,1.6vw,18px);line-height:1.6;color:var(--ink-d);max-width:62ch;margin:0}
 .hw-sh{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-f);margin:3.4vh 0 16px}
 .hw-panel{background:var(--panel);border:1px solid var(--line2);border-radius:18px;padding:clamp(20px,3vw,30px);
   box-shadow:0 30px 70px -56px rgba(40,30,10,.5)}
@@ -226,10 +225,7 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
   <section id="pane-browse">
     <div class="hw-hero">
       <p class="hw-ey" id="ey">read-only · 43 host durable objects</p>
-      <h1 class="hw-h1">A Wikipedia mirror spread across many Durable Objects.</h1>
-      <p class="hw-lead">One database, laid out over host Durable Objects in advance, entered by title
-        and traversed. No single object holds it. Every answer reports which hosts it was assembled
-        from, and how many requests that took.</p>
+      <h1 class="hw-h1">A Wikipedia mirror spread across <span id="hostn">43</span> Durable Objects.</h1>
     </div>
 
     <form class="hw-entry" id="f">
@@ -253,11 +249,7 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
   <section id="pane-query" hidden>
     <div class="hw-hero">
       <p class="hw-ey">query editor</p>
-      <h1 class="hw-h1">Author a traversal, and watch what it costs.</h1>
-      <p class="hw-lead">Written in hlekk's own builder chain. Edge and field names complete from the
-        catalog, so the popup cannot offer a name the engine would not resolve. The cost below is the
-        product of the limits down each path — the thing no storage budget can see — and the server
-        refuses the same number it shows you.</p>
+      <h1 class="hw-h1">Author a traversal</h1>
     </div>
 
     <div class="qbar">
@@ -314,11 +306,14 @@ async function loadCluster() {
     const d = await fetch("/admin/where").then((r) => r.json());
     if (!Array.isArray(d.hosts)) return;
     CLUSTER = { hosts: d.hosts, indexVshards: (d.indexVshards || []).length };
-    // The hero's host count was a literal, written when the pilot had 43. The grid below now draws
-    // the real roster, so a stale number there is a page contradicting itself in two places a
-    // viewer can see at once. Same source for both.
+    // The hero's host counts were literals, written when the pilot had 43. The grid below draws the
+    // real roster, so a stale number up here is a page contradicting itself in two places a viewer
+    // can see at once -- and the headline is now one of them. One source for all three. The markup
+    // keeps 43 so the hero reads correctly before this resolves, and if it never does.
     const ey = document.getElementById("ey");
     if (ey) ey.textContent = "read-only · " + d.hosts.length + " host durable objects";
+    const hostn = document.getElementById("hostn");
+    if (hostn) hostn.textContent = d.hosts.length;
   } catch (e) { /* the grid is a nicety; a failed roster must not take the page with it */ }
 }
 
