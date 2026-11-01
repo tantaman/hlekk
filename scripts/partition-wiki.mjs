@@ -41,7 +41,17 @@
 // of all edges, and the skew cost 4.8x on write throughput. A partition that is not balanced is not
 // an improvement.
 
-import { createReadStream, createWriteStream, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 
@@ -153,6 +163,36 @@ async function scanEdges(file, visit) {
 }
 
 /**
+ * Reads a whole file into one Buffer, in slices.
+ *
+ * A single fs call caps at 2 GiB -- `readFileSync` refuses anything larger outright -- and enwiki's
+ * cached adjacency is 8.0 GB. The slice size is the only reason this is not `readFileSync`.
+ */
+function slurp(file) {
+  const size = statSync(file).size;
+  const buf = Buffer.allocUnsafe(size);
+  const fd = openSync(file, "r");
+  try {
+    for (let at = 0; at < size; ) {
+      const got = readSync(fd, buf, at, Math.min(1 << 30, size - at), at);
+      if (got <= 0) throw new Error(`short read on ${file} at ${at} of ${size}`);
+      at += got;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return buf;
+}
+
+/** The same 2 GiB limit from the other side: one `write` of an 8 GB buffer is one fs call. */
+async function spill(out, buf) {
+  for (let at = 0; at < buf.length; at += 1 << 30) {
+    const slice = buf.subarray(at, Math.min(at + (1 << 30), buf.length));
+    if (!out.write(slice)) await new Promise((drain) => out.once("drain", drain));
+  }
+}
+
+/**
  * The symmetric adjacency, in CSR, cached on disk.
  *
  * `edges.tsv` already holds both directions of both relations — `wiki.page_links` A->B and
@@ -165,7 +205,7 @@ async function graph(node) {
   const n = node.ids.length;
   const cache = path("graph.bin");
   if (existsSync(cache) && statSync(cache).mtimeMs > statSync(path("edges.tsv")).mtimeMs) {
-    const buf = readFileSync(cache);
+    const buf = slurp(cache);
     const off = new Int32Array(buf.buffer, buf.byteOffset, n + 1);
     const adj = new Int32Array(buf.buffer, buf.byteOffset + (n + 1) * 4, (buf.length - (n + 1) * 4) / 4);
     log(`graph: ${adj.length} entries from cache`);
@@ -184,7 +224,15 @@ async function graph(node) {
   log(`graph: ${rows} rows, ${dropped} with an endpoint outside pages.tsv`);
 
   const off = new Int32Array(n + 1);
-  for (let i = 0; i < n; i++) off[i + 1] = off[i] + deg[i];
+  let total = 0;
+  for (let i = 0; i < n; i++) {
+    total += deg[i];
+    off[i + 1] = off[i] + deg[i];
+  }
+  // A CSR offset is an Int32 and enwiki's adjacency, at 2.00 billion entries, sits 7% under the
+  // limit. A wrap would read back as a negative offset and a silently wrong graph rather than an
+  // error, so the one number that could wrap is checked before anything is built on it.
+  if (total > 0x7fffffff) throw new Error(`adjacency of ${total} entries overflows an Int32 offset`);
   const adj = new Int32Array(off[n]);
   const at = Int32Array.from(off.subarray(0, n));
   await scanEdges(path("edges.tsv"), (from, to) => {
@@ -194,8 +242,8 @@ async function graph(node) {
   });
 
   const out = createWriteStream(cache);
-  out.write(Buffer.from(off.buffer, off.byteOffset, off.byteLength));
-  out.write(Buffer.from(adj.buffer, adj.byteOffset, adj.byteLength));
+  await spill(out, Buffer.from(off.buffer, off.byteOffset, off.byteLength));
+  await spill(out, Buffer.from(adj.buffer, adj.byteOffset, adj.byteLength));
   await new Promise((done) => out.end(done));
   log(`graph: ${adj.length} entries, cached`);
   return { off, adj };
