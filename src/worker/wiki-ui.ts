@@ -202,7 +202,7 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
   /* Full-width controls, because a half-width control beside a wrapped one reads as a mistake. */
   .hw-entry{gap:8px}
   .hw-entry .hw-input[type=search]{flex:1 1 100%}
-  .hw-entry select.hw-input,.hw-entry .hw-btn,.qbar .hw-input,.qbar .hw-btn{width:100%}
+  .hw-entry .hw-btn,.qbar .hw-input,.qbar .hw-btn{width:100%}
   /* Finger-sized: 6px of padding is a comfortable mouse target and a poor thumb one. */
   .hw-mini{padding:9px 13px}
   .hw-chips a{padding:6px 12px}
@@ -234,7 +234,6 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
 
     <form class="hw-entry" id="f">
       <input class="hw-input" type="search" id="q" placeholder="Page title, e.g. Country" autocomplete="off" autofocus>
-      <select class="hw-input" id="ns" aria-label="Namespace"></select>
       <button class="hw-btn" type="submit">look up</button>
     </form>
     <!-- Titles carry spaces here and underscores in the index; stored() converts, so these read the
@@ -373,7 +372,11 @@ tabs.query.onclick = () => tab("query");
 
 const out = document.getElementById("out");
 const qbox = document.getElementById("q");
-const nsbox = document.getElementById("ns");
+// Entry is article-only, so there is no picker to read a namespace from: four of the five choices it
+// offered were namespaces nobody browsing an encyclopedia enters at. Reads still carry one, because
+// the card itself is not article-only -- a category chip is ns 14, and chips carry their own data-ns.
+// So this is the namespace the *entry form* uses, not the only one show() ever sees.
+const ARTICLE = "0";
 
 const RELS = [
   { edge: "wiki.page_links", title: "links from this page", count: "linkCount", key: "links" },
@@ -482,15 +485,14 @@ out.addEventListener("click", async (e) => {
 
 document.getElementById("f").addEventListener("submit", (e) => {
   e.preventDefault();
-  show(qbox.value, nsbox.value);
+  show(qbox.value, ARTICLE);
 });
 document.addEventListener("click", (e) => {
   const a = e.target.closest("a[data-go]");
   if (!a) return;
   e.preventDefault();
-  const ns = a.dataset.ns !== undefined ? a.dataset.ns : nsbox.value;
+  const ns = a.dataset.ns !== undefined ? a.dataset.ns : ARTICLE;
   qbox.value = pretty(a.dataset.go);
-  nsbox.value = ns;
   tab("browse");
   show(a.dataset.go, ns);
   window.scrollTo({ top: 0, behavior: "smooth" });
@@ -583,18 +585,18 @@ function optionsFor(head, typing) {
   if (/\.where\(\s*$/.test(head)) return fieldOpts(true);
   if (/\.where\(\s*"[^"]*"\s*,\s*$/.test(head)) return OPS.map((o) => opt('"' + o + '"', "operator"));
   if (/,\s*$/.test(head) && /\.related\([^()]*$/.test(head)) return [opt("q => q", "lambda")];
-  if (/^\s*$/.test(head)) return [opt('page(0, "Country")', "start here")];
+  if (/^\s*$/.test(head)) return [opt('page("Country")', "start here")];
   return typing
     ? [...METHODS.map((m) => opt(m, "method")), ...edgeOpts(), opt("page", "root"), opt("q", "lambda")]
     : null;
 }
 
 const EXAMPLES = {
-  "A page card — the demo's own query": 'page(0, "Country")\n  .countAs("linkCount", page_links)\n  .countAs("backlinkCount", linked_from)\n  .related("links", page_links, q => q.limit(25))\n  .related("categories", page_categories, q => q.limit(25))',
-  "Two hops — links, and who links to them": 'page(0, "Country")\n  .related("links", page_links, q => q\n    .limit(5)\n    .countAs("backlinkCount", linked_from)\n    .related("linkedFrom", linked_from, q => q.limit(3)))',
-  "A filter — only long articles": 'page(0, "Country")\n  .related("longLinks", page_links, q => q\n    .limit(10)\n    .where("len", ">", 20000))',
+  "A page card — the demo's own query": 'page("Country")\n  .countAs("linkCount", page_links)\n  .countAs("backlinkCount", linked_from)\n  .related("links", page_links, q => q.limit(25))\n  .related("categories", page_categories, q => q.limit(25))',
+  "Two hops — links, and who links to them": 'page("Country")\n  .related("links", page_links, q => q\n    .limit(5)\n    .countAs("backlinkCount", linked_from)\n    .related("linkedFrom", linked_from, q => q.limit(3)))',
+  "A filter — only long articles": 'page("Country")\n  .related("longLinks", page_links, q => q\n    .limit(10)\n    .where("len", ">", 20000))',
   "Members of a category": 'page(14, "France_geography_stubs")\n  .countAs("memberCount", category_pages)\n  .related("members", category_pages, q => q.limit(20))',
-  "Over budget on purpose — refused before any I/O": 'page(0, "Country")\n  .related("a", page_links, q => q.limit(100)\n    .related("b", page_links, q => q.limit(100)\n      .related("c", page_links, q => q.limit(100))))',
+  "Over budget on purpose — refused before any I/O": 'page("Country")\n  .related("a", page_links, q => q.limit(100)\n    .related("b", page_links, q => q.limit(100)\n      .related("c", page_links, q => q.limit(100))))',
 };
 
 const wrap = document.getElementById("qwrap");
@@ -787,8 +789,6 @@ exSel.addEventListener("change", () => {
   // fetch and the editor's setup instead of being added to them.
   const roster = loadCluster();
   SCHEMA = await (await fetch("/schema")).json();
-  nsbox.innerHTML = SCHEMA.entry.namespaces.map((n) =>
-    '<option value="' + n.value + '">' + esc(n.label) + "</option>").join("");
   // The editor's whole vocabulary, read off the schema so the popup cannot offer a name the engine
   // would not resolve -- the one property of this editor worth stating.
   EDGE_SHORT = SCHEMA.edges.map((e) => e.name.replace(/^wiki\./, ""));
@@ -802,9 +802,10 @@ exSel.addEventListener("change", () => {
 
   const params = new URLSearchParams(location.search);
   if (params.get("title")) {
-    nsbox.value = params.get("ns") || "0";
+    // Still read, though nothing in the UI now writes anything but 0: a card reached by a category
+    // chip replaceState's its own ns, and that link has to come back to the page it was copied from.
     qbox.value = pretty(params.get("title"));
-    show(params.get("title"), nsbox.value);
+    show(params.get("title"), params.get("ns") || ARTICLE);
   }
 })();
 </script>
