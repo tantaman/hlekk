@@ -65,6 +65,28 @@ const RELATION: Record<string, typeof pageLinks> = {
   [categoryPages.name]: categoryPages,
 };
 
+/** The page card's read: four counts from maintained counters, and the first page of the two lists
+ *  the card shows. Exported because the card is half of a contract -- `/relation` continues these
+ *  lists, and the join between them is the cursor this hands back -- and a test of that contract
+ *  should run the query the Worker runs rather than a copy that can drift from it.
+ *
+ *  Paged, not plain `related`: without a cursor the card's "show more" had nowhere to resume from,
+ *  so it re-read each list from the start and appended rows that were already on screen. `more` is
+ *  the other half of it -- a list that fits the limit gets no button at all. */
+export const cardQuery = (id: Id, limit: number) =>
+  Page.gen(id)
+    .countAs("linkCount", pageLinks)
+    .countAs("backlinkCount", linkedFrom)
+    .countAs("categoryCount", pageCategories)
+    .countAs("memberCount", categoryPages)
+    .relatedPage("links", pageLinks, (q) => q.limit(limit))
+    .relatedPage("categories", pageCategories, (q) => q.limit(limit));
+
+/** One page of one of those lists, continued from a cursor the card returned. `/relation` is this,
+ *  and so is the second half of the test that the two agree. */
+export const relationPage = (id: Id, edge: typeof pageLinks, limit: number, after: string | null) =>
+  Page.gen(id).relatedPage("items", edge, (q) => (after ? q.limit(limit).after(after) : q.limit(limit)));
+
 /** A page as the import emits it, with its edges stripped off by the driver. */
 interface PageIn {
   key: string;
@@ -478,13 +500,7 @@ export default {
 
         const stats = { rounds: 0, requests: 0 };
         const started = Date.now();
-        const rows = await Page.gen(id)
-          .countAs("linkCount", pageLinks)
-          .countAs("backlinkCount", linkedFrom)
-          .countAs("categoryCount", pageCategories)
-          .countAs("memberCount", categoryPages)
-          .related("links", pageLinks, (q) => q.limit(limit))
-          .related("categories", pageCategories, (q) => q.limit(limit))
+        const rows = await cardQuery(id, limit)
           .run(db, { driver: url.searchParams.get("driver") === "rounds" ? "rounds" : "async", stats });
         const ms = Date.now() - started;
 
@@ -516,8 +532,7 @@ export default {
         const after = url.searchParams.get("after");
         const stats = { rounds: 0, requests: 0 };
         const started = Date.now();
-        const rows = (await Page.gen(id)
-          .relatedPage("items", edge, (q) => (after ? q.limit(limit).after(after) : q.limit(limit)))
+        const rows = (await relationPage(id, edge, limit, after)
           .run(db, { stats })) as unknown as { items: { items: { id: Id; title: string; ns: number }[]; cursor: string | null; more: boolean } }[];
         const page = rows[0]?.items ?? { items: [], cursor: null, more: false };
         const ids = page.items.map((i) => i.id);
