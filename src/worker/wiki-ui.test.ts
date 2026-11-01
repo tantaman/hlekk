@@ -34,32 +34,16 @@ describe("the inline UI", () => {
     assert.equal(hit, -1, hit === -1 ? "" : `template interpolation near: ${scripts[0]!.slice(Math.max(0, hit - 60), hit + 60)}`);
   });
 
-  it("serves the placement comparison, with a roster for each side", () => {
-    // The A/B passes each database's own roster to the grid; without the second argument both sides
-    // would be shaded against the primary and a host holding control data would draw as empty.
-    assert.match(scripts[0]!, /function clusterGrid\(serving, roster\)/);
-    assert.match(scripts[0]!, /clusterGrid\(r\.hosts, roster\)/);
-    assert.match(scripts[0]!, /placement=b/);
-    assert.match(scripts[0]!, /async function compare\(/);
-    // Three sides, not two: the control is the denominator and the other two are what it is
-    // quoting. A pane that read only two would be comparing two guesses against each other.
-    assert.match(scripts[0]!, /placement=" \+ which|placement=c/);
-    assert.match(scripts[0]!, /is-three/);
-    assert.match(scripts[0]!, /let CLUSTER_C = null/);
-  });
-
-  it("reads the comparison at a limit the whole link set fits inside", () => {
-    // A truncated read returns the smallest-id targets, and init lands a contiguous id band on a
-    // contiguous host band -- so limit=25 made the comparison partly a measurement of the id
-    // layout. The pane says so when a page does not fit even this.
-    assert.match(scripts[0]!, /&limit=100/);
-    assert.doesNotMatch(scripts[0]!, /placement=b"\) \+ "&limit=25/);
-  });
-
-  it("gives the placement tab a pane to show", () => {
-    for (const id of ["tab-ab", "pane-ab", "abouts", "abq", "abns", "abf"]) {
+  it("gives every tab a pane to show, and nothing else", () => {
+    // The panes and tabs maps are keyed in lockstep and tab() walks one to set the other, so a
+    // button without a section -- or a section left behind by a removed tab -- throws on the first
+    // click. The placement A/B was removed; this is what keeps a stray reference to it from
+    // reaching the browser.
+    for (const id of ["tab-browse", "pane-browse", "tab-query", "pane-query"]) {
       assert.ok(WIKI_UI.includes('id="' + id + '"'), "missing #" + id);
     }
+    assert.doesNotMatch(WIKI_UI, /placement/);
+    assert.doesNotMatch(WIKI_UI, /pane-ab|tab-ab/);
   });
 
   it("serves the cluster grid the page card depends on", () => {

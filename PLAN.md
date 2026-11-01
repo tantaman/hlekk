@@ -72,8 +72,8 @@ Then, in order:
 A method error to keep not repeating: a read with a `limit` returns the smallest-id targets, and
 `init` assigns vshards to hosts in contiguous blocks, so a limited sample lands in a narrow band of
 hosts *whatever* the placement. The first measurement was an artifact of this and reported 1.39x with
-clustering losing on several pages. **The UI's placement tab still has this bias** — it reads
-`limit=25` — and it only knows two placements.
+clustering losing on several pages. The UI's placement tab had the same bias and has since been
+removed from the demo, so the measurement lives in the doc rather than in a pane a visitor re-runs.
 
 ## 2. Bulk import, proven against an oracle
 
@@ -180,9 +180,6 @@ All three are irreversible, and the last one is the one that bites.
 ## Open
 
 - [ ] The live reading of the third placement. Everything in step 1.
-- [ ] The UI's placement tab: it samples with `limit=25`, which is the bias that made the first
-      measurement wrong, and it knows only two placements. A third tab needs a `placement=c` target,
-      another service binding and a redeploy of the public Worker.
 - [ ] The 4 missing objects on the hash side. The hypothesis is a lost `indexConfirm` response, after
       which the worker's recovery deletes the object while the confirmed index entry survives, so the
       retry resolves to a deleted id — a title that looks up fine and reads as nothing. **Unverified.**
