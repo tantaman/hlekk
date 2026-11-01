@@ -257,7 +257,7 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
   <section id="pane-browse">
     <div class="hw-hero">
       <p class="hw-ey" id="ey">read-only · 43 host durable objects</p>
-      <h1 class="hw-h1">A Wikipedia mirror spread across <span id="hostn">43</span> Durable Objects.</h1>
+      <h1 class="hw-h1">A SimpleWiki spread across <span id="hostn">43</span> Durable Objects.</h1>
     </div>
 
     <form class="hw-entry" id="f">
