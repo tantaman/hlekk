@@ -428,7 +428,9 @@ returns the targets with the smallest ids, and `init` assigns vshards to hosts i
 (`Math.floor(i / per)`), so a limited sample lands in a narrow band of hosts *whatever* the
 placement. The first run reported 1.39x and had clustering losing on several pages — an artifact of
 sampling, not a result. Only a page whose entire target set fits under the limit compares anything.
-The UI's placement tab reads `limit=25` and has the same bias.
+The UI's placement tab had the same bias at `limit=25`, was later raised to 100, and has
+since been removed from the demo — the comparison is a finding recorded here, not a control
+a visitor needs to re-run.
 
 **The knob's larger effect was on writes, in the opposite direction.** Pass B ran at 33,832 edges/s
 clustered against 164,021 spread — **4.8x** — because first-category affinity put **20.9%** of all
