@@ -38,6 +38,7 @@ import {
   pageCategories,
   pageLinks,
   legacyTitleKey,
+  storedTitle,
   titleKey,
 } from "./wiki.ts";
 
@@ -86,6 +87,27 @@ export const cardQuery = (id: Id, limit: number) =>
  *  and so is the second half of the test that the two agree. */
 export const relationPage = (id: Id, edge: typeof pageLinks, limit: number, after: string | null) =>
   Page.gen(id).relatedPage("items", edge, (q) => (after ? q.limit(limit).after(after) : q.limit(limit)));
+
+/**
+ * A title's id, under the current index key or the one this database may have been loaded with.
+ *
+ * `lookup` is the index read, passed in so this can be driven without a cluster: both halves are
+ * worth a test and neither was reachable while this lived inside the request handler. The halves are
+ * the normalization -- a typed title has to land on the key the loader wrote, which is the dump's
+ * own spelling -- and the legacy fallback, one extra lookup taken only on a miss.
+ */
+export async function titleLookup(
+  lookup: (key: string) => Promise<Id | null>,
+  ns: number,
+  typed: string,
+): Promise<Id | null> {
+  const stored = storedTitle(typed);
+  const key = titleKey(ns, stored);
+  const id = await lookup(key);
+  if (id !== null) return id;
+  const legacy = legacyTitleKey(ns, stored);
+  return legacy === key ? null : lookup(legacy);
+}
 
 /** A page as the import emits it, with its edges stripped off by the driver. */
 interface PageIn {
@@ -207,13 +229,8 @@ export default {
      * why a loaded database cannot simply be re-keyed. The second lookup is skipped when the two
      * spellings agree, which is 99.67% of simplewiki's titles.
      */
-    const byTitle = async (n: number, t: string): Promise<Id | null> => {
-      const key = titleKey(n, t);
-      const id = await db.lookupUnique(TITLE_IDX, key);
-      if (id !== null) return id;
-      const legacy = legacyTitleKey(n, t);
-      return legacy === key ? null : db.lookupUnique(TITLE_IDX, legacy);
-    };
+    const byTitle = (n: number, t: string): Promise<Id | null> =>
+      titleLookup((key) => db.lookupUnique(TITLE_IDX, key), n, t);
 
     try {
       // ---- the demo you can look at
@@ -585,7 +602,11 @@ export default {
         }
         const id = await byTitle(spec.from.ns, spec.from.title);
         if (id === null) {
-          return json({ refused: `no page "${spec.from.title}" in namespace ${spec.from.ns}`, at: "from" }, 404);
+          // Named by the key that was actually looked up. A demo whose entry story is "one exact
+          // key" owes an author the spelling it tried, especially when it is not the one they typed.
+          const stored = storedTitle(spec.from.title);
+          const asked = stored === spec.from.title ? "" : ` (from "${spec.from.title}")`;
+          return json({ refused: `no page "${stored}"${asked} in namespace ${spec.from.ns}`, at: "from" }, 404);
         }
         const stats = { rounds: 0, requests: 0 };
         const started = Date.now();

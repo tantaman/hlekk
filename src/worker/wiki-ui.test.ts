@@ -13,6 +13,7 @@ import { describe, it } from "node:test";
 import vm from "node:vm";
 
 import { WIKI_UI } from "./wiki-ui.ts";
+import { storedTitle } from "./wiki.ts";
 
 const scripts = [...WIKI_UI.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]!);
 
@@ -90,6 +91,24 @@ describe("the inline UI", () => {
     assert.match(scripts[0]!, /id="rtree"/);
     assert.match(scripts[0]!, /id="rjson"/);
     assert.match(scripts[0]!, /RESULT_VIEW = btn\.dataset\.view/);
+  });
+
+  it("normalizes a typed title exactly as the server does", () => {
+    // Two normalizers for one rule is what broke the query editor: the browse pane turned spaces
+    // into underscores in the browser and the editor sent what was typed to an exact-key lookup, so
+    // page("Computer Science") missed a page the card beside it renders. The server now normalizes
+    // at the lookup, which only helps while this copy keeps saying the same thing -- it still exists
+    // because the address bar should carry the stored spelling.
+    const src = scripts[0]!.match(/const stored = \(t\) => \{[\s\S]*?\n\};/);
+    assert.ok(src, "the browse pane should still normalize before it builds a URL");
+    const ctx = vm.createContext({});
+    vm.runInContext(src![0] + "\nglobalThis.normalize = stored;", ctx);
+    for (const typed of [
+      "Computer science", "computer science", "Computer_science", "  North Korea  ",
+      "NASA", "éclair", "a", "",
+    ]) {
+      assert.equal(ctx.normalize(typed), storedTitle(typed), JSON.stringify(typed));
+    }
   });
 
   it("serves the cluster grid the page card depends on", () => {
