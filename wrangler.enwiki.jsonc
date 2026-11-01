@@ -6,7 +6,7 @@
   // WHY A FOURTH DEPLOYMENT, AND ONLY ONE PLACEMENT. The three simplewiki deployments answer the
   // demo's question -- a key derived from the link graph reads a page from 10.7 hosts of 43 where a
   // title hash needs 34.7, and a page's first category only gets to 26.2. That comparison needs
-  // three databases loaded from identical records, which at this size costs 20 hours each. So the
+  // three databases loaded from identical records, which at this size costs ~22 hours each. So the
   // comparison stays at simplewiki, where it is complete and cheap to re-run, and this exists to
   // show the same key holding up two orders of magnitude further out.
   //
@@ -28,20 +28,41 @@
   "vars": {
     "HLEKK_DATABASE": "enwiki-graph",
     /**
-     * 256, where simplewiki used 128, and `/admin/init?hosts=86&indexVshards=128` is the matching
+     * 256, where simplewiki used 128, and `/admin/init?hosts=20&indexVshards=128` is the matching
      * call. Read once, when the directory first opens, so this is chosen before the load and cannot
-     * be changed afterwards -- which is why it is sized from a measurement rather than a guess.
+     * be changed afterwards -- which is why it is sized from the prepared import and not a guess.
      *
-     * `init` spreads these 256 across hosts at `per = ceil(256/86) = 3`, giving 86 hosts, then opens
-     * a second batch of 256 and takes the first 128 of it as index vshards. So: 512 vshards, 384 of
-     * them taking data, 128 serving the unique title index, on 86 hosts.
+     * `init` spreads these 256 across hosts at `per = ceil(256/20) = 13`, which gives 20 hosts, then
+     * opens a second batch of 256 and takes the first 128 of it as index vshards. So: 512 vshards,
+     * 384 of them taking data, 128 serving the unique title index, on 20 hosts.
      *
-     * The sizing. simplewiki measured 61.4 bytes per stored row across all three placements, and
-     * this import is 21,963,892 pages and ~2.8-3.5 billion edges -- 161 to 201 GB. Over 43 hosts
-     * that is 3.75 to 4.68 GB each, and `Allocator.active()` drops a vshard once it passes *half*
-     * the 9 GB cap, so 43 hosts would have run the placement set down to nothing mid-load and
-     * shifted every subsequent `place()`. Over 86 it is 1.88 to 2.34 GB a host and 0.42 to 0.52 GB
-     * a vshard, which leaves the active set whole and the 10 GB per-object ceiling far off.
+     * THE SIZING IS A HOST-SIZE TARGET, AND THE HOST COUNT IS THE ONLY KNOB LEFT. The prepared
+     * import is 21,963,892 pages and 1,776,368,606 edges, which at the 61.4 bytes per stored row
+     * simplewiki measured under all three placements is 102.8 GiB. Host count is quantised by
+     * `per = ceil(256/ask)`: 20, 22, 26, 32 and 43 are reachable and nothing between them is.
+     *
+     * 20 puts the average host at 5.14 GiB. The spread around that average comes from the
+     * partitioner and not from the vshard split -- a host holds one part, and `splitWithinHosts`
+     * only chooses which of that host's own vshards each page lands on. The partitioner balances
+     * parts by degree and holds the heaviest to the `--eps` ceiling of 1.20x the mean; at 20 parts
+     * over this graph it left the lightest at 0.63x. So the hosts arrive between 3.3 and 6.2 GiB.
+     * `DEFAULT_THRESHOLDS.bytes` sheds at 8 GB and a write meets SQLITE_FULL at 10: the heaviest
+     * host keeps 1.8 GiB against the first and 3.8 against the second, which is the margin for a
+     * row costing more here than the 61.4 bytes it cost two orders of magnitude down.
+     *
+     * Why not fewer, when fewer would fill them better. 18 would average 5.71 GiB and 16 would
+     * average 6.43, both still under the shed line at 1.20x. The argument for 20 is asymmetric
+     * risk: the only uncertain number is bytes per row, being wrong low costs nothing but empty
+     * hosts, and being wrong high at 16 hosts puts the heaviest host within 0.3 GiB of shedding
+     * mid-load. Why not more: 43 would load in about half the time, because the loader keeps one
+     * batch in flight per host and pass B measured 136k edges/s at that width -- but it would leave
+     * every host a quarter full, which demonstrates the sizing rather than exercises it.
+     *
+     * `Allocator.active()` does not bear on this. It drops a vshard past *half* the 9 GB VSHARD_CAP,
+     * but `usage` is keyed by vshard and 384 of them hold 0.27 GiB apiece, so the active set stays
+     * whole and `place()` keeps dividing by 384 throughout. Nothing sheds mid-load either:
+     * `rebalance()` is an RPC that nothing calls, and the directory's alarm only resumes a move that
+     * failed partway.
      */
     "HLEKK_VSHARDS": "256"
   },
