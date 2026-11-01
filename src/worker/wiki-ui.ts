@@ -237,11 +237,16 @@ pre.hw-code code{font-family:var(--font-mono);font-size:12px;line-height:1.65;co
       <select class="hw-input" id="ns" aria-label="Namespace"></select>
       <button class="hw-btn" type="submit">look up</button>
     </form>
-    <p class="hw-note">Entry is exact <code>(namespace, title)</code> against a unique index. There is
-      no scan and no prefix search, so there is nothing to suggest titles from. The first letter is
-      capitalized for you, as MediaWiki does; nothing else is. Try
+    <!-- Titles carry spaces here and underscores in the index; stored() converts, so these read the
+         way they are displayed. "Computer science" is deliberately not "Computer Science": both
+         titles exist in the dump and the capitalized one is a redirect, which would render a stub
+         with one outlink and light a single host -- the opposite of what an example is for. -->
+    <p class="hw-note">Case sensitive. Try
+      <a href="#" data-go="North Korea">North Korea</a>,
+      <a href="#" data-go="Computer science">Computer science</a>,
       <a href="#" data-go="Country">Country</a>, <a href="#" data-go="Europe">Europe</a>,
-      <a href="#" data-go="Earth">Earth</a> or <a href="#" data-go="Water">Water</a>.</p>
+      <a href="#" data-go="Earth">Earth</a>, <a href="#" data-go="Water">Water</a>,
+      <a href="#" data-go="NASA">NASA</a>, etc.</p>
 
     <div id="out"></div>
   </section>
