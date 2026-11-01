@@ -416,7 +416,7 @@ async function show(title, ns) {
     + '<div class="hw-read" style="border-top:none;margin-top:3.4vh;padding-top:0">'
       + "<p>Assembled from <b>" + r.hosts.length + "</b> host" + (r.hosts.length === 1 ? "" : "s")
       + " in <b>" + r.requests + "</b> request" + (r.requests === 1 ? "" : "s")
-      + " over <b>" + r.objects + "</b> objects — <b>" + r.ms + " ms</b>, plus " + r.lookupMs
+      + " — <b>" + r.ms + " ms</b>, plus " + r.lookupMs
       + " ms to turn the title into an id. The counts above come from maintained counters, so a page "
       + "with thousands of backlinks costs no more to count than one with three.</p>"
       + clusterGrid(r.hosts)
@@ -760,7 +760,7 @@ async function run() {
     + '<p class="hw-sh" style="margin-top:0">result</p>'
     + '<p class="hw-note">Assembled from <b>' + r.hosts.length + "</b> host"
     + (r.hosts.length === 1 ? "" : "s") + " in <b>" + r.requests + "</b> request"
-    + (r.requests === 1 ? "" : "s") + " over <b>" + r.objects + "</b> objects — <b>" + r.ms
+    + (r.requests === 1 ? "" : "s") + " — <b>" + r.ms
     + " ms</b>. Priced at " + nf(d.cost.nodes) + " answer nodes across " + d.cost.frames + " frames.</p>"
     + clusterGrid(r.hosts)
     + '<div style="margin-top:18px"></div>'
