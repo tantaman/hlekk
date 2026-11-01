@@ -149,6 +149,38 @@ select.hw-input{font-family:var(--font-mono);font-size:13px}
   background:var(--white);border:1px solid var(--line2);border-radius:999px;padding:4px 11px}
 .hw-chips a:hover{border-color:var(--orange);color:var(--orange)}
 .hw-shown{font-family:var(--font-mono);font-size:11px;color:var(--ink-f);margin-left:9px}
+/* ---- the result tree.
+   The JSON beside it is the proof; this is the read. A query names its own aliases and nests to
+   whatever depth it was written to, so nothing here is keyed to wiki.page: an object is a headline
+   plus its scalars, an array is a named countable group, and the engine's own $-prefixed metadata
+   folds into the meta line rather than becoming nodes of its own -- an $edge of time and data drawn
+   as a child buries the row it belongs to under its bookkeeping. */
+.hw-rhead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 16px}
+.hw-rhead .hw-sh{margin:0}
+.hw-views{display:flex;gap:6px}
+.hw-mini.is-on{border-color:var(--orange);color:var(--orange)}
+.hw-tree{font-size:13.5px}
+.hw-node{border-left:1px solid var(--line);padding-left:13px}
+.hw-nh{display:flex;flex-wrap:wrap;align-items:baseline;gap:1px 12px;padding:4px 0}
+.hw-nl{font-weight:600;color:var(--ink)}
+.hw-nl.is-bare{font-family:var(--font-mono);font-weight:400;font-size:12px;color:var(--ink-d)}
+.hw-nl a{color:inherit;text-decoration:none;border-bottom:1px solid var(--line2)}
+.hw-nl a:hover{color:var(--orange);border-color:var(--orange)}
+.hw-meta{display:flex;flex-wrap:wrap;gap:1px 12px;font-family:var(--font-mono);font-size:11px;color:var(--ink-d)}
+.hw-meta b{font-weight:400;color:var(--ink-f)}
+.hw-meta.is-dim{opacity:.55}
+.hw-grp{margin:1px 0 3px}
+/* list-style:none and the ::marker rule both matter: Safari uses the webkit pseudo-element and
+   Firefox the standard one, and a leftover disclosure triangle beside the drawn one reads as two. */
+.hw-grp>summary{cursor:pointer;list-style:none;font-family:var(--font-mono);font-size:10.5px;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--ink-f);padding:4px 0}
+.hw-grp>summary::marker{content:""}
+.hw-grp>summary::-webkit-details-marker{display:none}
+.hw-grp>summary::before{content:"\25b8";color:var(--orange);display:inline-block;width:13px}
+.hw-grp[open]>summary::before{content:"\25be"}
+.hw-grp>summary:hover{color:var(--ink)}
+.hw-grp>summary em{font-style:normal;opacity:.6;margin-left:5px}
+.hw-empty{font-family:var(--font-mono);font-size:11px;color:var(--ink-f);margin:0 0 4px;padding-left:13px}
 .hw-read{border-top:1px solid var(--line);margin-top:3.4vh;padding-top:16px}
 .hw-read p{margin:0;font-size:13.5px;line-height:1.55;color:var(--ink-d)}
 .hw-read b{font-family:var(--font-mono);font-weight:500;color:var(--ink)}
@@ -747,6 +779,108 @@ async function reprice() {
   runBtn.disabled = false;
 }
 
+// ---------------------------------------------------------------- the answer, rendered
+//
+// The JSON is what a reader checks the demo against and it stays one click away, but it is not how
+// anyone reads a graph answer: the shape the engine returns is a tree, and a pre full of braces
+// makes the reader rebuild that tree in their head.
+//
+// Nothing below knows what a page is. A query in this editor names its own aliases, picks its own
+// fields and nests as deep as it was written to, so the renderer works from the value's own shape:
+// scalars describe the node they sit on, arrays are the relations, and objects are nodes.
+
+const isScalar = (v) => v === null || typeof v === "string" || typeof v === "number" || typeof v === "boolean";
+
+/** The field a node is named by. There is none it can rely on, so: the conventional names first,
+ *  then the first ordinary string, then the id, and nothing if the object carries no string at all
+ *  -- a node of pure numbers is legitimate and gets drawn unnamed rather than mislabelled. */
+function headline(o) {
+  for (const k of ["title", "name", "label"]) if (typeof o[k] === "string") return k;
+  for (const k of Object.keys(o)) {
+    if (typeof o[k] === "string" && k !== "id" && k.charAt(0) !== "$") return k;
+  }
+  return typeof o.id === "string" ? "id" : null;
+}
+
+const scalarText = (v) => (v === null ? "null" : typeof v === "number" ? nf(v) : String(v));
+// The sigil is dropped on the way out: it marks where a key came from, which the dimmed group it is
+// drawn in already says, and "$version 1" beside "edge.time 0" spells the same thing two ways.
+const pair = (k, v) => "<span><b>" + esc(k.charAt(0) === "$" ? k.slice(1) : k)
+  + "</b> " + esc(scalarText(v)) + "</span>";
+/** Two levels of relations open, the rest folded: the first example alone is 25 links and 3
+ *  categories, and a tree that opens everything is the pre it replaced with indentation. */
+const openTo = (depth) => (depth < 3 ? " open" : "");
+
+function treeNode(o, depth) {
+  const head = headline(o);
+  // Two meta lines, not one. The query's own fields are what a reader came for; $version and an
+  // edge's time are the engine's bookkeeping, true on every row and interesting on almost none, so
+  // they are drawn after the fields and dimmer rather than interleaved by key order.
+  const meta = [];
+  const dim = [];
+  const groups = [];
+  for (const k of Object.keys(o)) {
+    const v = o[k];
+    if (k === head) continue;
+    if (isScalar(v)) (k.charAt(0) === "$" ? dim : meta).push(pair(k, v));
+    else if (Array.isArray(v)) groups.push(treeGroup(k, v, depth + 1));
+    else if (v === undefined) continue;
+    else if (k.charAt(0) === "$") {
+      // Flattened onto the dim line, and a null drops out rather than drawing "data null" on every
+      // row of an edge that carries no payload.
+      for (const sk of Object.keys(v)) if (isScalar(v[sk]) && v[sk] !== null) dim.push(pair(k.slice(1) + "." + sk, v[sk]));
+    } else {
+      groups.push('<details class="hw-grp"' + openTo(depth + 1) + "><summary>" + esc(k)
+        + "</summary>" + treeNode(v, depth + 1) + "</details>");
+    }
+  }
+  // A row that carries a title and a namespace is a page this demo can open, so the headline is the
+  // way back to the browse pane -- the same data-go the card's chips use, read by the same handler.
+  const text = head === null ? "unnamed" : head === "title" ? pretty(o[head]) : o[head];
+  const linked = head === "title" && typeof o.ns === "number"
+    ? '<a href="#" data-go="' + esc(o.title) + '" data-ns="' + esc(o.ns) + '">' + esc(text) + "</a>"
+    : esc(text);
+  return '<div class="hw-node"><div class="hw-nh">'
+    + '<span class="hw-nl' + (head === null ? " is-bare" : "") + '">' + linked + "</span>"
+    + (meta.length ? '<span class="hw-meta">' + meta.join("") + "</span>" : "")
+    + (dim.length ? '<span class="hw-meta is-dim">' + dim.join("") + "</span>" : "") + "</div>"
+    + groups.join("") + "</div>";
+}
+
+/** A relation: its alias, how many came back, and the rows themselves. The count is on the summary
+ *  so a folded group still answers the question most often asked of it. */
+function treeGroup(name, arr, depth) {
+  const body = arr.length === 0
+    ? '<p class="hw-empty">empty</p>'
+    : arr.map((v) => (isScalar(v)
+      ? '<div class="hw-node"><div class="hw-nh"><span class="hw-nl is-bare">' + esc(scalarText(v)) + "</span></div></div>"
+      : treeNode(v, depth))).join("");
+  return '<details class="hw-grp"' + openTo(depth) + "><summary>" + esc(name)
+    + " <em>" + nf(arr.length) + "</em></summary>" + body + "</details>";
+}
+
+/** The whole answer. The rows are the roots, so they are drawn without a group above them. */
+function treeOf(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return '<p class="hw-empty">No rows.</p>';
+  return '<div class="hw-tree">' + rows.map((r) =>
+    (isScalar(r) ? '<div class="hw-node"><div class="hw-nh"><span class="hw-nl is-bare">'
+      + esc(scalarText(r)) + "</span></div></div>" : treeNode(r, 0))).join("") + "</div>";
+}
+
+// Which view the result panel opens on, kept across runs so a reader who wants the JSON is not put
+// back on the tree by every query they run.
+let RESULT_VIEW = "tree";
+qout.addEventListener("click", (e) => {
+  const btn = e.target.closest("button.view");
+  if (!btn) return;
+  RESULT_VIEW = btn.dataset.view;
+  for (const b of qout.querySelectorAll("button.view")) b.classList.toggle("is-on", b.dataset.view === RESULT_VIEW);
+  const tree = qout.querySelector("#rtree");
+  const raw = qout.querySelector("#rjson");
+  if (tree) tree.hidden = RESULT_VIEW !== "tree";
+  if (raw) raw.hidden = RESULT_VIEW !== "json";
+});
+
 async function run() {
   qout.innerHTML = '<div class="hw-panel"><p class="hw-note">Running…</p></div>';
   let d;
@@ -774,15 +908,20 @@ async function run() {
     return;
   }
   const r = d.read;
+  const view = (name) => '<button class="hw-mini view' + (RESULT_VIEW === name ? " is-on" : "")
+    + '" data-view="' + name + '">' + name + "</button>";
   qout.innerHTML = '<div class="hw-panel">'
-    + '<p class="hw-sh" style="margin-top:0">result</p>'
+    + '<div class="hw-rhead"><p class="hw-sh">result</p>'
+      + '<div class="hw-views">' + view("tree") + view("json") + "</div></div>"
     + '<p class="hw-note">Assembled from <b>' + r.hosts.length + "</b> host"
     + (r.hosts.length === 1 ? "" : "s") + " in <b>" + r.requests + "</b> request"
     + (r.requests === 1 ? "" : "s") + " — <b>" + r.ms
     + " ms</b>. Priced at " + nf(d.cost.nodes) + " answer nodes across " + d.cost.frames + " frames.</p>"
     + clusterGrid(r.hosts)
     + '<div style="margin-top:18px"></div>'
-    + '<pre class="hw-code"><code>' + esc(JSON.stringify(d.rows, null, 2)) + "</code></pre></div>";
+    + '<div id="rtree"' + (RESULT_VIEW === "tree" ? "" : " hidden") + ">" + treeOf(d.rows) + "</div>"
+    + '<pre class="hw-code" id="rjson"' + (RESULT_VIEW === "json" ? "" : " hidden") + "><code>"
+    + esc(JSON.stringify(d.rows, null, 2)) + "</code></pre></div>";
 }
 
 runBtn.addEventListener("click", () => void run());

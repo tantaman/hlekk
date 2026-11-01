@@ -70,6 +70,28 @@ describe("the inline UI", () => {
     );
   });
 
+  it("renders the answer as a tree without knowing what a page is", () => {
+    // The point of the tree view is that it works on whatever a query returns, so the thing worth
+    // asserting is the absence of a wiki vocabulary in it: a renderer that reached for p.title or
+    // "links" would draw this demo's own queries and nothing an author writes.
+    assert.match(scripts[0]!, /function treeOf\(rows\)/);
+    assert.match(scripts[0]!, /function treeNode\(o, depth\)/);
+    assert.match(scripts[0]!, /function treeGroup\(name, arr, depth\)/);
+    const tree = scripts[0]!
+      .slice(scripts[0]!.indexOf("const isScalar"), scripts[0]!.indexOf("async function run()"))
+      // Comments out: the section explains itself using this demo's own queries as the example, and
+      // prose naming "categories" is not the renderer reaching for a field called categories.
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .replace(/^\s*\/\/.*$/gm, " ");
+    for (const wiki of ["page_links", "linkCount", "wiki.", "categories", "page_categories"]) {
+      assert.ok(!tree.includes(wiki), "the tree renderer should not know about " + wiki);
+    }
+    // Both views are built, and the toggle reads the same names it writes.
+    assert.match(scripts[0]!, /id="rtree"/);
+    assert.match(scripts[0]!, /id="rjson"/);
+    assert.match(scripts[0]!, /RESULT_VIEW = btn\.dataset\.view/);
+  });
+
   it("serves the cluster grid the page card depends on", () => {
     // The card calls clusterGrid(); if it were renamed on one side only, the page would throw at
     // render time and the test suite would otherwise never know.
