@@ -9,8 +9,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { altTarget, wipeTarget } from "./wiki-app.ts";
+import { LocalCluster } from "../client/local.ts";
+import { altTarget, cardQuery, relationPage, wipeTarget } from "./wiki-app.ts";
+import { LOCK, Page, pageLinks } from "./wiki.ts";
 import type { Env } from "../do/bindings.ts";
+
+/** The card's row, as the Worker hands it to the UI. */
+interface CardRow {
+  linkCount: number;
+  links: { items: { id: string; title: string }[]; cursor: string | null; more: boolean };
+}
 
 const at = (query: string) => altTarget(new URL("https://wiki.example.com/page" + query));
 
@@ -103,5 +111,76 @@ describe("wipeTarget", () => {
   it("refuses a request that names nothing at all", () => {
     assert.equal(wipeTarget(armed, url("")), null);
     assert.equal(wipeTarget(armed, url("?confirm=wiki-pilot2")), null);
+  });
+});
+
+// The page card and "show more" are two halves of one contract: the card reads the first page of
+// each list, the button reads the rest, and the cursor the card returns is the only thing joining
+// them. The card used plain `related`, which hands back rows and no cursor -- so the button had
+// nowhere to resume from, re-read each list from its start, and appended rows that were already on
+// screen. A page with 20 links showed 40 chips, every one of them twice.
+//
+// Both sides run the Worker's own builders against a real cluster here, because a test that wrote
+// the queries out again would have agreed with itself while the Worker disagreed.
+describe("the page card and the list it continues", () => {
+  async function seeded(links: number) {
+    const c = new LocalCluster();
+    c.directory.applyLock(LOCK);
+    c.spreadCatalog();
+    await c.publish();
+    const db = c.client();
+    const page = (title: string, vshard: string) =>
+      db.create(Page.otype, { ns: 0, title, redirect: false, len: 100 }, { vshard });
+    const from = await page("Country", "5");
+    for (let i = 1; i <= links; i++) {
+      // Spread over vshards, as the real graph is: a page's links point anywhere.
+      const to = await page("Target" + i, String(10 + (i % 7)));
+      await db.assocAdd(pageLinks.atype, from, to, 0);
+    }
+    return { db, from };
+  }
+
+  it("hands the button a cursor, so the next page continues rather than repeats", async () => {
+    const { db, from } = await seeded(5);
+    const [card] = (await cardQuery(from, 2).run(db)) as unknown as CardRow[];
+    assert.equal(card.linkCount, 5, "the counter sees the whole list");
+    assert.equal(card.links.items.length, 2);
+    assert.equal(card.links.more, true);
+    assert.ok(card.links.cursor, "a card with more to show must say where to resume");
+
+    const [next] = (await relationPage(from, pageLinks, 2, card.links.cursor).run(db)) as unknown as {
+      items: { items: { id: string; title: string }[]; cursor: string | null; more: boolean };
+    }[];
+    const titles = [...card.links.items, ...next.items.items].map((l) => l.title);
+    assert.equal(new Set(titles).size, titles.length, "a row the card already showed came back: " + titles.join(", "));
+    assert.equal(titles.length, 4);
+  });
+
+  it("says a list that fits the card is whole, so no button is drawn", async () => {
+    // The other half of the same bug: "20 total" over 20 chips still offered "show more", and
+    // pressing it was the only way to find out there was nothing behind it.
+    const { db, from } = await seeded(3);
+    const [card] = (await cardQuery(from, 25).run(db)) as unknown as CardRow[];
+    assert.equal(card.links.items.length, 3);
+    assert.equal(card.links.more, false);
+  });
+
+  it("reads a whole list through its cursors with nothing lost or repeated", async () => {
+    const { db, from } = await seeded(9);
+    const seen: string[] = [];
+    const [card] = (await cardQuery(from, 4).run(db)) as unknown as CardRow[];
+    seen.push(...card.links.items.map((l) => l.title));
+    let cursor = card.links.cursor;
+    let more = card.links.more;
+    for (let round = 0; more && round < 10; round++) {
+      const [page] = (await relationPage(from, pageLinks, 4, cursor).run(db)) as unknown as {
+        items: { items: { title: string }[]; cursor: string | null; more: boolean };
+      }[];
+      seen.push(...page.items.items.map((l) => l.title));
+      cursor = page.items.cursor;
+      more = page.items.more;
+    }
+    assert.equal(seen.length, 9, "every link, once: " + seen.join(", "));
+    assert.equal(new Set(seen).size, 9);
   });
 });

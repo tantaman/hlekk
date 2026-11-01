@@ -388,6 +388,11 @@ const RELS = [
 const chip = (i) => '<li><a href="#" data-go="' + esc(i.title) + '" data-ns="' + esc(i.ns) + '">'
   + esc(pretty(i.title)) + "</a></li>";
 
+// Where each relation's list has got to, keyed by page id and edge. show() seeds it from the card's
+// own read and the "show more" handler below advances it; declared here because the card writes it
+// before the first click can read it.
+const cursors = new Map();
+
 async function show(title, ns) {
   if (!title) return;
   out.innerHTML = '<div class="hw-panel"><p class="hw-note">Looking up ' + esc(pretty(title)) + "…</p></div>";
@@ -435,13 +440,25 @@ async function show(title, ns) {
   for (const rel of RELS) {
     const total = p[rel.count] || 0;
     if (total === 0) continue;
-    const seeded = rel.key ? (p[rel.key] || []) : [];
+    // A seeded relation arrives as a page -- rows, a cursor, and whether the list goes on. The two
+    // unseeded ones are read entirely through the button, so they start with nothing and always
+    // have more to get.
+    const seed = rel.key ? (p[rel.key] || { items: [], cursor: null, more: false }) : null;
+    const items = seed ? seed.items : [];
+    // The cursor the card's own read already returned. Handing it to the button here is what stops
+    // the first "show more" from starting the list again and showing these rows twice.
+    if (seed && seed.cursor) cursors.set(d.id + ":" + rel.edge, seed.cursor);
+    const more = seed ? seed.more : true;
     html += '<div class="hw-rel" data-edge="' + rel.edge + '">'
       + '<p class="hw-sh">' + rel.title + " <em>" + nf(total) + " total</em></p>"
-      + '<ul class="hw-chips">' + seeded.map(chip).join("") + "</ul>"
-      + '<button class="hw-mini more" data-edge="' + rel.edge + '" data-id="' + esc(d.id) + '">'
-      + (seeded.length ? "show more" : "load " + nf(Math.min(total, 50))) + "</button>"
-      + '<span class="hw-shown">' + (seeded.length ? nf(seeded.length) + " of " + nf(total) : "") + "</span>"
+      + '<ul class="hw-chips">' + items.map(chip).join("") + "</ul>"
+      // No button when the list is already whole: "20 total" above 20 chips and a live "show more"
+      // was an invitation to press something with nothing behind it.
+      + (more
+        ? '<button class="hw-mini more" data-edge="' + rel.edge + '" data-id="' + esc(d.id) + '">'
+          + (items.length ? "show more" : "load " + nf(Math.min(total, 50))) + "</button>"
+        : "")
+      + '<span class="hw-shown">' + (items.length ? nf(items.length) + " of " + nf(total) : "") + "</span>"
       + "</div>";
   }
 
@@ -452,7 +469,6 @@ async function show(title, ns) {
 }
 
 // "show more": read the next page of one relation, carrying the cursor the last page returned.
-const cursors = new Map();
 out.addEventListener("click", async (e) => {
   const btn = e.target.closest("button.more");
   if (!btn) return;

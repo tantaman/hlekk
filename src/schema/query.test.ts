@@ -400,6 +400,29 @@ describe("paging a related list", () => {
     assert.deepEqual(seen, ["c5", "c4", "c3", "c2", "c1"]);
   });
 
+  // The wiki demo's page card reads its counts and the first page of each list in one query, then
+  // continues those lists through a "show more" button. It used plain `related` for them, which
+  // hands back rows and no cursor -- so the first "show more" had nowhere to resume from, started
+  // the list again, and appended rows that were already on screen: "20 total" over 40 chips, each
+  // one twice. The card's query has to be a paged one, and this is that query.
+  it("continues a card's own first page without repeating it", async () => {
+    const { db, issue } = await seeded();
+    const [card] = await Issue.gen(issue)
+      .countAs("commentCount", issueComments)
+      .relatedPage("comments", issueComments, (q) => q.limit(2))
+      .run(db);
+    assert.equal(card.commentCount, 5);
+    assert.equal(card.comments.more, true);
+    assert.ok(card.comments.cursor, "a card with more to show must hand back somewhere to resume");
+
+    const [next] = await Issue.gen(issue)
+      .relatedPage("comments", issueComments, (q) => q.limit(2).after(card.comments.cursor!))
+      .run(db);
+    const seen = [...card.comments.items, ...next.comments.items].map((c) => c.body);
+    assert.deepEqual(seen, ["c5", "c4", "c3", "c2"]);
+    assert.equal(new Set(seen).size, seen.length, "a row the card had already shown came back again");
+  });
+
   it("reports no more once the list is exhausted", async () => {
     const { db, issue } = await seeded();
     const [page] = await Issue.gen(issue).relatedPage("comments", issueComments, (q) => q.limit(50)).run(db);

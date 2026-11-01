@@ -56,6 +56,20 @@ describe("the inline UI", () => {
     assert.match(scripts[0]!, /data-ns="/);
   });
 
+  it("seeds the cursor the card was given before the first show-more can run", () => {
+    // The server half of this is tested in wiki-app.test.ts: the card hands back a cursor. The
+    // client half is that the card writes it into the map the button reads, and that the button is
+    // not drawn when the card says the list is already whole. Miss either and "20 total" shows 40
+    // chips, each one twice.
+    assert.match(scripts[0]!, /cursors\.set\(d\.id \+ ":" \+ rel\.edge, seed\.cursor\)/);
+    assert.match(scripts[0]!, /const more = seed \? seed\.more : true/);
+    // The map has to exist before show() runs, not merely before the click handler.
+    assert.ok(
+      scripts[0]!.indexOf("const cursors = new Map()") < scripts[0]!.indexOf("cursors.set(d.id"),
+      "cursors is declared after the card that seeds it",
+    );
+  });
+
   it("serves the cluster grid the page card depends on", () => {
     // The card calls clusterGrid(); if it were renamed on one side only, the page would throw at
     // render time and the test suite would otherwise never know.

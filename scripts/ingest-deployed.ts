@@ -420,8 +420,9 @@ interface Card {
     title: string;
     linkCount: number;
     backlinkCount: number;
-    links: { id: string; title: string }[];
-    categories: { id: string; title: string }[];
+    // Pages, not bare arrays: the card hands back a cursor its "show more" continues from.
+    links: { items: { id: string; title: string }[]; cursor: string | null; more: boolean };
+    categories: { items: { id: string; title: string }[]; cursor: string | null; more: boolean };
   };
   read: { rounds: number; requests: number; ms: number; lookupMs: number; objects: number; hosts: number[] };
 }
@@ -430,18 +431,47 @@ check(
   "a page card reads a real page across hosts",
   card.found &&
     card.page.title === top.fields.title &&
-    card.page.links.length > 0 &&
-    card.page.links.every((l) => typeof l.title === "string"),
+    card.page.links.items.length > 0 &&
+    card.page.links.items.every((l) => typeof l.title === "string"),
   `${card.page.title}: ${card.page.linkCount} links, ${card.page.backlinkCount} backlinks, ` +
-    `${card.page.links.length} shown from ${card.read.hosts.length} host(s), ` +
+    `${card.page.links.items.length} shown from ${card.read.hosts.length} host(s), ` +
     `${card.read.requests} host requests, ${card.read.rounds} rounds, ${card.read.ms}ms ` +
     `(+${card.read.lookupMs}ms title lookup)`,
 );
 check(
   "a limit is honoured against the real list",
-  card.page.links.length === Math.min(LIMIT, expected(top, pageLinks.name)),
-  `${card.page.links.length} of ${expected(top, pageLinks.name)}, limit ${LIMIT}`,
+  card.page.links.items.length === Math.min(LIMIT, expected(top, pageLinks.name)),
+  `${card.page.links.items.length} of ${expected(top, pageLinks.name)}, limit ${LIMIT}`,
 );
+
+// The card's lists continue through /relation, and the join between the two is the cursor the card
+// hands back. When the card did not hand one back, the first "show more" re-read the list from the
+// start and the rows already on screen arrived a second time -- a bug visible only by asking for
+// both halves and looking at them together, which is what this does.
+if (card.page.links.more && card.page.links.cursor !== null) {
+  interface Rel {
+    items: { id: string; title: string }[];
+    cursor: string | null;
+    more: boolean;
+  }
+  const next = await hit<Rel>(
+    `/relation?id=${encodeURIComponent(card.id)}&edge=${encodeURIComponent(pageLinks.name)}` +
+      `&limit=${LIMIT}&after=${encodeURIComponent(card.page.links.cursor)}`,
+  );
+  const ids = [...card.page.links.items, ...next.items].map((l) => l.id);
+  const repeated = ids.filter((id, i) => ids.indexOf(id) !== i);
+  check(
+    "the next page of a list continues the card rather than repeating it",
+    next.items.length > 0 && repeated.length === 0,
+    `${card.page.links.items.length} + ${next.items.length} rows, ${repeated.length} repeated`,
+  );
+} else {
+  check(
+    "the card says its list is whole, so there is no next page to continue",
+    card.page.links.items.length === expected(top, pageLinks.name),
+    `${card.page.links.items.length} shown, more=${card.page.links.more}`,
+  );
+}
 
 // ---- what it cost on disk, which is the figure the import doc leaves open
 
