@@ -10,8 +10,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { LocalCluster } from "../client/local.ts";
-import { altTarget, cardQuery, relationPage, wipeTarget } from "./wiki-app.ts";
-import { LOCK, Page, pageLinks } from "./wiki.ts";
+import { altTarget, cardQuery, relationPage, titleLookup, wipeTarget } from "./wiki-app.ts";
+import { LOCK, Page, legacyTitleKey, pageLinks, storedTitle, titleKey } from "./wiki.ts";
 import type { Env } from "../do/bindings.ts";
 
 /** The card's row, as the Worker hands it to the UI. */
@@ -182,5 +182,77 @@ describe("the page card and the list it continues", () => {
     }
     assert.equal(seen.length, 9, "every link, once: " + seen.join(", "));
     assert.equal(new Set(seen).size, 9);
+  });
+});
+
+// What a typed title has to resolve to. The loader indexes a page under the dump's own spelling --
+// underscores, first letter upper -- so the only question a lookup asks is whether what someone
+// typed lands on that key. It did from the browse pane, which normalized in the browser, and did
+// not from the query editor, which sent the text straight to an exact-key lookup.
+describe("resolving a title to the key the loader wrote", () => {
+  const written = titleKey(0, "Computer_science");
+
+  it("lands a typed title on the dump's own key", () => {
+    for (const typed of ["Computer science", "computer science", "Computer_science", "  computer science  "]) {
+      assert.equal(titleKey(0, storedTitle(typed)), written, typed);
+    }
+  });
+
+  it("keeps a title that differs by more than spacing a different page", () => {
+    // "Computer Science" is a real title in this dump and a *different* one -- a redirect to the
+    // article. Normalizing case beyond the first letter would quietly answer a question nobody
+    // asked, so the rule stops where MediaWiki's does.
+    assert.notEqual(titleKey(0, storedTitle("Computer Science")), written);
+    assert.equal(storedTitle("Computer Science"), "Computer_Science");
+  });
+
+  it("is idempotent, so normalizing at the lookup cannot harm a caller that already did", () => {
+    for (const t of ["Computer science", "NASA", "North Korea", "éclair", "ß", ""]) {
+      assert.equal(storedTitle(storedTitle(t)), storedTitle(t), t);
+    }
+  });
+
+  it("finds a page from a title typed with spaces", async () => {
+    // The index as the loader left it: one entry, under the dump's own spelling. Driving the real
+    // lookup is the point -- the rule being right is no use if the read path does not apply it,
+    // which is exactly the shape of the bug this fixes.
+    const index = new Map([[written, "page-1"]]);
+    const lookup = async (key: string) => index.get(key) ?? null;
+    for (const typed of ["Computer science", "computer science", "Computer_science", " computer science "]) {
+      assert.equal(await titleLookup(lookup, 0, typed), "page-1", typed);
+    }
+  });
+
+  it("still does not invent a page that is not there", async () => {
+    const index = new Map([[written, "page-1"]]);
+    const lookup = async (key: string) => index.get(key) ?? null;
+    // A different title, a different namespace, and a near-miss that normalization must not close.
+    assert.equal(await titleLookup(lookup, 0, "Computer Science"), null);
+    assert.equal(await titleLookup(lookup, 14, "Computer science"), null);
+    assert.equal(await titleLookup(lookup, 0, "Computerscience"), null);
+  });
+
+  it("falls back to the key a loaded database may have been written under, and only on a miss", async () => {
+    // 0.332% of simplewiki's titles spell differently under the two schemes, and the three loaded
+    // databases used the old one. The fallback is what keeps them readable -- and it has to normalize
+    // too, or a typed title reaches the legacy key no better than it reached the current one.
+    const legacyOnly = new Map([[legacyTitleKey(0, "\u00C9clair"), "page-9"]]);
+    const reads: string[] = [];
+    const lookup = async (key: string) => {
+      reads.push(key);
+      return legacyOnly.get(key) ?? null;
+    };
+    assert.equal(await titleLookup(lookup, 0, "éclair"), "page-9");
+    assert.equal(reads.length, 2, "the legacy key costs a second read");
+    reads.length = 0;
+    await titleLookup(lookup, 0, "Computerscience");
+    assert.equal(reads.length, 1, "an ASCII title spells the same way, so there is nothing to retry");
+  });
+
+  it("leaves a namespace out of it", () => {
+    // The index key is (ns, title) and the namespace is a separate column, so normalization touches
+    // the title alone -- a category keeps its own namespace and gets the same spelling rule.
+    assert.equal(storedTitle("France geography stubs"), "France_geography_stubs");
+    assert.notEqual(titleKey(14, "France_geography_stubs"), titleKey(0, "France_geography_stubs"));
   });
 });

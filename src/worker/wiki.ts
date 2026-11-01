@@ -124,6 +124,24 @@ const ESCAPER = new TextEncoder();
 const escape = (c: string): string =>
   [...ESCAPER.encode(c)].map((b) => `%${b.toString(16).padStart(2, "0")}`).join("");
 
+/**
+ * A title as `page_title` holds it: spaces as underscores, first letter upper case.
+ *
+ * This is MediaWiki's own rule rather than a fuzzy match. A dump never stores a space in
+ * `page_title`, and `$wgCapitalLinks` capitalizes the first letter in every standard namespace, so
+ * "Computer science", "Computer_science" and "computer science" are three spellings of one title
+ * and only the third form is a key.
+ *
+ * It lives here because both ways into the database need it and only one of them had it: the browse
+ * pane normalized in the browser, so a title typed into the query editor reached an exact-key lookup
+ * with its spaces intact and missed a page that is plainly there.
+ *
+ * Idempotent, which is what makes it safe to apply at the lookup even for callers that had already
+ * normalized -- the browse pane still does, because the address bar should carry the stored spelling.
+ */
+export const storedTitle = (title: string): string =>
+  title.trim().replace(/ /g, "_").replace(/^./u, (c) => c.toUpperCase());
+
 export const titleKey = (ns: number, title: string): string =>
   `${ns}:${title.replace(/./gsu, (c) => (c === "%" || c !== c.toLowerCase() ? escape(c) : c))}`;
 
