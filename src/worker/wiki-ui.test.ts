@@ -46,6 +46,16 @@ describe("the inline UI", () => {
     assert.doesNotMatch(WIKI_UI, /pane-ab|tab-ab/);
   });
 
+  it("enters at articles only, in one argument", () => {
+    // The namespace picker is gone, so the entry form has nothing to read a namespace from and the
+    // editor should not be teaching a first argument the form no longer has. show() keeps its ns
+    // parameter regardless: a category chip is ns 14 and carries its own data-ns, which is the one
+    // way a non-article card is still reachable.
+    assert.doesNotMatch(WIKI_UI, /id="ns"/);
+    assert.doesNotMatch(scripts[0]!, /page\(0, /);
+    assert.match(scripts[0]!, /data-ns="/);
+  });
+
   it("serves the cluster grid the page card depends on", () => {
     // The card calls clusterGrid(); if it were renamed on one side only, the page would throw at
     // render time and the test suite would otherwise never know.

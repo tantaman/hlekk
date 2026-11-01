@@ -126,7 +126,7 @@ export class QueryRefused extends Error {
 // them the isolate. The grammar is deliberately hlekk's own builder chain rather than a SQL dialect,
 // so what an author types is what the demo's own code says, and so there is one vocabulary to learn.
 //
-//   page(0, "Country")
+//   page("Country")
 //     .countAs("linkCount", page_links)
 //     .related("links", page_links, q => q
 //       .limit(25)
@@ -310,7 +310,12 @@ export function unparse(spec: QuerySpec): string {
     }
     return out;
   };
-  return `page(${spec.from.ns}, ${JSON.stringify(spec.from.title)})${body(spec, "  ")}`;
+  // The namespace is written only when it is not the article one. parse() defaults it to 0, so the
+  // round trip holds either way, and the form the editor is seeded with is the form it teaches.
+  const from = spec.from.ns === 0
+    ? JSON.stringify(spec.from.title)
+    : `${spec.from.ns}, ${JSON.stringify(spec.from.title)}`;
+  return `page(${from})${body(spec, "  ")}`;
 }
 
 // ---- the schema, as the editor's autocomplete sees it
