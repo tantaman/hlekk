@@ -393,6 +393,45 @@ async function pass1() {
   return lt;
 }
 
+/**
+ * The page ids pass 0 kept, as a bitset.
+ *
+ * `--namespaces` has to hold on the *source* side of every edge, and only `pagelinks` carries the
+ * source's namespace as a column. `categorylinks` does not -- its rows start at `cl_from`, and a
+ * category's members are whatever was categorised into it, which on enwiki is half Talk, User,
+ * Template and Draft pages. On the 20261001 dump that was 114,176,741 of 226,560,035 memberships
+ * whose source page pass 0 had dropped.
+ *
+ * Emitting them is worse than useless. `--pass B` resolves each endpoint to the object id pass A
+ * minted, an endpoint with no object resolves to nothing, and an edge written as nothing is still
+ * counted as written -- the same vacuous accounting that hid 1,592,372 missing simplewiki edges.
+ * So the source side is checked here instead, where it is a bit lookup.
+ *
+ * 84.4 million page ids is 10.6 MB of bits, so it is read once and held whole.
+ */
+export async function keptPages() {
+  let bits = Buffer.alloc(1 << 20);
+  let n = 0;
+  for await (const line of lines(path("pages.tsv"))) {
+    const id = Number(line.slice(0, line.indexOf("\t")));
+    const byte = id >> 3;
+    if (byte >= bits.length) {
+      let size = bits.length;
+      while (size <= byte) size *= 2;
+      const next = Buffer.alloc(size);
+      bits.copy(next);
+      bits = next;
+    }
+    bits[byte] |= 1 << (id & 7);
+    n++;
+  }
+  log(`kept pages: ${n.toLocaleString()} ids in ${(bits.length / 1e6).toFixed(1)} MB of bits`);
+  return (id) => {
+    const byte = id >> 3;
+    return byte < bits.length && (bits[byte] & (1 << (id & 7))) !== 0;
+  };
+}
+
 /** The `pagelinks` rows as `(pl_from, pl_target_id)`, written once and read by passes 2 and 3. */
 async function extractPagelinks() {
   const raw = path("pl.tsv");
@@ -425,13 +464,20 @@ async function extractPagelinks() {
 }
 
 /** 2 and 3. Both directions of the link graph, as edges keyed by the page they hang off. */
-async function passLinks(lt, out) {
+async function passLinks(lt, kept, out) {
   const raw = await extractPagelinks();
   let fwd = 0;
   let dropped = 0;
+  let unkept = 0;
   for await (const line of lines(raw)) {
     const t = line.indexOf("\t");
     const from = line.slice(0, t);
+    // `pl_from_namespace` dropped most of these already; what reaches here is dump skew -- a page
+    // that pagelinks links from and this page.sql does not have.
+    if (!kept(Number(from))) {
+      unkept++;
+      continue;
+    }
     const target = lt.get(Number(line.slice(t + 1)));
     if (!target) {
       dropped++;
@@ -443,16 +489,25 @@ async function passLinks(lt, out) {
     await out.write(`${target}\twiki.linked_from\t${from}\t0\n`);
     if (++fwd % 20_000_000 === 0) log(`passes 2-3: ${fwd.toLocaleString()} links both ways`);
   }
-  report.links = { emitted: fwd, droppedRed: dropped };
-  log(`passes 2-3: ${fwd.toLocaleString()} links, ${dropped.toLocaleString()} dropped as red`);
+  report.links = { emitted: fwd, droppedRed: dropped, droppedUnkept: unkept };
+  log(
+    `passes 2-3: ${fwd.toLocaleString()} links, ${dropped.toLocaleString()} dropped as red, ` +
+      `${unkept.toLocaleString()} from a page pass 0 did not keep`,
+  );
 }
 
 /** 4. Both directions of category membership. */
-async function passCategories(lt, out) {
+async function passCategories(lt, kept, out) {
   let n = 0;
   let dropped = 0;
+  let unkept = 0;
   for await (const f of rows(await dump("categorylinks"))) {
     expect("categorylinks", f, 7);
+    // Before the red-link check, so the guard below measures the join and not the namespaces.
+    if (!kept(Number(f[0]))) {
+      unkept++;
+      continue;
+    }
     const target = lt.get(Number(f[6]));
     if (!target) {
       // A category nobody has created is a red link like any other.
@@ -466,8 +521,11 @@ async function passCategories(lt, out) {
     if (++n % 10_000_000 === 0) log(`pass 4: ${n.toLocaleString()} memberships`);
     if (n >= LIMIT) break;
   }
-  report.categories = { emitted: n, droppedRed: dropped };
-  log(`pass 4: ${n.toLocaleString()} memberships, ${dropped.toLocaleString()} dropped`);
+  report.categories = { emitted: n, droppedRed: dropped, droppedUnkept: unkept };
+  log(
+    `pass 4: ${n.toLocaleString()} memberships, ${dropped.toLocaleString()} dropped as red, ` +
+      `${unkept.toLocaleString()} from a page pass 0 did not keep`,
+  );
   // This number also checks an assumption: cl_target_id is read as a linktarget id, by analogy with
   // pl_target_id and because cl_to is gone. The column shape says so; no id was resolved end to end
   // to prove it. If the column indexes something else, nearly everything drops.
@@ -660,9 +718,10 @@ async function run() {
   if (PASSES.has("1")) lt = await pass1();
   if (PASSES.has("2") || PASSES.has("3") || PASSES.has("4")) {
     if (!lt) throw new Error("passes 2-4 need pass 1's lt map in the same run");
+    const kept = await keptPages();
     const out = writer(path("edges-raw.tsv"));
-    if (PASSES.has("2") || PASSES.has("3")) await passLinks(lt, out);
-    if (PASSES.has("4")) await passCategories(lt, out);
+    if (PASSES.has("2") || PASSES.has("3")) await passLinks(lt, kept, out);
+    if (PASSES.has("4")) await passCategories(lt, kept, out);
     await out.end();
   }
   if (PASSES.has("5")) await writeRecords();
