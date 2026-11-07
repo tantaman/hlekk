@@ -37,6 +37,16 @@ import type { FieldSpec } from "../catalog/catalog.ts";
 import { Query } from "../schema/query.ts";
 import { LOCK, Page, categoryPages, linkedFrom, pageCategories, pageLinks } from "./wiki.ts";
 import type { EdgeType, FieldMap } from "../schema/define.ts";
+import {
+  DEFAULT_HOP_LIMIT,
+  DEFAULT_LIMITS,
+  OPS,
+  Refused as QueryRefused,
+  check as checkRequest,
+  countEdge,
+  describe,
+} from "../query/request.ts";
+import type { Cmp, Cost, CountSpec, Hop, Limits, Request, Vocabulary } from "../query/request.ts";
 
 /** Every relation the editor may traverse, by the name the schema gives it. Taken from the typed
  *  values rather than re-listed, so the editor cannot offer an edge the catalog does not have. */
@@ -47,76 +57,24 @@ const EDGES: Record<string, EdgeType<FieldMap, FieldMap, boolean>> = {
   [categoryPages.name]: categoryPages as unknown as EdgeType<FieldMap, FieldMap, boolean>,
 };
 
-export const OPS: readonly CmpOp[] = ["=", "!=", "<", "<=", ">", ">="];
+// What a submitted query may say, and the guard that prices it, are generic and live in
+// `../query/request.ts`, so that this editor's boundary and the cross-database protocol's boundary are
+// the same code checked by the same tests. What stays here is particular to this schema: the four
+// relations, entry by (ns, title), and the text syntax.
+export { OPS, QueryRefused, countEdge };
+export type { Cmp, Cost, CountSpec, Hop };
 
-/**
- * The budget. Numbers, not taste — the demo doc says the mechanism is cheap and the figures are a
- * judgement about what a stranger may spend, so they are stated in one place and served to the
- * client, which shows the cost of a query before it is run.
- */
-export const LIMITS = {
-  /** Hop nesting. Depth 10 at limit 3 was already 177,145 nodes in the probe. */
-  maxDepth: 4,
-  /** Rows one hop may read. Not a bound on what a filter scans underneath it. */
-  maxLimit: 100,
-  /** Frames, counting `exists` subqueries. A plan is compiled once and cached per host. */
-  maxFrames: 16,
-  /** Answer nodes the query may materialize, summed over every node of the tree. The probe reached
-   *  1,594,321 nodes at depth 12 and took 16.5 s; 20,000 is a page of results, not a heap. */
-  maxNodes: 20_000,
-  /** Counts per hop, each a maintained counter read rather than a scan. */
-  maxCounts: 4,
-  /** Filters per hop. */
-  maxWhere: 4,
-} as const;
+/** The budget this deployment serves to its client and enforces on submit. */
+export const LIMITS: Limits = DEFAULT_LIMITS;
 
-// ---- what a client may submit
-
-export interface Cmp {
-  field: string;
-  op: CmpOp;
-  value: Json;
-}
-
-/** A count to read from the maintained counter. A bare string is the edge name, and the result
- *  carries it under that edge's short name; the object form names the alias, which is what an
- *  author writing `countAs("backlinkCount", linked_from)` is asking for. */
-export type CountSpec = string | { as: string; edge: string };
-
-export const countEdge = (c: CountSpec): string => (typeof c === "string" ? c : c.edge);
+/** A count's result name. The short form drops this schema's prefix, which is a presentation choice
+ *  and so stays here rather than in the core. */
 export const countAlias = (c: CountSpec): string =>
   typeof c === "string" ? c.replace(/^wiki\./, "") : c.as;
 
-export interface Hop {
-  /** The name this hop's result appears under. */
-  as?: string;
-  /** An edge type name from the schema. */
-  edge: string;
-  limit?: number;
-  where?: Cmp[];
-  /** Counts to read here, from the maintained counter. */
-  counts?: CountSpec[];
-  hops?: Hop[];
-}
-
-export interface QuerySpec {
+export interface QuerySpec extends Request {
   /** Where the query enters: a title, which is the only entry the database has. */
   from: { ns: number; title: string };
-  counts?: CountSpec[];
-  hops?: Hop[];
-}
-
-export class QueryRefused extends Error {
-  /** Where in the submitted query the problem is, so an editor can point at it. */
-  readonly at: string;
-  /** For a query submitted as text, the character offset to put the caret at. */
-  readonly offset?: number;
-  constructor(at: string, message: string, offset?: number) {
-    super(`${at}: ${message}`);
-    this.name = "QueryRefused";
-    this.at = at;
-    this.offset = offset;
-  }
 }
 
 // ---- the query language
@@ -324,15 +282,7 @@ export interface SchemaView {
   objects: { name: string; otype: number; fields: { name: string; type: string; optional: boolean }[] }[];
   edges: { name: string; atype: number; from: string; to: string }[];
   entry: { by: string; namespaces: { value: number; label: string }[] };
-  limits: typeof LIMITS & { ops: readonly CmpOp[] };
-}
-
-/** How a field spec reads to a person, and what a value for it has to be. */
-function describe(spec: FieldSpec): { type: string; optional: boolean } {
-  if (typeof spec === "object" && "optional" in spec) return { ...describe(spec.optional), optional: true };
-  if (typeof spec === "object" && "enum" in spec) return { type: `enum(${spec.enum.join("|")})`, optional: false };
-  if (typeof spec === "object" && "id" in spec) return { type: `id(${spec.id})`, optional: false };
-  return { type: spec, optional: false };
+  limits: Limits & { ops: readonly CmpOp[] };
 }
 
 /** The namespaces worth offering. MediaWiki has many; these are the ones this import holds enough of
@@ -365,83 +315,25 @@ export function schemaView(): SchemaView {
 
 // ---- the guard
 
-/** The fields of the one object type every relation here points at. */
-const pageFields = LOCK.objects["wiki.page"].fields;
-
-function checkValue(at: string, field: string, value: Json): void {
-  const spec = pageFields[field];
-  if (spec === undefined) {
-    throw new QueryRefused(at, `no field "${field}" on wiki.page; it has ${Object.keys(pageFields).join(", ")}`);
-  }
-  const { type } = describe(spec);
-  const actual = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
-  // An unknown field or a mistyped value matches nothing rather than failing, and in an editor a
-  // silently empty answer is harder to understand than a refusal.
-  const want = type.startsWith("enum") ? "string" : type.startsWith("id(") ? "string" : type;
-  if (want !== "json" && actual !== want) {
-    throw new QueryRefused(at, `field "${field}" is ${type}, but the value is ${actual}`);
-  }
-}
-
-interface Counted {
-  /** Frames this subtree compiles to. */
-  frames: number;
-  /** Answer nodes it can materialize, given its ancestors' limits. */
-  nodes: number;
-}
-
-/** Validates one hop and everything under it, and counts what it would cost. */
-function checkHop(hop: Hop, at: string, depth: number, reaching: number): Counted {
-  if (depth > LIMITS.maxDepth) {
-    throw new QueryRefused(at, `hops nest ${depth} deep, the maximum is ${LIMITS.maxDepth}`);
-  }
-  if (typeof hop.edge !== "string" || EDGES[hop.edge] === undefined) {
-    throw new QueryRefused(at, `no edge "${String(hop.edge)}"; the schema has ${Object.keys(EDGES).join(", ")}`);
-  }
-  const limit = hop.limit ?? 25;
-  if (!Number.isInteger(limit) || limit < 1 || limit > LIMITS.maxLimit) {
-    throw new QueryRefused(at, `limit must be an integer in 1..${LIMITS.maxLimit}, got ${String(hop.limit)}`);
-  }
-  for (const [i, c] of (hop.where ?? []).entries()) {
-    if (!OPS.includes(c.op)) throw new QueryRefused(`${at}.where[${i}]`, `operator must be one of ${OPS.join(" ")}`);
-    checkValue(`${at}.where[${i}]`, c.field, c.value);
-  }
-  if ((hop.where ?? []).length > LIMITS.maxWhere) {
-    throw new QueryRefused(at, `${hop.where!.length} filters, the maximum is ${LIMITS.maxWhere}`);
-  }
-  for (const [i, c] of (hop.counts ?? []).entries()) {
-    if (EDGES[countEdge(c)] === undefined) {
-      throw new QueryRefused(`${at}.counts[${i}]`, `no edge "${countEdge(c)}"`);
-    }
-  }
-  if ((hop.counts ?? []).length > LIMITS.maxCounts) {
-    throw new QueryRefused(at, `${hop.counts!.length} counts, the maximum is ${LIMITS.maxCounts}`);
-  }
-
-  // The rows this hop can produce is its limit times however many rows reached it — which is the
-  // product of the limits above it, and the thing no read budget can see.
-  const produced = reaching * limit;
-  let frames = 1;
-  let nodes = produced;
-  for (const [i, child] of (hop.hops ?? []).entries()) {
-    const under = checkHop(child, `${at}.hops[${i}]`, depth + 1, produced);
-    frames += under.frames;
-    nodes += under.nodes;
-  }
-  return { frames, nodes };
-}
-
-export interface Cost {
-  frames: number;
-  /** The upper bound on answer nodes, which is what the budget is spent on. */
-  nodes: number;
-}
+/** What a submitted query may name: the relations above, and the fields of the types they land on.
+ *  Taken from the typed values and the lock rather than re-listed, so the editor cannot offer an edge
+ *  the catalog does not have.
+ *
+ *  One thing changed in the lift. This file used to check every filter against `wiki.page`, the one
+ *  type all four relations point at; the core checks a filter against the type its own hop lands on.
+ *  The two agree here, because every relation in this schema is page-to-page — and the core's rule is
+ *  the one that is right in general. */
+const VOCAB: Vocabulary = {
+  edge: (name) => (EDGES[name] === undefined ? undefined : { to: EDGES[name]!.to.name }),
+  edges: () => Object.keys(EDGES),
+  fields: (type) => LOCK.objects[type]?.fields,
+};
 
 /**
  * Refuses a query that must not run, and reports what a permitted one will cost.
  *
- * Separate from compiling so an editor can price a query as it is typed, which is what makes the
- * budget comprehensible rather than a surprise on submit.
+ * The entry is this schema's own — one exact `(ns, title)`, with no scan and no prefix search — so it
+ * is checked here. Everything below the entry is the generic guard.
  */
 export function check(spec: QuerySpec): Cost {
   if (!spec || typeof spec !== "object") throw new QueryRefused("query", "expected an object");
@@ -453,32 +345,7 @@ export function check(spec: QuerySpec): Cost {
   if (!Number.isInteger(from.ns) || from.ns < 0 || from.ns > 5000) {
     throw new QueryRefused("from.ns", `namespace must be an integer in 0..5000, got ${String(from.ns)}`);
   }
-  for (const [i, c] of (spec.counts ?? []).entries()) {
-    if (EDGES[countEdge(c)] === undefined) throw new QueryRefused(`counts[${i}]`, `no edge "${countEdge(c)}"`);
-  }
-  if ((spec.counts ?? []).length > LIMITS.maxCounts) {
-    throw new QueryRefused("counts", `${spec.counts!.length} counts, the maximum is ${LIMITS.maxCounts}`);
-  }
-
-  let frames = 1;
-  let nodes = 1; // the root object
-  for (const [i, hop] of (spec.hops ?? []).entries()) {
-    const under = checkHop(hop, `hops[${i}]`, 1, 1);
-    frames += under.frames;
-    nodes += under.nodes;
-  }
-  if (frames > LIMITS.maxFrames) {
-    throw new QueryRefused("query", `compiles to ${frames} frames, the maximum is ${LIMITS.maxFrames}`);
-  }
-  if (nodes > LIMITS.maxNodes) {
-    throw new QueryRefused(
-      "query",
-      `could materialize ${nodes.toLocaleString()} answer nodes, the maximum is ${LIMITS.maxNodes.toLocaleString()}. ` +
-        `This is the product of the limits down each path, and no amount of storage reading would reveal it — ` +
-        `lower a limit or remove a hop.`,
-    );
-  }
-  return { frames, nodes };
+  return checkRequest(spec, VOCAB, LIMITS);
 }
 
 /** Prices a query without refusing it, for an editor that wants to show the cost of something that
@@ -506,7 +373,7 @@ function addHop(q: Query<FieldMap, unknown>, hop: Hop): Query<FieldMap, unknown>
   const edge = EDGES[hop.edge]!;
   const alias = hop.as && hop.as.length > 0 ? hop.as : hop.edge.replace(/^wiki\./, "");
   return q.related(alias, edge, (child) => {
-    let c = child.limit(hop.limit ?? 25) as unknown as Query<FieldMap, unknown>;
+    let c = child.limit(hop.limit ?? DEFAULT_HOP_LIMIT) as unknown as Query<FieldMap, unknown>;
     for (const w of hop.where ?? []) c = c.where(w.field, w.op, w.value as never);
     for (const n of hop.counts ?? []) c = c.countAs(countAlias(n), EDGES[countEdge(n)]!);
     for (const inner of hop.hops ?? []) c = addHop(c, inner);
