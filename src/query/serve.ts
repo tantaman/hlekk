@@ -164,26 +164,68 @@ export function planOf(req: ReadRequest, catalog: Catalog): Plan {
  * edges to missing objects are dropped at read time, and a maintained count still counts them, so a
  * page shorter than its limit beside a larger count is exactly what a deleted object looks like. If
  * the read path did not already do that, filtering the answer here would itself be the tell.
+ *
+ * WHY THIS IS A WALK and not a filter. Dropping a hidden object and the lists keyed by it is not
+ * enough, because the answer is a graph and not a list: an object the request reached only by hopping
+ * THROUGH the hidden one stays perfectly visible to `policy.object`, and its own list key is parented
+ * by its own id rather than by the hidden one. Filtering entry by entry therefore leaves the
+ * descendants of a hidden object in the answer — and had that object genuinely been absent, the
+ * engine would never have gathered them at all, so their presence is both the tell and the
+ * disclosure. The only faithful question is "what would still have been reached", so that is what
+ * this asks: re-walk the shape from the roots, refusing to step through anything hidden, and keep
+ * what the walk arrives at. An object reachable by some other permitted path survives, because an
+ * absent parent would not have hidden it either.
  */
 export function enforce(result: QueryResult, plan: Plan, policy: Policy): QueryResult {
   const hidden = new Set<Id>();
-  const objects: QueryResult["objects"] = {};
   for (const [id, entry] of Object.entries(result.objects)) {
-    if (policy.object(id, entry.otype)) objects[id] = entry;
-    else hidden.add(id);
+    if (!policy.object(id, entry.otype)) hidden.add(id);
   }
   if (hidden.size === 0 && everyCountAllowed(result, plan, policy)) return result;
 
+  // The walk. `reached` is keyed by frame and id together, not by id alone: the same object can sit
+  // at two frames with different children under each, and collapsing them would stop the walk short
+  // of a list the request did ask for. A queue rather than recursion, since depth is a caller's
+  // number.
+  const roots = result.roots.filter((id) => !hidden.has(id));
+  const reached = new Set<string>();
+  const visible = new Set<Id>();
+  const keptLists = new Set<string>();
+  const queue: { id: Id; frame: number }[] = [];
+  const step = (id: Id, frame: number): void => {
+    const at = `${frame}:${id}`;
+    if (reached.has(at)) return;
+    reached.add(at);
+    visible.add(id);
+    queue.push({ id, frame });
+  };
+  for (const id of roots) step(id, 0);
+  for (let i = 0; i < queue.length; i++) {
+    const { id, frame } = queue[i]!;
+    for (const child of Object.values(result.shape[frame] ?? {})) {
+      const key = `${child}:${id}`;
+      const list = result.lists[key];
+      if (list === undefined) continue;
+      keptLists.add(key);
+      for (const to of list.ids) if (!hidden.has(to)) step(to, child);
+    }
+  }
+
+  const objects: QueryResult["objects"] = {};
+  for (const [id, entry] of Object.entries(result.objects)) {
+    if (visible.has(id)) objects[id] = entry;
+  }
+
   const lists: QueryResult["lists"] = {};
-  for (const [key, list] of Object.entries(result.lists)) {
-    if (hidden.has(parentOf(key))) continue;
-    lists[key] = prune(list, hidden);
+  for (const key of keptLists) {
+    lists[key] = prune(result.lists[key]!, hidden);
   }
 
   const counts: QueryResult["counts"] = {};
   for (const [key, byAlias] of Object.entries(result.counts)) {
+    // A count is keyed by its own object's frame, so the key is exactly what the walk recorded.
+    if (!reached.has(key)) continue;
     const parent = parentOf(key);
-    if (hidden.has(parent)) continue;
     const frame = plan.frames[Number(key.slice(0, key.indexOf(":")))];
     const kept: Record<string, number> = {};
     for (const [alias, n] of Object.entries(byAlias)) {
@@ -193,7 +235,7 @@ export function enforce(result: QueryResult, plan: Plan, policy: Policy): QueryR
     if (Object.keys(kept).length > 0) counts[key] = kept;
   }
 
-  return { roots: result.roots.filter((id) => !hidden.has(id)), objects, lists, counts, shape: result.shape };
+  return { roots, objects, lists, counts, shape: result.shape };
 }
 
 const parentOf = (key: string): Id => key.slice(key.indexOf(":") + 1);
@@ -239,11 +281,17 @@ export const MAX_IDS = 100;
  */
 export async function serve(req: ReadRequest, opts: ServeOptions): Promise<Served> {
   const { catalog, source, vocabulary, policy = PUBLIC, limits = DEFAULT_LIMITS, maxIds = MAX_IDS } = opts;
-  const cost = check(req, vocabulary, limits);
+  // The entry first, then the price, because the price depends on it: the tree is gathered once per
+  // root, so `check` needs the width of the entry to total it. Pricing first meant pricing for one
+  // root and then serving `maxIds` of them — the tree under a request certified at 10,101 nodes
+  // materialized a hundred times over, which is the work amplifier this guard exists to remove.
+  // The ordering also decides which fault a request carrying both is told about, and "this costs
+  // too much" is not something a caller whose `ids` is a string can act on.
   const ids = req.ids;
   if (!Array.isArray(ids) || ids.length === 0) throw new Refused("ids", "at least one id is required");
   if (ids.length > maxIds) throw new Refused("ids", `${ids.length} ids, the maximum is ${maxIds}`);
   if (ids.some((id) => typeof id !== "string")) throw new Refused("ids", "every id must be a decimal string");
+  const cost = check(req, vocabulary, limits, ids.length);
 
   const plan = planOf(req, catalog);
   const result = await source.normalized(plan, [...ids]);

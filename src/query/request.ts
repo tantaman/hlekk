@@ -218,9 +218,17 @@ function checkHop(hop: Hop, at: string, depth: number, reaching: number, vocab: 
  * Refuses a request that must not run, and reports what a permitted one will cost.
  *
  * Separate from compiling, so a caller can be told the price of a request before it is sent and an
- * editor can price one as it is typed. The entry is NOT checked here — see `Request`.
+ * editor can price one as it is typed. Whether the entry is *valid* is NOT decided here — see
+ * `Request`, which has no entry at all — but how WIDE it is has to be, because the tree below it is
+ * gathered once per root and the budget is spent on the total.
+ *
+ * `roots` is that width: the number of objects the request enters from, which `serve` takes from
+ * `ids.length`. It defaults to 1 for the single-entry case, and a caller that enters from N objects
+ * and prices for one has understated the request by a factor of N — which is property 2 in this
+ * file's header failing in the direction that matters, since the surplus is work an unauthenticated
+ * stranger got for free.
  */
-export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_LIMITS): Cost {
+export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_LIMITS, roots = 1): Cost {
   if (!req || typeof req !== "object") throw new Refused("query", "expected an object");
   for (const [i, c] of (req.counts ?? []).entries()) {
     checkCount(c, `counts[${i}]`, vocab);
@@ -230,9 +238,10 @@ export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_
   }
 
   let frames = 1;
-  let nodes = 1; // the root object
+  let nodes = roots; // the root objects themselves
   for (const [i, hop] of (req.hops ?? []).entries()) {
-    const under = checkHop(hop, `hops[${i}]`, 1, 1, vocab, limits);
+    // `reaching` is how many rows arrive at this hop, which at the top is one per root.
+    const under = checkHop(hop, `hops[${i}]`, 1, roots, vocab, limits);
     frames += under.frames;
     nodes += under.nodes;
   }
@@ -243,8 +252,9 @@ export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_
     throw new Refused(
       "query",
       `could materialize ${nodes.toLocaleString()} answer nodes, the maximum is ${limits.maxNodes.toLocaleString()}. ` +
-        `This is the product of the limits down each path, and no amount of storage reading would reveal it — ` +
-        `lower a limit or remove a hop.`,
+        `This is the product of the limits down each path${roots === 1 ? "" : `, times the ${roots} roots it enters from`}, ` +
+        `and no amount of storage reading would reveal it — ` +
+        `lower a limit${roots === 1 ? "" : ", enter from fewer ids"} or remove a hop.`,
     );
   }
   return { frames, nodes };

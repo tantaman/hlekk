@@ -59,8 +59,19 @@ and 16.5 seconds — while storage reads stayed flat at 58 objects and 32 reques
 and 14. A budget on reads, requests or rounds never fires. Nothing about the I/O reveals it.
 
 So a request whose cost is discoverable only by running it hands an unauthenticated stranger a work
-amplifier. `check(request, vocabulary, limits)` computes the bound from the request's text, before any
-I/O, by multiplying the limits down each root-to-leaf path and summing what every node materializes.
+amplifier. `check(request, vocabulary, limits, roots)` computes the bound from the request's text,
+before any I/O, by multiplying the limits down each root-to-leaf path and summing what every node
+materializes.
+
+**The entry is part of the price, and this is easy to get wrong.** The tree is gathered once per root,
+so its cost is linear in how many objects the request enters from — which means `maxIds` and `maxNodes`
+are not two independent bounds that each hold on their own. Pricing the tree for one root and then
+serving `maxIds` of them understates the request by a factor of `maxIds`: a two-level request at
+limit 100 prices at 10,101 nodes, comfortably inside a 20,000 budget, and materializes 1,010,100 from
+the 100 ids the same request may name. That is the amplifier this whole section exists to remove,
+reappearing behind a guard that reported it was satisfied. So the entry is validated *first* and its
+width is passed into the price, and the quoted `cost` describes the request that will actually run
+rather than a single-root version of it.
 
 Three consequences for the protocol:
 
@@ -94,6 +105,18 @@ something deleted", and a maintained count still counts it either way.
 
 I think indistinguishable is right, and it has to be *chosen* rather than arrived at, because the
 whole read path's behaviour follows from it.
+
+**Chosen also means transitive, which does not fall out of enforcing it object by object.** An answer
+is a graph, not a list. If a request reaches an object only by hopping *through* a forbidden one, then
+dropping the forbidden object and the lists that name it leaves that descendant sitting in the answer:
+it satisfies the policy on its own merits, and its own list is keyed by its own id rather than by the
+hidden one, so neither check touches it. But had the forbidden object genuinely been absent, the
+engine would never have gathered the descendant at all — so its presence is both the tell this
+decision was meant to remove *and* a disclosure of data the hidden path was the only route to. The
+faithful question is therefore not "may the caller see this object?" but "would this object still have
+been reached?", and the enforcement is a re-walk of the answer from the roots that refuses to step
+through anything hidden. Transitive is not contagious: an object some other permitted path also
+reaches survives, because an absent parent would not have hidden it either.
 
 ### A count is a separately authorized operation, and some edges have none
 
@@ -258,7 +281,9 @@ columns — is an implementation's own and can move.
 - [x] The entry is ids, and only ids, bounded by `maxIds` (100). A reference into another database
       *is* an id, so nothing needs more to follow one. Entry by a unique index — "the user with this
       email" — is a separate decision with a larger authorization question behind it, and adding it
-      later is additive.
+      later is additive. `maxIds` is a bound on the entry and **not** a second bound beside
+      `maxNodes`: the two multiply, so the entry's width is an input to the price rather than a
+      separate cap. See *A request is bounded and priced before it runs*.
 - [ ] Building a `Vocabulary` from a projection rather than from the catalog. `vocabularyOf(catalog,
       exposed)` takes a set of edge names, which is enough to serve a boundary but puts the selection
       in a deployment's hands as a list. A projection is the same selection with a name, a hash and a
