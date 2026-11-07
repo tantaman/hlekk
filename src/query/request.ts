@@ -118,8 +118,10 @@ export class Refused extends Error {
  * decision rather than a schema fact.
  */
 export interface Vocabulary {
-  /** The object type an edge lands on, or undefined when the edge is not exposed. */
-  edge(name: string): { to: string } | undefined;
+  /** The object type an edge lands on, or undefined when the edge is not exposed. `counted` is false
+   *  for a field relationship, which follows an id in a payload and stores nothing — so it can be
+   *  traversed but has no maintained counter to read. Absent means countable. */
+  edge(name: string): { to: string; counted?: boolean } | undefined;
   /** Every exposed edge name, so a refusal can say what was available instead. */
   edges(): readonly string[];
   /** The fields of an object type, so a filter's value is checked against what it declares. */
@@ -157,6 +159,14 @@ function checkValue(at: string, field: string, value: Json, objectType: string, 
   }
 }
 
+function checkCount(c: CountSpec, at: string, vocab: Vocabulary): void {
+  const edge = vocab.edge(countEdge(c));
+  if (edge === undefined) throw new Refused(at, `no edge "${countEdge(c)}"`);
+  if (edge.counted === false) {
+    throw new Refused(at, `edge "${countEdge(c)}" has no count: it follows an id in a payload and stores nothing`);
+  }
+}
+
 interface Counted {
   /** Frames this subtree compiles to. */
   frames: number;
@@ -185,9 +195,7 @@ function checkHop(hop: Hop, at: string, depth: number, reaching: number, vocab: 
     throw new Refused(at, `${hop.where!.length} filters, the maximum is ${limits.maxWhere}`);
   }
   for (const [i, c] of (hop.counts ?? []).entries()) {
-    if (vocab.edge(countEdge(c)) === undefined) {
-      throw new Refused(`${at}.counts[${i}]`, `no edge "${countEdge(c)}"`);
-    }
+    checkCount(c, `${at}.counts[${i}]`, vocab);
   }
   if ((hop.counts ?? []).length > limits.maxCounts) {
     throw new Refused(at, `${hop.counts!.length} counts, the maximum is ${limits.maxCounts}`);
@@ -215,7 +223,7 @@ function checkHop(hop: Hop, at: string, depth: number, reaching: number, vocab: 
 export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_LIMITS): Cost {
   if (!req || typeof req !== "object") throw new Refused("query", "expected an object");
   for (const [i, c] of (req.counts ?? []).entries()) {
-    if (vocab.edge(countEdge(c)) === undefined) throw new Refused(`counts[${i}]`, `no edge "${countEdge(c)}"`);
+    checkCount(c, `counts[${i}]`, vocab);
   }
   if ((req.counts ?? []).length > limits.maxCounts) {
     throw new Refused("counts", `${req.counts!.length} counts, the maximum is ${limits.maxCounts}`);

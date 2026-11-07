@@ -6,10 +6,18 @@ What one database exposes to another, and what has to be decided before anyone b
 [`global-ids.md`](global-ids.md) owns how a reference into another database is stored and named; this
 owns what crosses the wire when one is followed.
 
-**Nothing here is built except one piece**, and that piece was built for a different reason:
-`src/query/request.ts` is the bounded-request guard, lifted out of the wiki demo because a query box
-open to the internet and a database open to other databases are the same exposure. Everything else is
-a decision, not an implementation.
+**The serving half is built; the asking half is not.** `src/query/request.ts` holds the
+bounded-request guard, lifted out of the wiki demo because a query box open to the internet and a
+database open to other databases are the same exposure. `src/query/serve.ts` answers a read: check,
+compile, gather, then apply the policy. Neither needed a storage change, because a database answering
+a foreign read is only answering questions about its own objects with its own ids — the alias column
+in [`global-ids.md`](global-ids.md) is what the *asking* half needs, and that waits. Identity is not
+built either, and is its own piece of work for the reason the *Identity* section gives.
+
+**Reads only.** A cross-database write is a much larger question — it crosses a trust boundary in the
+direction that changes someone else's data, and nothing in the inverse-edge or cascade machinery can
+follow it — and it is deferred rather than designed here. Adding writes later is additive, so this is
+not one of the decisions below that gets stuck.
 
 Unlike the other documents here, this one is **almost entirely unmeasured**. It is a set of choices.
 The few figures are marked, and the choices that cannot be revised once someone has built against
@@ -87,12 +95,18 @@ something deleted", and a maintained count still counts it either way.
 I think indistinguishable is right, and it has to be *chosen* rather than arrived at, because the
 whole read path's behaviour follows from it.
 
-### A count is a separately authorized operation
+### A count is a separately authorized operation, and some edges have none
 
 `assoc_counts` is maintained with the edge write, so a count is a single row read and free. That makes
 it the thing most likely to ride along on a read that was authorized for something else. "This object
 has 4,312 inbound edges from a database you cannot read" is a disclosure, and an implementation that
 authorizes objects will not notice it is answering about edges.
+
+A related correctness rule fell out of building this: a **field relationship has no count**. It
+follows an id in a payload and stores nothing, so there is no maintained counter to read, and a count
+naming one is refused before any I/O like any other name that does not resolve. It is still
+traversable, which is the distinction — the `Vocabulary` reports it as an edge that may be followed
+but not counted.
 
 ### A response states its own cacheability
 
@@ -186,11 +200,19 @@ columns — is an implementation's own and can move.
 
 ## Open
 
-- [ ] What a foreign read returns: whole objects against a served projection, or ids only with the
-      caller fetching each. The second is far easier to authorize and nearly removes the point of
-      `related()` over a foreign edge; the first needs field-level policy to be expressible.
-- [ ] Building a `Vocabulary` from a projection, which is the concrete next piece of code and the
-      thing that would let a deployment serve a boundary without hand-listing its edges.
+- [x] What a foreign read returns: whole objects, in the normalized form `QueryResult`, which
+      design.md already built for "a response leaving the Worker, where a shared object would
+      otherwise be duplicated once per path". Ids-only was the alternative and is easier to authorize,
+      but it removes most of the point of `related()` over a foreign edge. Field-level policy is
+      therefore owed: `Policy.object` is whole-object today.
+- [x] The entry is ids, and only ids, bounded by `maxIds` (100). A reference into another database
+      *is* an id, so nothing needs more to follow one. Entry by a unique index — "the user with this
+      email" — is a separate decision with a larger authorization question behind it, and adding it
+      later is additive.
+- [ ] Building a `Vocabulary` from a projection rather than from the catalog. `vocabularyOf(catalog,
+      exposed)` takes a set of edge names, which is enough to serve a boundary but puts the selection
+      in a deployment's hands as a list. A projection is the same selection with a name, a hash and a
+      plan-time check that it still resolves.
 - [ ] The deadline and budget on a foreign round, and what a partial answer looks like in a result
       that today distinguishes only `done` from `short`.
 - [ ] Whether a foreign edge's `time` is the source's clock, and what a cursor means across two
@@ -200,5 +222,6 @@ columns — is an implementation's own and can move.
       a pin or an alias means anything.
 - [ ] Whether a reference is allowed at all without a mutual handshake, or whether an inbound edge is
       itself a disclosure the target consents to.
-- [ ] Whether the protocol says anything about writes. Everything above is reads. A cross-database
-      write is a much larger question and may simply be out of scope forever.
+- [ ] Field-level policy. `Policy.object` decides a whole object, so a database that will serve two
+      of an object's five fields cannot say so, and `fields` narrowing in a projection is the shape
+      that would express it.
