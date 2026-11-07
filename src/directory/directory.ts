@@ -26,6 +26,8 @@ export const DDL: readonly string[] = [
      -- What the host's database really occupies, as it last reported. NULL until it has been asked.
      bytes        INTEGER
    )`,
+  // A registry of other databases this one may reference would sit beside the catalog and
+  // distribute the same way; see `../host/schema.foreign.ts`, which nothing applies yet.
   `CREATE TABLE IF NOT EXISTS catalog (
      version INTEGER PRIMARY KEY,
      lock    TEXT NOT NULL
