@@ -1023,7 +1023,7 @@ The code carries no dependency on Cloudflare. Nothing in `src/` imports `cloudfl
 - IVM and change subscriptions; see Later.
 - R2 tiering for cold tails of large edge lists, and the larger idea it is a subset of: paged storage over object storage ([`paged-storage.md`](paged-storage.md)).
 - Transactions across vshards.
-- References from one database into another, and the global directory and permission model they would need ([`global-ids.md`](global-ids.md)).
+- References from one database into another: how one is stored and named ([`global-ids.md`](global-ids.md)), and what crosses the wire when one is followed ([`protocol.md`](protocol.md)). The global directory and the permission model both sit here.
 
 ### Open questions
 
