@@ -130,6 +130,25 @@ Two details follow:
   the wide form was auditing every call site that assumes a width, and turning a loud failure into a
   soft one.
 
+### Nothing else in the host schema changes
+
+`assocs_range` is unchanged as a declaration, but its records carry the primary key as their suffix
+and so widen with it — about half the 1.019x above, and no second index to add. The other five tables
+are untouched, each for a reason worth stating, because a bigger diff than this would be grounds to
+distrust the design:
+
+| Table | Why it does not change |
+| --- | --- |
+| `objects` | `id` is minted locally from `vshards.next_seq` by the host that owns the vshard, so it can never be foreign. Only edges point out |
+| `assoc_counts` | Keyed `(id1, atype)`, counting a local object's outbound edges of a type. A foreign target is still one, so the count is already right |
+| `index_entries` | `id` points at a local object, and uniqueness is enforced on one host of *this* database. It cannot point out, and should not |
+| `outbox` | The catalog refuses an `inverse` on a foreign-capable edge type, so a foreign edge never generates a row. Every op's ids stay local |
+| `vshards` | Ownership and sequence allocation are per database throughout |
+
+`db` sits before `id2` in the key rather than after. Both orders are **measured** identically, and
+this one groups a local object's edges by target database, so "every edge from X into database 7" is a
+range scan rather than a filter. It also reads in the order the global ID composes.
+
 ### Why in the key and not in `data`
 
 `data` is the edge's own JSON payload, and the write path is `INSERT OR REPLACE` on
@@ -161,15 +180,41 @@ pushes the merge up into every application's code. Recorded as considered, not p
 
 ## The registry
 
-An alias means nothing on its own. It resolves through a table of `{alias → URI, status}` that has
-to be database-wide, because any host can hold an edge into the same foreign database and an alias
-must mean one thing everywhere. That puts it in the directory DO and distributes it the way the
-catalog is distributed, with a version carried on requests.
+An alias means nothing on its own. It resolves through a table that has to be database-wide, because
+any host can hold an edge into the same foreign database and an alias must mean one thing everywhere.
+That puts it in the directory DO, distributed the way the catalog is, with a version carried on
+requests. It is the one new table.
 
-**An alias is never reused.** Reusing a tombstoned one silently repoints every existing edge at a
-different database. This is the same hazard as reusing a catalog integer, which apply already guards
-with "no tombstoned name is reused before a purge", and it takes the same answer: allocate
-monotonically, tombstone, never recycle.
+```sql
+CREATE TABLE IF NOT EXISTS foreign_dbs (
+  alias INTEGER PRIMARY KEY CHECK (alias > 0),  -- 0 means local and is never allocated
+  db_id TEXT    NOT NULL,                       -- the foreign database's own identity
+  uri   TEXT    NOT NULL,                       -- where it is reached; routing, and mutable
+  state TEXT    NOT NULL,                       -- 'live' | 'tombstoned'
+  added INTEGER NOT NULL
+)
+
+CREATE UNIQUE INDEX IF NOT EXISTS foreign_dbs_id ON foreign_dbs (db_id)
+```
+
+**An alias binds to the foreign database's identity, not to its address.** Keyed on the URI, the
+registry gets one case silently wrong: delete a database, create another at the same name, and every
+stored edge now points at the new one. So the row carries both, and the unique index is on `db_id` —
+which makes alias and database permanently one-to-one, and leaves the URI free to change when a
+database moves deployments without touching a single edge. Principle 1, one level up.
+
+**An alias is never repointed.** `state` tombstones rather than deletes, and the next alias comes
+from a counter in `meta` rather than `MAX(alias) + 1`, which is only accidentally correct while
+nothing is ever purged — and apply already contemplates purging tombstoned catalog names. Same
+hazard as reusing a catalog integer, same answer.
+
+**The host needs no copy of it.** A host stores the alias and never resolves it; the coordinator
+does, when it takes the foreign hop. Which raises the obvious objection: what stops a stale client
+writing an alias that does not exist? The never-repoint rule. A stale client can only name an alias
+already allocated, and an allocated alias always means the same database, so the worst case is an
+edge into a database that is gone — a dangling reference, which the read path already drops at read
+time. No host-side validation, no round trip, nothing added to the host's DDL. The rule earns its
+keep twice.
 
 **A URI resolves to an HTTPS endpoint, not a DO stub.** One deployment cannot bind another account's
 Durable Object namespace, so a foreign hop is a Worker-to-Worker fetch. That is a different latency
@@ -179,8 +224,17 @@ read time. The catalog gives it that statically.
 
 ## What the catalog must refuse
 
-Both of these belong beside the existing rule that exactly one side of a pair is `maintained`, and
-both are better as plan-time errors than as discoveries in the outbox.
+The planner's static signal is one optional flag on `EdgeDecl`, beside `inverse`, `maintained`,
+`onDelete` and `unique`:
+
+```json
+"issues.issue_owner": { "from": "issues.issue", "to": "core.user", "unique": true, "foreign": true }
+```
+
+`foreign: true` says targets *may* be in another database, not that they are, which is what lets one
+edge type hold both. Two refusals hang off it. Both belong beside the existing rule that exactly one
+side of a pair is `maintained`, and both are better as plan-time errors than as discoveries in the
+outbox.
 
 - **An `inverse` on an edge type that permits foreign targets.** Delivery routes through the host's
   own client, which is scoped to one database, and retries forever. Writing the other half would mean
