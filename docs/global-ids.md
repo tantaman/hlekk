@@ -5,7 +5,8 @@ Nov 7, 2026 · @Matt Wonlaw
 An exploration behind one sentence of [`design.md`](design.md)'s *IDs and sharding*: "Separate
 databases number their vshards independently, so an ID means nothing without its database." This
 document asks what it would take for an ID to mean something without its database, and answers that
-the ID is the cheap part.
+the ID is the cheap part. [`protocol.md`](protocol.md) owns what crosses the wire when a reference is
+followed; this owns how one is stored and named.
 
 **Nothing here is built.** It records the shape to build if this is ever wanted, the readings that
 chose that shape over two others, and — at more length — the four things the shape does not solve.
