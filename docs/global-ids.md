@@ -187,31 +187,48 @@ requests. It is the one new table.
 
 ```sql
 CREATE TABLE IF NOT EXISTS foreign_dbs (
-  alias INTEGER PRIMARY KEY CHECK (alias > 0),  -- 0 means local and is never allocated
-  db_id TEXT    NOT NULL,                       -- the foreign database's own identity
-  uri   TEXT    NOT NULL,                       -- where it is reached; routing, and mutable
-  state TEXT    NOT NULL,                       -- 'live' | 'tombstoned'
-  added INTEGER NOT NULL
+  alias  INTEGER PRIMARY KEY CHECK (alias > 0), -- 0 means local and is never allocated
+  uri    TEXT    NOT NULL,                      -- the identifier; an alias is local shorthand for it
+  pinned BLOB,                                  -- what it proved about itself; NULL until first contact
+  state  TEXT    NOT NULL,                      -- 'live' | 'unreachable' | 'repudiated' | 'tombstoned'
+  added  INTEGER NOT NULL,
+  seen   INTEGER                                -- when the pin was last confirmed
 )
 
-CREATE UNIQUE INDEX IF NOT EXISTS foreign_dbs_id ON foreign_dbs (db_id)
+CREATE UNIQUE INDEX IF NOT EXISTS foreign_dbs_uri ON foreign_dbs (uri)
 ```
 
-**An alias binds to the foreign database's identity, not to its address.** Keyed on the URI, the
-registry gets one case silently wrong: delete a database, create another at the same name, and every
-stored edge now points at the new one. So the row carries both, and the unique index is on `db_id` —
-which makes alias and database permanently one-to-one, and leaves the URI free to change when a
-database moves deployments without touching a single edge. Principle 1, one level up.
+**The URI is the identifier.** This is what makes the graph open: a URI is mintable before the
+database behind it exists, so an edge can be drawn at a name nobody has deployed yet and empty
+databases cost nothing; creating a database needs no registry round trip; and anyone who serves the
+protocol at a URI can be referenced without asking an authority for a number. An earlier draft of
+this document put a separately allocated identity beside the URI and keyed the registry on that. It
+was wrong in a way worth recording, because it is the obvious first instinct: a URI can be
+reassigned, so an alias bound to one can come to mean a different database. But an allocated
+identifier buys that guarantee by reintroducing a central allocator, and the allocator is the thing
+every system in this space has died of. Openness is the feature being bought.
 
-**An alias is never repointed.** `state` tombstones rather than deletes, and the next alias comes
-from a counter in `meta` rather than `MAX(alias) + 1`, which is only accidentally correct while
-nothing is ever purged — and apply already contemplates purging tombstoned catalog names. Same
-hazard as reusing a catalog integer, same answer.
+**A pin is what keeps substitution loud.** The reassignment hazard is real and the answer is not a
+second name — it is to record what the database proved about itself when it was interned, and to
+check that on later contact. Trust on first use, SSH's model rather than a naming authority. A
+mismatch moves the row to `repudiated` and reads through that alias fail, instead of quietly
+returning a stranger's objects under an edge that meant someone else. That is principle 7 with no
+authority in the picture, and it is why `pinned` is in the table rather than a second identifier.
+
+**An alias is never repointed.** The alias-to-URI binding is permanent: `state` tombstones rather
+than deletes, and the next alias comes from a counter in `meta` rather than `MAX(alias) + 1`, which
+is only accidentally correct while nothing is ever purged — and apply already contemplates purging
+tombstoned catalog names. Same hazard as reusing a catalog integer, same answer.
+
+**Canonicalization becomes load-bearing.** Once the URI is the identifier, two spellings of one
+database are two aliases and the unique index does not notice: scheme, host case, default port,
+trailing slash, percent-encoding, fragments. This is the price of the choice, it is a known swamp,
+and it is listed under *Open* rather than waved at.
 
 **The host needs no copy of it.** A host stores the alias and never resolves it; the coordinator
 does, when it takes the foreign hop. Which raises the obvious objection: what stops a stale client
 writing an alias that does not exist? The never-repoint rule. A stale client can only name an alias
-already allocated, and an allocated alias always means the same database, so the worst case is an
+already allocated, and an allocated alias always means the same URI, so the worst case is an
 edge into a database that is gone — a dangling reference, which the read path already drops at read
 time. No host-side validation, no round trip, nothing added to the host's DDL. The rule earns its
 keep twice.
@@ -270,11 +287,17 @@ database: one directory binding, one KV prefix, one host namespace. An alias and
 global directory above the per-database one, and it is where the service lives — who owns a database,
 whether it is alive, whether it may be linked to.
 
-**The catalog is a namespace too.** `atype` and `otype` integers are allocated per database by the
-lock. `atype` 7 in one database means nothing in another. Making IDs global without making type
-identity global yields edges that resolve and cannot be interpreted, so a cross-database edge is
-either typed only by its source — the target side opaque — or there is a global type registry, which
-is a far larger ask than a wider integer. This is the consequence most easily missed.
+**The catalog is a namespace too**, though less of one than it first appears. `atype` and `otype`
+integers are allocated per database by the lock, so `atype` 7 in one database means nothing in
+another, and an edge that resolves while being uninterpretable is worse than one that fails. What
+shrinks the problem is that the catalog already treats the *name* as canonical and the integer as a
+local encoding: `issues.issue_comment` is the entry, and the lock's integer is merely how this
+database writes it down. So a cross-database edge carries the name, and once domains are URIs that
+name is globally meaningful with no registry to build — the alias-to-URI relation and the
+atype-to-name relation are the same pattern, and the second is already implemented. What remains is
+not naming but agreement: a globally unique type name says nothing about whether the reader knows
+that type's shape, so a reader has to be able to decline a type it does not understand. That is a
+protocol question, not an ID one.
 
 **Authorization.** Principle 10 says the caller is a trusted server and authorization belongs to the
 application. That holds inside one database owned by one application. It is false the moment
@@ -294,27 +317,31 @@ an empty database to cost zero — nothing existing until the first write, and a
 the database exists, which argues for deriving a database's identity from `(owner, name)` rather than
 allocating it.
 
-## Sizing, if a presentation form is ever fixed
+## The presentation form is a URI, not a width
 
-The alias is a storage form. If a global ID is ever written down — in a URI, a log, an export — it
-needs a width, and the stated goal does not fit 128 bits the way it is usually imagined.
+The alias is a storage form, local to one database and never leaving it. When a reference is written
+down — in a log, an export, an edge drawn by hand — what it carries is the target database's URI and
+the target's own local ID. There is no packed global integer, and that absence is the point: a fixed
+width has to be handed out by someone.
 
-*Arithmetic*, from the birthday bound `p ≈ n²/2N`: at 10^12 databases, a 64-bit random or
-hash-derived database ID collides with certainty, `p ≈ 2.7 × 10^4`. Holding `p < 10^-9` at that
-count needs `N > n²/2p = 5 × 10^32`, about **109 bits** of database ID alone, which is 173 bits
-total. Random identity does not fit.
+The arithmetic is worth keeping, because it is the argument for why a fixed width is the wrong
+instinct rather than merely an unnecessary one. *Arithmetic*, from the birthday bound `p ≈ n²/2N`: at
+10^12 databases a 64-bit random or hash-derived database ID collides with certainty, `p ≈ 2.7 × 10^4`,
+and holding `p < 10^-9` at that count needs `N > n²/2p = 5 × 10^32`, about **109 bits** of database ID
+alone — 173 bits with the local half. So a packed form at a credible scale is either wider than 128
+bits or centrally allocated, and there is no third option. A URI is neither: it is as long as it needs
+to be, and DNS already arbitrates who may mint one.
 
-Allocated identity fits easily, and the allocator already exists, because owner accounts are
-centrally allocated anyway — they have billing:
+What a fixed form would have bought is a cheap equality test and a cheap sort. The interned alias buys
+both of those locally, which is where they are actually needed, without the identifier being
+fixed-width anywhere. Recorded as considered, not planned.
 
-```
-[ fmt: 8 ] [ owner: 32 ] [ db: 24 ] [ local: 64 ]   = 128
-```
+One consequence worth stating plainly: `ids.ts` does not change. A local ID keeps its layout exactly,
+because qualification happens outside the integer rather than inside it. The whole of the earlier
+*wider ID* reading was the cost of the alternative.
 
-4.3 billion owners, 16.7 million databases each, the existing 64-bit ID untouched in the low half,
-and 8 bits of format tag as the only insurance against the one decision that cannot be revisited.
-Guessability is handled by the permission system above, not by the width — local IDs are already
-sequential, so an ID has never been a secret.
+Guessability is addressed by none of this and should not be. Local IDs are already sequential, so an
+ID has never been a secret; the permission system above is what carries that.
 
 ## What to do now
 
@@ -324,12 +351,12 @@ One thing, and it is not the storage.
 `"authorId": { "id": "core.user" }` — and an edge with `field` follows one. If every payload ID is a
 bare decimal, those references are local-only permanently, and qualifying them later means rewriting
 payloads, which the move and snapshot path does not cover and no fence makes safe. So: decide now
-that an `Id` is a qualified string that may carry a database prefix, have `parseId` round-trip one,
+that an `Id` is a string that may be qualified by a database's URI, have `parseId` round-trip one,
 and have everything that compares IDs compare the qualified form. Not one stored byte changes. This
 is the only piece here where deferring is expensive.
 
-Spending the 8 format bits — writing the layout above into `ids.ts` as reserved and not implemented
-— costs nothing and is worth doing beside it.
+Nothing needs reserving in `ids.ts` beside it. Qualification lives outside the integer, so a local
+ID's layout is untouched by all of this.
 
 **Not now:** the alias column, the registry, the global directory, the permission model. There is
 also a scheduling reason, not only a scope one. PLAN.md step 3 is an irreversible enwiki placement
@@ -341,10 +368,17 @@ placement against numbers already invalidated.
 ## Open
 
 - [ ] Whether an alias is allocated in `catalog.lock.json` at plan time or by compare-and-set in the
-      directory at runtime. The lock gives the git-conflict property and integers that match across
-      environments; but drawing an edge to another database is inherently a runtime act, and a deploy
-      gate removes the story. Runtime is the likely answer, which makes the registry the first
-      schema-shaped state that is not in the lock.
+      directory at runtime. URI identity pushes hard toward runtime, since drawing an edge at a name
+      nobody has deployed against is the point of it — which makes the registry the first
+      schema-shaped state outside the lock, and gives up the git-conflict property that catches two
+      branches allocating one integer twice.
+- [ ] URI canonicalization. Scheme, host case, default port, trailing slash, percent-encoding,
+      fragments: two spellings of one database become two aliases and the unique index does not
+      notice. Load-bearing the moment the URI is the identifier, and the known cost of that choice.
+- [ ] What a database proves about itself, and when. A pin detects substitution only if there is
+      something to pin and something to check it against on later contact — a key it signs with, at
+      a minimum. The policy on a mismatch is a decision rather than a default: refuse the alias
+      outright, or surface it and let the application choose.
 - [ ] What a foreign read returns. Whole objects against a projection the target database publishes,
       or IDs only, leaving the caller to fetch. The second is far easier to authorize and the first is
       what makes `related()` over a foreign edge useful.

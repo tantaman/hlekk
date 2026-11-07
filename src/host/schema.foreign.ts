@@ -49,26 +49,40 @@ export const FOREIGN_ASSOCS_DDL: readonly string[] = [
  * beside the catalog and distributed the same way, because an alias must mean one thing on every
  * host and a host can hold an edge into any foreign database.
  *
- * The alias binds to the foreign database's IDENTITY, not its address. Keyed on the URI, the registry
- * gets one case silently wrong — delete a database, create another at the same name, and every stored
- * edge now points at the new one — so `db_id` carries identity and takes the unique index, while
- * `uri` is routing and may change when a database moves deployments without touching an edge.
+ * THE URI IS THE IDENTIFIER, and the alias is local shorthand for it — it never leaves this database,
+ * so two databases may number the same foreign one differently and nothing coordinates them. That is
+ * what makes the graph open: a URI is mintable before the database behind it exists, creating one
+ * needs no registry round trip, and anyone serving the protocol at a URI can be referenced without
+ * asking an authority for a number.
+ *
+ * An earlier revision put a separately allocated identity beside the URI and keyed the registry on
+ * that, because a URI can be reassigned and an alias bound to one can come to mean another database.
+ * The hazard is real; that answer was not, since it reintroduces the central allocator the whole
+ * design exists to avoid. `pinned` is the answer instead: record what the database proved about
+ * itself when it was interned and check it on later contact, trust on first use rather than a naming
+ * authority. A mismatch moves the row to `repudiated` and reads through the alias fail, rather than
+ * quietly returning a stranger's objects under an edge that meant someone else.
  *
  * An alias is never repointed: `state` tombstones rather than deleting, and the next alias comes from
  * a counter in `meta` rather than `MAX(alias) + 1`, which is only accidentally correct while nothing
  * is purged. That rule is also what lets a host store an alias without validating it — a stale client
  * can only name one already allocated, so the worst case is a dangling reference, which the read path
  * already drops.
+ *
+ * What this costs: URI canonicalization becomes load-bearing. Scheme, host case, default port,
+ * trailing slash, percent-encoding and fragments all have to be settled before the unique index means
+ * anything, or two spellings of one database become two aliases and it does not notice.
  */
 export const FOREIGN_DBS_DDL: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS foreign_dbs (
-     alias INTEGER PRIMARY KEY CHECK (alias > 0), -- 0 means local and is never allocated
-     db_id TEXT    NOT NULL,                      -- the foreign database's own identity
-     uri   TEXT    NOT NULL,                      -- where it is reached; routing, and mutable
-     state TEXT    NOT NULL,                      -- 'live' | 'tombstoned'
-     added INTEGER NOT NULL
+     alias  INTEGER PRIMARY KEY CHECK (alias > 0), -- 0 means local and is never allocated
+     uri    TEXT    NOT NULL,                      -- the identifier, canonicalized before it lands
+     pinned BLOB,                                  -- what it proved about itself; NULL until reached
+     state  TEXT    NOT NULL,                      -- 'live'|'unreachable'|'repudiated'|'tombstoned'
+     added  INTEGER NOT NULL,
+     seen   INTEGER                                 -- when the pin was last confirmed
    )`,
 
-  // So that one foreign database interns exactly once, and an alias is permanently bound to it.
-  `CREATE UNIQUE INDEX IF NOT EXISTS foreign_dbs_id ON foreign_dbs (db_id)`,
+  // So that one foreign database interns exactly once, and an alias is permanently bound to its URI.
+  `CREATE UNIQUE INDEX IF NOT EXISTS foreign_dbs_uri ON foreign_dbs (uri)`,
 ];
