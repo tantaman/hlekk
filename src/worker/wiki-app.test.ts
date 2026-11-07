@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { LocalCluster } from "../client/local.ts";
-import { altTarget, cardQuery, relationPage, titleLookup, wipeTarget } from "./wiki-app.ts";
+import { altTarget, cardQuery, probeKey, probeRange, relationPage, titleLookup, wipeTarget } from "./wiki-app.ts";
 import { LOCK, Page, legacyTitleKey, pageLinks, storedTitle, titleKey } from "./wiki.ts";
 import type { Env } from "../adapters/cloudflare/bindings.ts";
 
@@ -111,6 +111,87 @@ describe("wipeTarget", () => {
   it("refuses a request that names nothing at all", () => {
     assert.equal(wipeTarget(armed, url("")), null);
     assert.equal(wipeTarget(armed, url("?confirm=wiki-pilot2")), null);
+  });
+});
+
+// `/admin/r2probe` took its key, offset and length straight from the request, and `HLEKK_BULK` is a
+// committed binding -- which made a route that merely answers "can a Durable Object read R2" a read
+// oracle over the whole bucket: `found` enumerates keys, `size` measures them, `head` returns 24
+// bytes, and walking `offset` reads out any object in it. It reads rather than destroys, which is
+// why it was not gated like `/admin/wipe` and is exactly why it needed to be.
+describe("probeKey", () => {
+  const armed = { HLEKK_R2PROBE: "probe.bin" } as unknown as Env;
+  const url = (q: string) => new URL("https://wiki.example.com/admin/r2probe" + q);
+
+  it("probes the armed key when the request names it", () => {
+    assert.equal(probeKey(armed, url("?key=probe.bin")), "probe.bin");
+  });
+
+  it("arms several keys from one list", () => {
+    const many = { HLEKK_R2PROBE: "probe.bin, slices/0.bin ,probe2.bin" } as unknown as Env;
+    for (const key of ["probe.bin", "slices/0.bin", "probe2.bin"]) {
+      assert.equal(probeKey(many, url("?key=" + encodeURIComponent(key))), key, key);
+    }
+    for (const key of ["slices/1.bin", "probe.bin2", "slices/", "probe"]) {
+      assert.equal(probeKey(many, url("?key=" + encodeURIComponent(key))), null, key);
+    }
+  });
+
+  it("refuses when nothing is armed, which is the committed state", () => {
+    // Including `probe.bin`, which used to be the default: a deployment that set nothing still
+    // answered for it, so the route was never actually closed.
+    for (const env of [{}, { HLEKK_R2PROBE: "" }, { HLEKK_DATABASE: "wiki-simple-hash" }]) {
+      for (const key of ["probe.bin", "pages.tsv", ""]) {
+        assert.equal(probeKey(env as unknown as Env, url("?key=" + key)), null, key);
+      }
+    }
+  });
+
+  it("refuses every key the operator did not name", () => {
+    // The shapes that would walk the bucket if the key were taken from the request rather than
+    // matched against a list.
+    for (const key of [
+      "pages.tsv", "edges.tsv", "probe.bin.bak", "PROBE.BIN", "", "/probe.bin",
+      "../probe.bin", "slices/enwiki-0.bin", "*",
+    ]) {
+      assert.equal(probeKey(armed, url("?key=" + encodeURIComponent(key))), null, key);
+    }
+  });
+
+  it("refuses a request that names no key at all", () => {
+    assert.equal(probeKey(armed, url("")), null);
+    assert.equal(probeKey(armed, url("?offset=0&length=24")), null);
+  });
+});
+
+describe("probeRange", () => {
+  const range = (q: string) => probeRange(new URL("https://wiki.example.com/admin/r2probe" + q));
+
+  it("reads a range the request states", () => {
+    assert.deepEqual(range("?offset=48&length=24"), { offset: 48, length: 24 });
+    assert.deepEqual(range("?offset=0"), { offset: 0 });
+  });
+
+  it("asks for no range when the request states none", () => {
+    // Distinct from a zero offset: an unranged probe answers a different question, and `r2probe`
+    // on the host branches on it.
+    assert.deepEqual(range(""), {});
+    assert.deepEqual(range("?key=probe.bin"), {});
+  });
+
+  it("refuses what Number() would have turned into NaN", () => {
+    // `Number("abc")` is NaN, and NaN used to reach R2 as `{range: {offset: NaN}}` rather than as a
+    // complaint.
+    for (const q of ["?offset=abc", "?offset=0&length=abc", "?offset=1.5", "?offset=-1", "?offset=1e3x"]) {
+      const out = range(q);
+      assert.ok("error" in out, q);
+    }
+  });
+
+  it("refuses a length with no offset to measure it from", () => {
+    const out = range("?length=24");
+    assert.ok("error" in out);
+    assert.match(out.error, /needs an offset/);
   });
 });
 

@@ -697,7 +697,12 @@ hold. Two findings worth keeping, both design gaps rather than loading problems:
       its own slice in chunks with the offset held as a cursor, which is what a bulk import needs —
       each host pulling a pre-partitioned payload instead of a Worker pushing `createUnique` through
       the one directory object that bounds pass A at ~590 pages/s. `r2probe` on the host DO is kept
-      for whoever asks next.
+      for whoever asks next, but `/admin/r2probe` in front of it is now armed by `HLEKK_R2PROBE` —
+      a comma-separated list of the keys it may read — and is POST only. Taking the key from the
+      request had made a public deployment with `HLEKK_BULK` bound into a read oracle over the whole
+      bucket, since `found` enumerates keys, `size` measures them and `head` returns bytes, so
+      walking `offset` reads out any object. The probe answers a question about the platform, so one
+      key the operator placed answers it as well as any.
 - [ ] Whether the 100 KB SQL statement limit is per statement or per `exec` string.
 - [ ] Which affinity functions the demo compares, given the import takes it as a parameter. Note
       that 48% of simplewiki pages have no category, so `category` is half a fallback to `namespace`.
