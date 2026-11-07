@@ -5,6 +5,7 @@
 // A list, not one string: the seam runs one statement at a time, and splitting on ";" would cut a
 // statement whose comment contains one.
 
+import { PLATFORM } from "../runtime/platform.ts";
 import type { Sql } from "./sql.ts";
 
 export const DDL: readonly string[] = [
@@ -73,5 +74,6 @@ export function migrate(sql: Sql): void {
   for (const stmt of DDL) sql.run(stmt);
 }
 
-/** The platform's row-size limit, and so the cap on an object payload. */
-export const MAX_PAYLOAD = 2 * 1024 * 1024;
+/** The host platform's row-size limit, and so the cap on an object payload. See
+ *  `../runtime/platform.ts`. */
+export const MAX_PAYLOAD = PLATFORM.rowBytes;

@@ -12,20 +12,24 @@
 import type { Allocator } from "./allocator.ts";
 import type { Directory } from "./directory.ts";
 import type { Mover } from "./move.ts";
+import { shedBytes } from "../runtime/platform.ts";
 
 export interface Thresholds {
-  /** Bytes on one host before it sheds, against the 10 GB per-DO limit. Measured on what the engine
-   *  reports it occupies, not on a sum of payloads: see `VshardStats`. */
+  /** Bytes on one host before it sheds, against the host platform's storage limit. Measured on what
+   *  the engine reports it occupies, not on a sum of payloads: see `VshardStats`. */
   bytes?: number;
-  /** Requests per window on one host before it sheds, against the 1,000/sec soft limit per DO. */
+  /** Requests per window on one host before it sheds, against the platform's per-host request rate. */
   requests?: number;
 }
 
 export const DEFAULT_THRESHOLDS: Required<Thresholds> = {
-  // Close to the 10 GB per-DO limit, leaving room for the shed to run before a write meets
-  // SQLITE_FULL. It sits above a single vshard's cap on purpose: a host holding one vshard at the cap
-  // is not something a move can help, and `pickRun` declines it rather than renaming the host.
-  bytes: 8_000_000_000,
+  // Close to the platform's per-host storage limit, leaving room for the shed to run before a write
+  // meets SQLITE_FULL. It sits BELOW a single vshard's cap, so a lone vshard grown past it trips the
+  // threshold with nothing to shed — not something a move can help, and `pickRun` declines it rather
+  // than renaming the host.
+  bytes: shedBytes(),
+  // Still a guess, not a derivation: this is a count per window where the platform's figure is a rate,
+  // and nothing has calibrated the window. See design.md's open question on the request threshold.
   requests: 500_000,
 };
 
