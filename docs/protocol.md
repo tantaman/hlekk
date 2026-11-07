@@ -118,13 +118,25 @@ two is the difference between federation being usable and being one round trip p
 
 ## Identity
 
-The hard part of identity was already settled by making the URI the identifier. The caller is a
-database, it is named by its URI, and what remains is binding the claim to a key.
+**A database authenticates a database, and that is sufficient rather than a compromise.** The reason
+is that nothing forwards. A foreign database does not continue a traversal on anyone's behalf, so the
+topology is not one database relaying to the next: the coordinator is the hub. It asks B directly, and
+if B's answer carries a reference into C it asks C directly as well. B never speaks to C, and never
+speaks for A. So every database authenticates exactly the one party addressing it, there is no
+delegation chain to verify, and the many hops of a federated read are many *graph* edges rather than
+many trust hops.
+
+That is worth stating because the alternative is the thing that sinks federated identity schemes: a
+caller passing along a claim about a third party's user, to a database that cannot check it, several
+times over. It is not avoided here by being careful. It is unrepresentable, because no database ever
+acts for another.
+
+The caller is therefore named by its URI, and what remains is binding that claim to a key.
 
 - **A URI resolves to a key at a well-known path under it.** TLS already proves domain control, so
   this is exactly as strong as the domain and needs no new infrastructure or coordinated PKI.
 - **Pinned on first use, checked on later contact.** This is the `pinned` column in
-  `global-ids.md`'s registry, and it is what makes substitution loud instead of silent.
+  [`global-ids.md`](global-ids.md)'s registry, and it is what makes substitution loud instead of silent.
 - **The registry is symmetric.** A pins B's key when A interns B; B pins A's when A first calls. The
   same columns serve both directions — only the alias is outbound-only, because only stored edges
   need it. There is one table, not two.
@@ -135,7 +147,39 @@ database, it is named by its URI, and what remains is binding the claim to a key
   the key *in* the URI, self-certifying though that would be — identity has to survive rotation, or
   rotation is impossible.
 
-Note what identity does **not** do here. Local ids are sequential and therefore guessable, and that was
+### Per-user policy, without a user registry
+
+A responder decides at the granularity it can see, which by default is "the database calling me". That
+is the granularity any service-account API has, and it is principle 10 one level out: authorization
+between databases belongs to the databases, authorization inside one belongs to the application behind
+it. A database serving 10,000 users enforces among them itself; its peers cannot and should not.
+
+That is not a ceiling, and raising it does not require anyone to hold anyone else's user list. A
+caller may make a claim about *its own* subject — `sub: https://foo.example/users/42` — and the
+responder decides whether it accepts that caller's claims about that caller's namespace. That is a
+per-database policy, not a per-user one: nobody has to know who user 42 is.
+
+**The rule that keeps this from becoming the untenable case: a database may assert only about subjects
+in its own namespace**, checked against the authenticated caller. A claim about
+`https://baz.example/users/9` arriving from `foo.example` is refused, because foo is not authoritative
+for baz. That one check is the whole difference between speaking about yourself, which is sound at any
+scale, and relaying a claim you cannot verify, which is not sound even once.
+
+It is optional and additive, so a responder that does not care ignores it — and it needs no change to
+the code. `Policy` is a per-request argument in `ServeOptions`, so an implementation authenticates
+first and builds the policy for that caller and subject; `Policy.object` closes over whoever is
+asking.
+
+### What authentication does not buy
+
+**It does not stop a reader from re-serving what it read.** A database that reads B's objects and also
+answers third parties can pass them on, and nothing in the protocol prevents it — the same position as
+any API client holding a service credential. `Cacheability` tells a caller what it may reuse, but that
+is advisory and not enforcement. So the honest statement is that a database controls **who it answers,
+not what happens next**: if data must not leave the caller, it must not be sent. Signatures are
+frequently mistaken for providing this, and they do not.
+
+**It does not make an id a secret.** Local ids are sequential and therefore guessable, and that was
 always fine under principle 10. It stops being fine across a boundary, and the answer is the
 authorization check, not entropy in the identifier. An unguessable id is not an access control and
 should not be mistaken for one.
@@ -144,6 +188,12 @@ should not be mistaken for one.
 
 **There is no pushdown.** A foreign database will not accept a plan, so it cannot continue a traversal
 on the caller's behalf. Each level of foreign traversal is a separate request, separately authorized.
+
+This was decided on cost — a plan is unbounded work chosen by someone else — and it carries the
+stronger half of the identity argument for free. A database continuing a traversal on a caller's behalf
+would have to either act as itself, making it a confused deputy fetching a third party's data for
+someone else, or relay claims to a database that cannot verify them. One decision, two independent
+reasons, and the second would have forced it on its own.
 
 So `related()` across a boundary is depth-1 per round trip, and a federated query's latency is linear
 in its foreign depth — where a local query's latency is the longest chain of *dependent* reads, with
@@ -222,6 +272,10 @@ columns — is an implementation's own and can move.
       a pin or an alias means anything.
 - [ ] Whether a reference is allowed at all without a mutual handshake, or whether an inbound edge is
       itself a disclosure the target consents to.
+- [ ] Whether a request may carry a subject claim at all, and in what form. The own-namespace rule
+      above makes one safe to accept, but nothing says a responder must offer per-subject policy, and
+      a protocol that defines the field invites callers to send it to databases that ignore it. The
+      field is additive either way, so this is a question about when rather than whether.
 - [ ] Field-level policy. `Policy.object` decides a whole object, so a database that will serve two
       of an object's five fields cannot say so, and `fields` narrowing in a projection is the shape
       that would express it.
