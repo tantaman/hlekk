@@ -46,24 +46,30 @@ describe("the proposed foreign-reference DDL", () => {
     assert.equal(sql.all<{ db: number }>("SELECT db FROM assocs")[0].db, 0);
   });
 
-  it("refuses alias 0 and a second alias for one database", () => {
+  it("refuses alias 0 and a second alias for one URI, and pins on first contact", () => {
     const sql = nodeSql();
     for (const stmt of FOREIGN_DBS_DDL) sql.run(stmt);
-    const add = (alias: number, dbId: string, uri: string) =>
-      sql.run("INSERT INTO foreign_dbs (alias, db_id, uri, state, added) VALUES (?, ?, ?, 'live', 0)", alias, dbId, uri);
+    const add = (alias: number, uri: string) =>
+      sql.run("INSERT INTO foreign_dbs (alias, uri, state, added) VALUES (?, ?, 'live', 0)", alias, uri);
 
-    add(1, "acme/app", "https://acme.example/hlekk");
+    add(1, "https://acme.example/hlekk");
 
     // 0 means local, so allocating it would make every local edge name a foreign database.
-    assert.throws(() => add(0, "acme/other", "https://other.example"), /CHECK/i);
+    assert.throws(() => add(0, "https://other.example/hlekk"), /CHECK/i);
 
-    // One database interns once: a second alias for it would leave two names for one place, and
-    // nothing to say which of them an edge meant.
-    assert.throws(() => add(2, "acme/app", "https://acme.example/hlekk"), /UNIQUE/i);
+    // The URI is the identifier, so one database interns exactly once: two aliases for it would
+    // leave nothing to say which of them an edge meant.
+    assert.throws(() => add(2, "https://acme.example/hlekk"), /UNIQUE/i);
 
-    // Re-addressing is not re-interning: the alias is bound to the identity, not the URI.
-    sql.run("UPDATE foreign_dbs SET uri = ? WHERE db_id = ?", "https://acme.example/v2", "acme/app");
-    const rows = sql.all<{ alias: number; uri: string }>("SELECT alias, uri FROM foreign_dbs");
-    assert.deepEqual(rows.map((r) => [r.alias, r.uri]), [[1, "https://acme.example/v2"]]);
+    // Nothing is pinned until the database has answered, which is what separates "not yet reached"
+    // from "reached, and this is what it was".
+    assert.equal(sql.all<{ pinned: unknown }>("SELECT pinned FROM foreign_dbs WHERE alias = 1")[0].pinned, null);
+    sql.run("UPDATE foreign_dbs SET pinned = ?, seen = ? WHERE alias = ?", new Uint8Array([1, 2, 3]), 10, 1);
+
+    // A later mismatch repudiates the alias instead of repointing it: the URI it names never moves,
+    // so an edge drawn through it fails rather than resolving somewhere else.
+    sql.run("UPDATE foreign_dbs SET state = 'repudiated' WHERE alias = ?", 1);
+    const rows = sql.all<{ uri: string; state: string }>("SELECT uri, state FROM foreign_dbs");
+    assert.deepEqual(rows.map((r) => [r.uri, r.state]), [["https://acme.example/hlekk", "repudiated"]]);
   });
 });
