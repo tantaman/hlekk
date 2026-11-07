@@ -24,7 +24,8 @@ export const DDL: readonly string[] = [
      data    TEXT    NOT NULL
    ) WITHOUT ROWID`,
 
-  // Outbound edges of objects on this host.
+  // Outbound edges of objects on this host. An edge into another database would put that
+  // database in this key; see `schema.foreign.ts`, which nothing applies yet.
   `CREATE TABLE IF NOT EXISTS assocs (
      id1   BLOB    NOT NULL,
      atype INTEGER NOT NULL,
