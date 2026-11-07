@@ -5,14 +5,14 @@
 // re-routing on a refusal, the operators — is the same code the in-process cluster runs, which is why
 // the suite can prove anything about it at all.
 
-import type { Catalog } from "../catalog/catalog.ts";
-import { Catalog as Compile } from "../catalog/catalog.ts";
-import type { Lock } from "../catalog/catalog.ts";
-import type { Mutation, Transport } from "../client/transport.ts";
-import { chunkKey } from "../directory/map.ts";
-import type { Route } from "../directory/map.ts";
-import type { ExecReply, Reply, Routed } from "../host/host.ts";
-import type { Id, Miss, Plan } from "../query/types.ts";
+import type { Catalog } from "../../catalog/catalog.ts";
+import { Catalog as Compile } from "../../catalog/catalog.ts";
+import type { Lock } from "../../catalog/catalog.ts";
+import type { Mutation, Transport } from "../../client/transport.ts";
+import { chunkKey } from "../../directory/map.ts";
+import type { Route } from "../../directory/map.ts";
+import type { ExecReply, Reply, Routed } from "../../host/host.ts";
+import type { Id, Miss, Plan } from "../../query/types.ts";
 import { databaseOf, directoryStub, hostStub } from "./bindings.ts";
 import type { Env } from "./bindings.ts";
 import { call, routedToWire, routesFromWire } from "./rpc.ts";

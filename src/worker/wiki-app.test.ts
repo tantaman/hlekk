@@ -12,7 +12,7 @@ import { describe, it } from "node:test";
 import { LocalCluster } from "../client/local.ts";
 import { altTarget, cardQuery, relationPage, titleLookup, wipeTarget } from "./wiki-app.ts";
 import { LOCK, Page, legacyTitleKey, pageLinks, storedTitle, titleKey } from "./wiki.ts";
-import type { Env } from "../do/bindings.ts";
+import type { Env } from "../adapters/cloudflare/bindings.ts";
 
 /** The card's row, as the Worker hands it to the UI. */
 interface CardRow {

@@ -2,8 +2,8 @@
 // serve. Hand-written for the same reason `DoStorage` is: nothing here needs a dependency on the
 // generated worker types, and writing out what is actually used says what the layer depends on.
 
-import { Directory } from "../directory/directory.ts";
-import type { DoStorage } from "../host/sql.ts";
+import { Directory } from "../../directory/directory.ts";
+import type { DoStorage } from "../../host/sql.ts";
 
 export interface Stub {
   fetch(request: Request): Promise<Response>;
@@ -27,6 +27,9 @@ export interface Kv {
 
 /**
  * An R2 bucket, as narrowly as a bulk load needs it.
+ *
+ * Narrow on purpose, and not only for the reason below: S3, minio, Azure blobs or a local directory
+ * all satisfy these two members, so a bulk load is not tied to R2 and a port supplies whatever it has.
  *
  * Ranged `get` is the part that matters: a bulk payload is pulled in chunks a Durable Object can
  * insert inside one invocation, with the offset held as a cursor in its own storage, so progress

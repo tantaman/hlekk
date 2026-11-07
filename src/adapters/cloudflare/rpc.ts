@@ -6,8 +6,8 @@
 // The two shapes that are not plain JSON are maps keyed by vshard. They are carried as pairs and
 // rebuilt on arrival, in this one place, so the two sides cannot disagree about it.
 
-import type { Route } from "../directory/map.ts";
-import type { Routed } from "../host/host.ts";
+import type { Route } from "../../directory/map.ts";
+import type { Routed } from "../../host/host.ts";
 import type { Stub } from "./bindings.ts";
 
 /** A method call and its arguments. */
