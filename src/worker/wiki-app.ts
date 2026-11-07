@@ -168,6 +168,22 @@ interface WikiEnv extends Env {
    * carrying a destructive route is worse than one.
    */
   HLEKK_WIPE?: string;
+
+  /**
+   * Arms `/admin/r2probe` for the R2 keys this names, comma separated, and for no others.
+   *
+   * On the same reasoning as `HLEKK_WIPE`, and for a route that does not look dangerous at all. The
+   * probe answers one question — can a Durable Object read R2, and a byte range of it — and
+   * answering it needs one key the operator put there. Taking the key from the request instead made
+   * a public deployment with `HLEKK_BULK` bound into a read oracle over the whole bucket: `found`
+   * enumerates keys, `size` measures them, and `head` returns the bytes, so walking `offset` in
+   * 24-byte steps reads out any object in it. The bucket holds the pre-partitioned import slices,
+   * which is to say the whole wiki and anything else that lands in `hlekk-bulk`.
+   *
+   * Absent — which is the committed state — the route refuses everything, so the capability answer
+   * costs a deliberate deploy rather than nothing at all.
+   */
+  HLEKK_R2PROBE?: string;
 }
 
 /**
@@ -185,6 +201,49 @@ export function wipeTarget(env: WikiEnv, url: URL): string | null {
   const asked = url.searchParams.get("database");
   if (asked === null || asked === "") return null;
   return armed.includes(asked) ? asked : null;
+}
+
+/**
+ * The R2 key `/admin/r2probe` may read, if the request names one of them.
+ *
+ * Both halves again, and for the same reason as `wipeTarget`: the var lists the keys, the request
+ * has to name one of that list exactly, and so a request can only ever agree with configuration. A
+ * probe is a question about the platform rather than about the data, so one key the operator placed
+ * answers it as well as any — and an allowlist is what keeps the answer from being a way to read
+ * everything else in the bucket.
+ *
+ * There is no default key. `probe.bin` used to be one, which meant a deployment that never set this
+ * var still answered for `probe.bin`, and a reader could not tell from the route whether anything
+ * was armed.
+ */
+export function probeKey(env: WikiEnv, url: URL): string | null {
+  const armed = (env.HLEKK_R2PROBE ?? "")
+    .split(",")
+    .map((key) => key.trim())
+    .filter((key) => key !== "");
+  const asked = url.searchParams.get("key");
+  if (asked === null || asked === "") return null;
+  return armed.includes(asked) ? asked : null;
+}
+
+/**
+ * A byte range a probe may ask for, or an error naming what was wrong with it.
+ *
+ * `Number()` on a query parameter yields NaN for anything that is not a number, and NaN reached R2
+ * as `{range: {offset: NaN}}` rather than as a complaint. A range is two non-negative integers or it
+ * is not a range.
+ */
+export function probeRange(url: URL): { offset?: number; length?: number } | { error: string } {
+  const out: { offset?: number; length?: number } = {};
+  for (const name of ["offset", "length"] as const) {
+    const raw = url.searchParams.get(name);
+    if (raw === null || raw === "") continue;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0) return { error: `${name} must be a non-negative integer, got ${raw}` };
+    out[name] = n;
+  }
+  if (out.length !== undefined && out.offset === undefined) return { error: "length needs an offset" };
+  return out;
 }
 
 /**
@@ -348,16 +407,29 @@ export default {
       }
 
       /** Asks a host whether it can read R2, and a byte range of it. See `r2probe` on the host for
-       *  why this is worth a route: it is the undocumented fact a bulk import would rest on. */
+       *  why this is worth a route: it is the undocumented fact a bulk import would rest on.
+       *
+       *  Gated like `/admin/wipe`, and POST only for the same reason — no link or prefetch can
+       *  trigger it. A route that returns bytes out of a bucket is not safer than one that erases a
+       *  database just because it reads; see `HLEKK_R2PROBE` for what taking the key from the
+       *  request made this. */
       if (path === "/admin/r2probe") {
-        const key = url.searchParams.get("key") ?? "probe.bin";
+        if (request.method !== "POST") return json({ error: "probing is POST only" }, 405);
+        const key = probeKey(env, url);
+        if (key === null) {
+          return json(
+            { error: "this deployment is not armed to probe the R2 key named in ?key=" },
+            403,
+          );
+        }
+        const range = probeRange(url);
+        if ("error" in range) return json({ error: range.error }, 400);
         const host = num("host", 0);
-        const offset = url.searchParams.has("offset") ? num("offset", 0) : undefined;
-        const length = url.searchParams.has("length") ? num("length", 0) : undefined;
+        if (!Number.isInteger(host) || host < 0) return json({ error: "host must be a non-negative integer" }, 400);
         return json({
           host,
           key,
-          ...(await call<object>(hostStub(env, host), "r2probe", key, offset, length)),
+          ...(await call<object>(hostStub(env, host), "r2probe", key, range.offset, range.length)),
         });
       }
 
