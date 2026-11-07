@@ -1006,6 +1006,7 @@ What it costs is one extra b-tree hop per indexed read, index maintenance in hos
 - IVM and change subscriptions; see Later.
 - R2 tiering for cold tails of large edge lists, and the larger idea it is a subset of: paged storage over object storage ([`paged-storage.md`](paged-storage.md)).
 - Transactions across vshards.
+- References from one database into another, and the global directory and permission model they would need ([`global-ids.md`](global-ids.md)).
 
 ### Open questions
 
