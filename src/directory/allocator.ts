@@ -11,6 +11,7 @@ import { systemRandom } from "../runtime/runtime.ts";
 import type { Random } from "../runtime/runtime.ts";
 import type { VshardStats } from "../host/host.ts";
 import type { Directory } from "./directory.ts";
+import { vshardCap } from "../runtime/platform.ts";
 
 export const USAGE_DDL: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS usage (
@@ -21,23 +22,22 @@ export const USAGE_DDL: readonly string[] = [
    )`,
 ];
 
-/** A vshard's soft size cap, set against the 10 GB per-DO storage limit rather than against move
+/** A vshard's soft size cap, set against the host platform's storage limit rather than against move
  *  time. A vshard is allowed to fill most of a host because the answer to one that grows large is to
  *  give it a host of its own: shedding is for a host whose *several* vshards approach the limit
  *  together, and a lone vshard at the cap needs no destination because the cap is what stops it
  *  growing further.
  *
- *  The margin below 10 GB covers what no vshard owns — the `vshards` table, the freelist a delete
- *  leaves behind — and leaves the controller room to act before a write meets SQLITE_FULL, past which
- *  writes fail while reads and deletes keep working. DO bills storage in GB of 10^9 bytes, so this is
- *  9 GB in those terms and not in GiB.
+ *  The limit and the margin below it both live in `../runtime/platform.ts`, which is the one file a
+ *  port changes; the margin covers what no vshard owns. Storage is billed in GB of 10^9 bytes, so at
+ *  Cloudflare's 10 GB this is 9 GB in those terms and not in GiB.
  *
  *  The move pause this implies is accepted: a 9 GB stop-the-world copy is a long one, and the route
  *  out of it is the base of the database in R2 (`paged-storage.md`), not a smaller cap. What is NOT
  *  merely slow is the copy itself — `snapshot()` materializes a whole vshard as one JS object and
  *  `install()` replays it in a single transaction, which no 9 GB vshard survives. See the note on
  *  `Host.snapshot`. */
-export const VSHARD_CAP = 9_000_000_000;
+export const VSHARD_CAP = vshardCap();
 
 export interface AllocatorOptions {
   /** The soft cap. A vshard stops taking new roots at half of it, keeping the rest for colocated
