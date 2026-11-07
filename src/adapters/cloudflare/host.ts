@@ -7,18 +7,18 @@
 // while rows remain, which is what makes a cross-host inverse edge eventually arrive with nothing
 // driving it.
 
-import { Catalog } from "../catalog/catalog.ts";
-import type { Lock } from "../catalog/catalog.ts";
-import { Hlekk } from "../client/client.ts";
-import { applyTo } from "../client/transport.ts";
-import type { Mutation } from "../client/transport.ts";
-import { Deliverer } from "../host/outbox.ts";
-import { Host } from "../host/host.ts";
-import type { Snapshot } from "../host/host.ts";
-import { vshardRange } from "../host/ids.ts";
-import { doSql } from "../host/sql.ts";
-import type { Sql } from "../host/sql.ts";
-import type { Miss, Plan } from "../query/types.ts";
+import { Catalog } from "../../catalog/catalog.ts";
+import type { Lock } from "../../catalog/catalog.ts";
+import { Hlekk } from "../../client/client.ts";
+import { applyTo } from "../../client/transport.ts";
+import type { Mutation } from "../../client/transport.ts";
+import { Deliverer } from "../../host/outbox.ts";
+import { Host } from "../../host/host.ts";
+import type { Snapshot } from "../../host/host.ts";
+import { vshardRange } from "../../host/ids.ts";
+import { doSql } from "../../host/sql.ts";
+import type { Sql } from "../../host/sql.ts";
+import type { Miss, Plan } from "../../query/types.ts";
 import type { Ctx, Env } from "./bindings.ts";
 import { routedFromWire, serve } from "./rpc.ts";
 import { cloudflareTransport } from "./transport.ts";

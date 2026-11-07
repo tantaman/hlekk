@@ -7,14 +7,14 @@
 import { Hlekk } from "../client/client.ts";
 import { vshardOf } from "../host/ids.ts";
 import type { Id, Json } from "../query/types.ts";
-import { databaseOf, directoryStub } from "../do/bindings.ts";
-import type { Env } from "../do/bindings.ts";
-import { call } from "../do/rpc.ts";
-import { cloudflareTransport } from "../do/transport.ts";
+import { databaseOf, directoryStub } from "../adapters/cloudflare/bindings.ts";
+import type { Env } from "../adapters/cloudflare/bindings.ts";
+import { call } from "../adapters/cloudflare/rpc.ts";
+import { cloudflareTransport } from "../adapters/cloudflare/transport.ts";
 import { Comment, Issue, LOCK, User, commentAuthor, issueComments, issueOwner, userOwned } from "./schema.ts";
 
-export { HlekkHostDO } from "../do/host.ts";
-export { HlekkDirectoryDO } from "../do/directory.ts";
+export { HlekkHostDO } from "../adapters/cloudflare/host.ts";
+export { HlekkDirectoryDO } from "../adapters/cloudflare/directory.ts";
 
 const json = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body, null, 1), { status, headers: { "content-type": "application/json" } });

@@ -419,6 +419,8 @@ A 40-bit sequence exhausting in four months under a realistic tenant import is w
 
 **Two of those four are now historical, and two are load-bearing.** Reserving the sign bit (see Layout) put every id below 2^63, so the first reason — REAL coercion making two distinct ids compare equal — can no longer happen. And because every id is positive, signed integer order equals unsigned order, so the third reason's contiguous key range would hold for an INTEGER column too. What still forbids INTEGER is the second reason, on a different threshold that did not move: `SqlStorageValue` is `ArrayBuffer | string | number | null` with no BigInt, so an INTEGER column read back through `ctx.storage.sql` is a JS number and rounds above **2^53**, where ids run to 2^63−1. The fourth reason then inverts against INTEGER rather than merely being lost: with INTEGER a missed conversion *is* that silent rounding, where a blob fails loudly.
 
+**That surviving reason is one platform's, not SQLite's.** `node:sqlite` and better-sqlite3 both hand back BigInt, and the `Sql` seam's `Param` already admits `bigint`, so on a host that is not a Durable Object nothing forbids an INTEGER column. The format does not change: ids are the one thing that can never be revised, and BLOB keys are correct on every backend where INTEGER is correct only on some. But the claim this section makes is now *forced on one backend and merely sound on the rest*, which is weaker than it reads, and worth knowing before the design is held up as storage-agnostic. See *What a port must preserve*.
+
 The shape that would let blobs go is `(vshard, seq)` as two INTEGER columns — 65,536 and 2^47 both sit under 2^53, and the pair sorts identically to the packed id, making a vshard `WHERE vshard = ?` rather than a `BETWEEN`. The cost is that `id1` and `id2` each become two columns, widening every edge row and the index that serves `related()`, while the API boundary still packs and unpacks. Recorded as considered, not planned.
 
 ```ts
@@ -993,6 +995,21 @@ What it costs is one extra b-tree hop per indexed read, index maintenance in hos
 | [Workers KV value and write rate](https://developers.cloudflare.com/kv/platform/limits/) | 25 MiB per value; 1 write/sec per key | Shard map published in chunks, coalesced to one write per rebalance |
 | [Workers KV propagation](https://developers.cloudflare.com/kv/concepts/how-kv-works/) | Up to 60 seconds, 4.38 s p99 | A published route is a hint; the owner's epoch check corrects it |
 
+### What a port must preserve
+
+The code carries no dependency on Cloudflare. Nothing in `src/` imports `cloudflare:` or the generated worker types, there are no runtime dependencies at all, and the two Durable Object classes are plain classes taking `(ctx, env)` rather than subclasses of anything. The platform lives behind four seams, implemented for Cloudflare in `src/adapters/cloudflare/` — and `src/client/local.ts` is a second complete implementation of the same seams, running a whole database in one process over `node:sqlite`. That is the one the suite exercises, so the seam is the tested path rather than an aspiration.
+
+| Seam | Where | What a port supplies |
+| --- | --- | --- |
+| `Sql` | `host/sql.ts` | Synchronous SQLite, one local transaction, and the engine's own size figure |
+| `Transport` | `client/transport.ts` | Eight methods: per-host reads and writes, published chunks, the directory, the catalog, placement, index lookup |
+| `Runtime` | `runtime/runtime.ts` | A clock and randomness, so a failure replays |
+| Bindings | `adapters/cloudflare/bindings.ts` | Host and directory addressing, a map store, a timer, and for bulk loads an object store |
+
+`PlatformLimits` in `runtime/platform.ts` holds every figure that is a property of where a host runs rather than of the design — the per-host storage limit, the per-host request rate, the row cap — and the vshard cap and the shed threshold derive from it. A port reassigns `PLATFORM` and changes nothing else. The two margins there are absolute rather than proportional, which is right at 10 GB and a judgement to revisit on a much larger host.
+
+**One precondition is not a seam and cannot be configured: a host serves one writer at a time.** The batch read path answers a whole request in one turn of the event loop and treats it as one snapshot, and `assocAddMany` commits N edges once on the strength of there being no concurrency to race — `Host.assocAddMany` says so directly. Actor platforms give this; a thread-pooled HTTP server does not, and would need `BEGIN IMMEDIATE` and a different account of the batch snapshot. It is the first thing to check before writing an adapter, and the only one of these that a passing test suite would not catch.
+
 ### Design limits
 
 - **vshard size:** soft cap of 9 GB, set by the 10 GB per-DO storage limit less a margin. Not by move time: a 9 GB stop-the-world copy is a long pause and the pause is accepted, the route out of it being the base of the database in R2 rather than a smaller cap. Under paged storage the constraint becomes write rate per lease holder rather than bytes.
@@ -1048,7 +1065,7 @@ Build the riskiest parts first: per-host performance, then moves under load. Eve
 
 `npm run smoke` runs a host on real Durable Object SQLite through the DO adapter, which is what says the adapter is right — blobs arrive as `ArrayBuffer` and are normalized, `transactionSync` commits and rolls back, and an 8-byte big-endian key really does sort in unsigned numeric order up to 2^64−1 in the engine the design rests on.
 
-`npm run app` runs a database: a host Durable Object, a directory Durable Object, a KV namespace for the published map, and `src/do/transport.ts`, which is the whole of what the platform costs — eight methods, below which nothing above it changes. It asserts what it did rather than that the requests succeeded: that the rows landed on more than one host DO, that a maintained inverse edge arrived from the host that wrote its other half and that those objects really are elsewhere, that a graph read assembled its answer from several hosts, that both drivers agree, that a vshard moves to a host that has never held anything and the same read still answers the same, and that the placement controller sheds a run when a host crosses its threshold.
+`npm run app` runs a database: a host Durable Object, a directory Durable Object, a KV namespace for the published map, and `src/adapters/cloudflare/transport.ts`, which is the whole of what the platform costs — eight methods, below which nothing above it changes. It asserts what it did rather than that the requests succeeded: that the rows landed on more than one host DO, that a maintained inverse edge arrived from the host that wrote its other half and that those objects really are elsewhere, that a graph read assembled its answer from several hosts, that both drivers agree, that a vshard moves to a host that has never held anything and the same read still answers the same, and that the placement controller sheds a run when a host crosses its threshold.
 
 A read-only proof of concept comes before any of what a deployment still owes: a ~300 GB database laid out across ~50 hosts in advance and queried, with no moves and every epoch at 0. [`wikimedia-demo.md`](wikimedia-demo.md) records what carries it, what the fan-out measured at that width, and what a bulk loader owes — including that the chunked snapshot below is its primitive, so deferring moves does not defer that work.
 

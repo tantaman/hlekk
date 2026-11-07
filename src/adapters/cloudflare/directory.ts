@@ -7,17 +7,17 @@
 // for are collected and flushed by whichever call asked. And a host that a move creates has never
 // seen the lock, so `ensure` is where it is given one.
 
-import type { Lock } from "../catalog/catalog.ts";
-import { Allocator } from "../directory/allocator.ts";
-import { Directory } from "../directory/directory.ts";
-import { chunkKey } from "../directory/map.ts";
-import type { Route } from "../directory/map.ts";
-import { Mover } from "../directory/move.ts";
-import type { MoveHosts } from "../directory/move.ts";
-import { Placement } from "../directory/placement.ts";
-import type { Thresholds } from "../directory/placement.ts";
-import type { Snapshot, VshardStats } from "../host/host.ts";
-import { doSql } from "../host/sql.ts";
+import type { Lock } from "../../catalog/catalog.ts";
+import { Allocator } from "../../directory/allocator.ts";
+import { Directory } from "../../directory/directory.ts";
+import { chunkKey } from "../../directory/map.ts";
+import type { Route } from "../../directory/map.ts";
+import { Mover } from "../../directory/move.ts";
+import type { MoveHosts } from "../../directory/move.ts";
+import { Placement } from "../../directory/placement.ts";
+import type { Thresholds } from "../../directory/placement.ts";
+import type { Snapshot, VshardStats } from "../../host/host.ts";
+import { doSql } from "../../host/sql.ts";
 import { databaseOf, hostStub, vshardsOf } from "./bindings.ts";
 import type { Ctx, Env } from "./bindings.ts";
 import { call, routesToWire, serve } from "./rpc.ts";
