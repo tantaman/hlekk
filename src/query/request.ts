@@ -27,6 +27,7 @@
 // the per-query scan cap design.md still owes is.
 
 import type { FieldSpec } from "../catalog/catalog.ts";
+import { decodeCursor } from "../schema/query.ts";
 import type { CmpOp, Json } from "./types.ts";
 
 export const OPS: readonly CmpOp[] = ["=", "!=", "<", "<=", ">", ">="];
@@ -84,6 +85,10 @@ export interface Hop {
   /** An edge type name from the vocabulary. */
   edge: string;
   limit?: number;
+  /** Where to continue the list from: a cursor an earlier answer handed back. Without this a served
+   *  list is a first page and nothing else, since the caller holds no plan to put a cursor into —
+   *  which is why a protocol that pages is a protocol that carries this one field. */
+  after?: string;
   where?: Cmp[];
   /** Counts to read here, from the maintained counter. */
   counts?: CountSpec[];
@@ -186,6 +191,19 @@ function checkHop(hop: Hop, at: string, depth: number, reaching: number, vocab: 
   const limit = hop.limit ?? DEFAULT_HOP_LIMIT;
   if (!Number.isInteger(limit) || limit < 1 || limit > limits.maxLimit) {
     throw new Refused(at, `limit must be an integer in 1..${limits.maxLimit}, got ${String(hop.limit)}`);
+  }
+  if (hop.after !== undefined) {
+    // A field relationship follows an id in a payload: there is no list, so there is nothing to
+    // continue. Checked before the cursor itself, because "this edge cannot be paged" is the
+    // actionable half.
+    if (edge.counted === false) {
+      throw new Refused(at, `edge "${hop.edge}" cannot be continued: it follows an id in a payload and has no list`);
+    }
+    try {
+      decodeCursor(hop.after);
+    } catch (e) {
+      throw new Refused(at, `after is not a cursor from an earlier answer: ${(e as Error).message}`);
+    }
   }
   for (const [i, c] of (hop.where ?? []).entries()) {
     if (!OPS.includes(c.op)) throw new Refused(`${at}.where[${i}]`, `operator must be one of ${OPS.join(" ")}`);

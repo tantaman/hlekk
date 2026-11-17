@@ -26,6 +26,11 @@ import { databaseOf, directoryStub, hostStub } from "../adapters/cloudflare/bind
 import type { Env } from "../adapters/cloudflare/bindings.ts";
 import { call } from "../adapters/cloudflare/rpc.ts";
 import { cloudflareTransport } from "../adapters/cloudflare/transport.ts";
+import { Catalog } from "../catalog/catalog.ts";
+import { handle } from "../protocol/http.ts";
+import type { Binding } from "../protocol/http.ts";
+import { surfaceOf } from "../protocol/surface.ts";
+import { canonicalDb } from "../query/ref.ts";
 import { isOperatorPath, refuseOperator } from "./guard.ts";
 import { ROSTER_TTL_MS, narrowRoster, rosterOf } from "./roster.ts";
 import { OG_CARD, OG_CARD_ETAG } from "./wiki-og.ts";
@@ -55,6 +60,44 @@ const THIS_DEPLOYMENT = {};
 
 const json = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+/**
+ * Where the cross-database protocol is mounted, which is what gives this deployment its identity as
+ * a database: the URI is `https://<host>/db`.
+ *
+ * A prefix rather than routes at the top level, for two reasons. The demo already owns `/price` and
+ * `/query`, which mean something else here — an authored query over the wiki's own builder, entered
+ * by title — and a protocol route is not a demo route that happens to take JSON. And a database URI
+ * has to be a prefix of its own routes, so that one name identifies the database and every route
+ * under it is reached by appending to that name.
+ *
+ * Read-only and public, under no identity, which is the whole reason the first database on the
+ * internet can be one that is already loaded: the serving half needs no storage change at all.
+ */
+const PROTOCOL_PREFIX = "/db";
+
+/** Compiled once per isolate: the wiki's lock is constant and compiling it is not free. */
+const WIKI_CATALOG = Catalog.compile(LOCK);
+
+/**
+ * Everything in the catalog, because the wiki's whole graph is public — one page type and the four
+ * edges between pages, all of it already served to any visitor by `/page` and `/relation`. A
+ * database with a private half states a projection here instead; see `protocol/surface.ts`.
+ */
+const WIKI_SURFACE = surfaceOf(WIKI_CATALOG);
+
+/**
+ * The database URI this deployment answers at.
+ *
+ * `HLEKK_DATABASE_URI` is authoritative when set, and the request's own origin is the fallback. The
+ * fallback is a convenience with a real hazard behind it: a deployment reachable under two names
+ * would advertise two URIs, and since the URI *is* the database's identity, a caller interning both
+ * ends up with two aliases for one database and no way to tell. So a deployment that is going to be
+ * linked to sets the variable, and the fallback is for development and for looking at it.
+ */
+function databaseUri(url: URL, env: WikiEnv): string {
+  return canonicalDb(env.HLEKK_DATABASE_URI ?? `${url.origin}${PROTOCOL_PREFIX}`);
+}
 
 /** The edge types by the name the import emits, which is the only vocabulary the driver has. An
  *  unknown name is a mismatch between the two sides and is refused rather than skipped. */
@@ -146,6 +189,13 @@ interface WikiEnv extends Env {
    * only where the two were deliberately given the same one.
    */
   HLEKK_ADMIN_TOKEN?: string;
+
+  /**
+   * The canonical URI this database is linked to by, for the cross-database protocol mounted at
+   * `/db`. Absent, the request's own origin plus that prefix is used — see `databaseUri` for why
+   * that is a development convenience and not the thing to deploy with.
+   */
+  HLEKK_DATABASE_URI?: string;
 
   /**
    * A second deployment of this same Worker, holding the same wiki under a placement that buys no
@@ -309,6 +359,20 @@ export default {
     }
 
     const db = Hlekk.from(cloudflareTransport(env));
+
+    // The cross-database protocol, before the demo's own routes and after the guard: it is this
+    // deployment's one public, versioned surface, and everything else here is a demo.
+    if (path === PROTOCOL_PREFIX || path.startsWith(`${PROTOCOL_PREFIX}/`)) {
+      const binding: Binding = {
+        database: databaseUri(url, env),
+        catalog: WIKI_CATALOG,
+        source: db,
+        surface: WIKI_SURFACE,
+        prefix: PROTOCOL_PREFIX,
+      };
+      return handle(request, binding);
+    }
+
     const directory = directoryStub(env);
     const body = async <T>(): Promise<T> => (await request.json()) as T;
     const num = (k: string, fallback: number) => Number(url.searchParams.get(k) ?? fallback);

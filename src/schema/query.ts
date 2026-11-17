@@ -4,6 +4,7 @@
 // It compiles to a Plan, which is what hosts and the coordinator run. Each `related` level becomes one
 // frame, addressed by index, so a frontier task can carry its frame and a host can cache the plan.
 
+import { parseId } from "../host/ids.ts";
 import { DEFAULT_LIMIT } from "../query/ops.ts";
 import type { Stats } from "../query/driver.ts";
 import type { Cond, CmpOp, Id, Json, Plan, Source } from "../query/types.ts";
@@ -57,10 +58,17 @@ export const CURSOR_VERSION = "v1";
 
 export const encodeCursor = (time: number, id2: Id): string => `${CURSOR_VERSION}:${time}:${id2}`;
 
+/** Strict, because a cursor now arrives from an untrusted caller as well as from an answer this
+ *  process minted: `Hop.after` is a continuation token a stranger may submit, and a malformed one
+ *  that decoded to `NaN` would reach a SQL parameter rather than a refusal. */
 export function decodeCursor(cursor: string): { time: number; id2: Id } {
-  const [version, time, id2] = cursor.split(":");
-  if (version !== CURSOR_VERSION) throw new TypeError(`cursor version ${version}, expected ${CURSOR_VERSION}`);
-  return { time: Number(time), id2 };
+  const parts = cursor.split(":");
+  if (parts[0] !== CURSOR_VERSION) throw new TypeError(`cursor version ${parts[0]}, expected ${CURSOR_VERSION}`);
+  if (parts.length !== 3) throw new TypeError(`not a cursor: ${JSON.stringify(cursor)}`);
+  const time = Number(parts[1]);
+  if (!Number.isSafeInteger(time)) throw new TypeError(`not a cursor time: ${JSON.stringify(parts[1])}`);
+  parseId(parts[2]); // the 8-byte guard: a cursor's id2 is a local id, never a qualified reference
+  return { time, id2: parts[2] };
 }
 
 const clone = (n: Node): Node => ({ ...n, children: [...n.children], counts: [...n.counts] });
