@@ -229,10 +229,11 @@ export interface QueryOptions {
    * How many levels down a count may be asked for. Unbounded by default; 0 keeps counts on the root
    * alone.
    *
-   * The federation oracle asks for 0, because a count below the root is a count of an object's edges
-   * and that object may be in another database — which is a request with `counts`, and PLAN.md step
-   * 6's work. The root is always the asking database's own, so a count there is local whatever the
-   * split did.
+   * For an oracle that wants every count to be a local one: a count below the root is a count of an
+   * object's edges, and that object may be in another database, which makes it a request with
+   * `counts` rather than a read of a maintained row. The root is always the asking database's own.
+   * The federation oracle no longer needs it — those requests are built — and it is kept because the
+   * distinction is the one a reader of that oracle has to make to understand what it covers.
    */
   countsBelow?: number;
 }

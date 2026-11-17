@@ -49,7 +49,7 @@ const NOTES_LOCK: Lock = planLock({
 
 /** What the wiki serves: pages by title, and not the field it keeps to itself. A projection is the
  *  mechanism for that, and it is the responder's to state — field agreement between two catalogs is
- *  a different question, settled in PLAN.md step 6. */
+ *  a different question, and the answer is the vocabulary comparison further down this file. */
 const WIKI_PUBLIC = { name: "public", include: ["wiki.*"], fields: { "wiki.page": ["title"] } };
 
 const NOTES_CATALOG = Catalog.compile(NOTES_LOCK);
