@@ -13,7 +13,8 @@ import { describe, it } from "node:test";
 import vm from "node:vm";
 
 import { isOperatorPath } from "./guard.ts";
-import { WIKI_UI } from "./wiki-ui.ts";
+import { OG_CARD, OG_CARD_ETAG, OG_CARD_HEIGHT, OG_CARD_WIDTH } from "./wiki-og.ts";
+import { WIKI_UI, wikiUi } from "./wiki-ui.ts";
 import { storedTitle } from "./wiki.ts";
 
 const scripts = [...WIKI_UI.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]!);
@@ -128,5 +129,49 @@ describe("the inline UI", () => {
     assert.ok(asked.length >= 4, `found ${asked.length} fetches; the pattern has stopped matching`);
     assert.deepEqual(asked.filter(isOperatorPath), []);
     assert.doesNotMatch(scripts[0]!, /["'\/]admin\/|["'\/]ingest\//, "no operator path is built by concatenation either");
+  });
+});
+
+describe("the social card", () => {
+  const page = wikiUi("https://wiki.example.com");
+  const content = (prop: string): string | null => {
+    const m = page.match(new RegExp('<meta (?:property|name)="' + prop + '" content="([^"]*)"'));
+    return m === null ? null : m[1]!;
+  };
+
+  it("fills the origin in everywhere, so nothing ships a literal placeholder", () => {
+    // A crawler given "{{origin}}/og.png" fetches nothing and the card is simply absent -- a
+    // failure that is invisible until someone shares the link, which is the wrong time to find it.
+    assert.ok(WIKI_UI.includes("{{origin}}"), "the template should carry the placeholder");
+    assert.equal(page.includes("{{origin}}"), false);
+  });
+
+  it("points at this origin's own image and page, absolutely", () => {
+    // Three deployments serve this one document. Relative URLs are not allowed here by the
+    // protocol, and a hardcoded host would make a card shared from one of them advertise another.
+    assert.equal(content("og:image"), "https://wiki.example.com/og.png");
+    assert.equal(content("og:url"), "https://wiki.example.com/");
+    assert.match(page, /<link rel="canonical" href="https:\/\/wiki\.example\.com\/">/);
+  });
+
+  it("declares the image the dimensions the bundled card actually has", () => {
+    // These are three separate numbers that have to agree: the card is rendered at one size, the
+    // module records what was rendered, and the meta tags tell a crawler what to expect. A re-render
+    // at a different size silently breaks the layout of every preview until they are reconciled.
+    assert.equal(content("og:image:width"), String(OG_CARD_WIDTH));
+    assert.equal(content("og:image:height"), String(OG_CARD_HEIGHT));
+    assert.equal(content("twitter:card"), "summary_large_image");
+    assert.ok((content("og:image:alt") ?? "").length > 20, "the card needs alt text");
+  });
+
+  it("carries a PNG of that size in the bundle", () => {
+    // The module is generated, so this is checking the generator's output rather than a hand edit:
+    // that the bytes are a PNG at all, and that its IHDR says what the meta tags claim.
+    const png = OG_CARD;
+    assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const be = (at: number) => (png[at]! << 24) + (png[at + 1]! << 16) + (png[at + 2]! << 8) + png[at + 3]!;
+    assert.equal(be(16), OG_CARD_WIDTH);
+    assert.equal(be(20), OG_CARD_HEIGHT);
+    assert.match(OG_CARD_ETAG, /^"[0-9a-f]{16}"$/);
   });
 });

@@ -28,7 +28,8 @@ import { call } from "../adapters/cloudflare/rpc.ts";
 import { cloudflareTransport } from "../adapters/cloudflare/transport.ts";
 import { isOperatorPath, refuseOperator } from "./guard.ts";
 import { ROSTER_TTL_MS, narrowRoster, rosterOf } from "./roster.ts";
-import { WIKI_UI } from "./wiki-ui.ts";
+import { OG_CARD, OG_CARD_ETAG } from "./wiki-og.ts";
+import { wikiUi } from "./wiki-ui.ts";
 import { QueryRefused, build as buildQuery, check as checkQuery, parseQuery, schemaView, unparse } from "./wiki-query.ts";
 import type { QuerySpec } from "./wiki-query.ts";
 import {
@@ -327,8 +328,27 @@ export default {
       /** The page view. Served from the Worker as one document so the demo has nothing to build and
        *  no asset host to depend on; it calls the same `/page` route the ingest driver checks. */
       if (path === "/" || path === "/wiki") {
-        return new Response(WIKI_UI, {
+        return new Response(wikiUi(url.origin), {
           headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" },
+        });
+      }
+
+      /** The social card the page's og:image points at, in the bundle for the same reason the page
+       *  is: a link shared anywhere should not depend on an asset host this demo does not have.
+       *
+       *  Cached hard, and by its own hash rather than by a name: the path never changes, so a
+       *  re-render would otherwise serve stale bytes for as long as the max-age. A crawler that
+       *  already holds the card sends If-None-Match and gets 304 and no body. */
+      if (path === "/og.png") {
+        if (request.headers.get("if-none-match") === OG_CARD_ETAG) {
+          return new Response(null, { status: 304, headers: { etag: OG_CARD_ETAG } });
+        }
+        return new Response(OG_CARD, {
+          headers: {
+            "content-type": "image/png",
+            "cache-control": "public, max-age=86400",
+            etag: OG_CARD_ETAG,
+          },
         });
       }
 

@@ -11,7 +11,8 @@
     "app:dev": "wrangler dev --config wrangler.app.jsonc",
     "ingest:local": "node scripts/ingest-local.ts",
     "ingest:deployed": "node scripts/ingest-deployed.ts",
-    "wiki:deploy": "wrangler deploy --config wrangler.wiki.jsonc"
+    "wiki:deploy": "wrangler deploy --config wrangler.wiki.jsonc",
+    "og": "node scripts/make-og.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

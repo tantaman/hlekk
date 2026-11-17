@@ -38,6 +38,25 @@ export const WIKI_UI = String.raw`<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>hlekk — a Wikipedia mirror across many Durable Objects</title>
+<meta name="description" content="A read-only mirror of a simplewiki dump: 950,421 pages and 42,817,596 links, laid out in advance across 43 host Durable Objects and read back by traversal.">
+<!-- The social card. The origin below is filled in per request by wikiUi(), and the placeholder is
+     deliberately not written in this comment, which would be substituted too: og:image and og:url
+     have to be absolute, and this one document is served by three deployments on three hostnames,
+     so the origin is the one thing in the page that cannot be written down here. The image itself is
+     /og.png, served from the bundle by wiki-app.ts. X and the rest fall back to og:* for everything
+     but the card type, so twitter:card is the only twitter tag worth carrying. -->
+<link rel="canonical" href="{{origin}}/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="hlekk wiki">
+<meta property="og:url" content="{{origin}}/">
+<meta property="og:title" content="A SimpleWiki spread across 43 Durable Objects">
+<meta property="og:description" content="950,421 pages and 42,817,596 links, laid out in advance across 43 host Durable Objects and read back by traversal: title → id → the link graph. A read-only mirror of a simplewiki dump.">
+<meta property="og:image" content="{{origin}}/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Every host in the database drawn as a numbered chip, with the ones a single page's links came from lit in orange.">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@300;400;500;600;700;800&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,400&display=swap">
@@ -965,3 +984,16 @@ exSel.addEventListener("change", () => {
 </body>
 </html>
 `;
+
+/**
+ * The page, with its one per-request value filled in.
+ *
+ * The document is a constant and stays one: the only thing it cannot know statically is the origin
+ * it is being served from, because og:image and og:url must be absolute and `hlekk-wiki`,
+ * `hlekk-wiki-hash` and `hlekk-wiki-graph` serve this same string under three different hostnames
+ * (plus localhost under `wrangler dev`). Reading it off the request is what keeps a card shared
+ * from one deployment from pointing at another's.
+ */
+export function wikiUi(origin: string): string {
+  return WIKI_UI.replaceAll("{{origin}}", origin);
+}
