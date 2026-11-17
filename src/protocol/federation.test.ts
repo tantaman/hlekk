@@ -5,7 +5,8 @@ import { Catalog, plan as planLock } from "../catalog/catalog.ts";
 import type { Lock } from "../catalog/catalog.ts";
 import { federate } from "../testkit/federation.ts";
 import type { Federation } from "../testkit/federation.ts";
-import { ForeignUnreachable, NotFollowed, foreignClient } from "./client.ts";
+import { ForeignUnreachable, NotFollowed, ResponseCache, foreignClient } from "./client.ts";
+import { BudgetSpent } from "../client/client.ts";
 import { assertSound } from "../testkit/invariants.ts";
 import type { Id, Plan } from "../query/types.ts";
 import type { Hlekk } from "../client/client.ts";
@@ -35,7 +36,15 @@ const NOTES_LOCK: Lock = planLock({
       "notes.note_about_field": { from: "notes.note", to: "wiki.page", field: "aboutId", foreign: true },
     },
   },
-  wiki: { objects: { "wiki.page": { fields: { title: "string" } } } },
+  // `wiki.page_links` is declared here too, and it has to be: a plan carries the ASKING database's
+  // atypes, and the wire carries names. A notes query that hops `page -> page_links` can only name
+  // that edge if its own catalog has an entry for it. The two databases' integers are unrelated —
+  // here `notes.note_about` and `wiki.page_links` are both 1 in their own catalogs — which is the
+  // whole reason integers never cross.
+  wiki: {
+    objects: { "wiki.page": { fields: { title: "string" } } },
+    edges: { "wiki.page_links": { from: "wiki.page", to: "wiki.page" } },
+  },
 });
 
 /** What the wiki serves: pages by title, and not the field it keeps to itself. A projection is the
@@ -49,7 +58,9 @@ const T = {
   note: NOTES_CATALOG.objectNamed("notes.note")!.otype,
   about: NOTES_CATALOG.edgeNamed("notes.note_about")!.atype!,
   page: WIKI_CATALOG.objectNamed("wiki.page")!.otype,
-  links: WIKI_CATALOG.edgeNamed("wiki.page_links")!.atype!,
+  // From the NOTES catalog, because that is whose plan traverses it.
+  links: NOTES_CATALOG.edgeNamed("wiki.page_links")!.atype!,
+  wikiLinks: WIKI_CATALOG.edgeNamed("wiki.page_links")!.atype!,
 };
 
 /** The plan for `note -> about`, which is the whole of Milestone A. */
@@ -79,7 +90,7 @@ async function two(opts: Partial<Parameters<typeof federate>[0]> = {}): Promise<
   const notes = f.member(NOTES);
   const page = await wiki.db.create(T.page, { title: "Country", secret: "not yours" }, { vshard: "3" });
   const other = await wiki.db.create(T.page, { title: "Capital" }, { with: page });
-  await wiki.db.assocAdd(T.links, page, other, 1);
+  await wiki.db.assocAdd(T.wikiLinks, page, other, 1);
   const note = await notes.db.create(T.note, { body: "about a country" }, { vshard: "7" });
   await notes.db.assocAdd(T.about, note, `${WIKI}#${page}`, 1);
   return { f, note, page, other };
@@ -303,17 +314,34 @@ describe("failure is stated, never inferred", () => {
     assert.equal(((await res.json()) as { at: string }).at, "hops[0]");
   });
 
-  it("names a list or a count in another database rather than answering it as empty", async () => {
+  it("follows a list that lives in the other database, which is where the query keeps going", async () => {
+    const { f, note, page, other } = await two();
+    // `note -> page -> the pages it links to`: the second hop is a list the wiki holds, so the
+    // coordinator asks the wiki for it rather than answering an empty list. Milestone B.
+    const rows = (await f.member(NOTES).db.query(
+      {
+        frames: [
+          { source: { kind: "ids" }, children: [{ alias: "about", frame: 1 }], counts: [] },
+          { source: { kind: "edge", atype: T.about }, children: [{ alias: "links", frame: 2 }], counts: [] },
+          { source: { kind: "edge", atype: T.links }, children: [], counts: [] },
+        ],
+      },
+      [note],
+    )) as { about: { id: string; links: { id: string; title: string }[] }[] }[];
+    assert.deepEqual(rows[0].about.map((a) => a.id), [`${WIKI}#${page}`]);
+    assert.deepEqual(rows[0].about[0].links.map((l) => [l.id, l.title]), [[`${WIKI}#${other}`, "Capital"]]);
+  });
+
+  it("names an edge type this catalog cannot, rather than reading a list it could not interpret", async () => {
     const { f, note } = await two();
-    // The coordinator would need a one-hop request with `after` or `counts`, which is step 6. An
-    // empty list here would be a wrong answer that looks like a right one.
+    // An atype with no name here is an atype that cannot be sent: the wire carries names.
     await assert.rejects(
       f.member(NOTES).db.query(
         {
           frames: [
             { source: { kind: "ids" }, children: [{ alias: "about", frame: 1 }], counts: [] },
-            { source: { kind: "edge", atype: T.about }, children: [{ alias: "links", frame: 2 }], counts: [] },
-            { source: { kind: "edge", atype: T.links }, children: [], counts: [] },
+            { source: { kind: "edge", atype: T.about }, children: [{ alias: "x", frame: 2 }], counts: [] },
+            { source: { kind: "edge", atype: 9999 }, children: [], counts: [] },
           ],
         },
         [note],
@@ -523,5 +551,179 @@ describe("what a responder may not slip into an answer", () => {
         [`${WIKI}#999999`, null],
       ],
     );
+  });
+});
+
+describe("what one query may spend reaching other databases", () => {
+  it("gives up when the request count is spent, saying which of the three ran out", async () => {
+    const { f, note } = await two();
+    // One hop needs one request, so a budget of zero cannot even start.
+    const err = (await f
+      .member(NOTES)
+      .db.query(ABOUT_PLAN, [note], { budget: { requests: 0 } })
+      .then(() => null, (e: Error) => e)) as BudgetSpent;
+    assert.equal(err.name, "BudgetSpent");
+    assert.equal(err.what, "requests");
+    // And the same query inside its budget is answered.
+    const rows = (await f.member(NOTES).db.query(ABOUT_PLAN, [note], { budget: { requests: 4 } })) as {
+      about: unknown[];
+    }[];
+    assert.equal(rows[0].about.length, 1);
+  });
+
+  it("gives up on the database count, which is what bounds a read fanning out", async () => {
+    // Three real databases, so every hop would succeed and the only thing that stops the read is
+    // how far it is allowed to fan out.
+    const THIRD = "https://third.example/db";
+    const f = await federate({
+      members: [
+        { uri: WIKI, lock: WIKI_LOCK, database: "wiki" },
+        { uri: THIRD, lock: WIKI_LOCK, database: "third" },
+        { uri: NOTES, lock: NOTES_LOCK, database: "notes" },
+      ],
+    });
+    const notes = f.member(NOTES);
+    const note = await notes.db.create(T.note, { body: "many" }, { vshard: "7" });
+    for (const [i, m] of [f.member(WIKI), f.member(THIRD)].entries()) {
+      const page = await m.db.create(T.page, { title: `p${i}` }, { vshard: "3" });
+      await notes.db.assocAdd(T.about, note, `${m.uri}#${page}`, i + 1);
+    }
+    // Two databases at a budget of two is fine.
+    const ok = (await notes.db.query(ABOUT_PLAN, [note], { budget: { databases: 2 } })) as { about: unknown[] }[];
+    assert.equal(ok[0].about.length, 2);
+
+    const err = (await notes.db
+      .query(ABOUT_PLAN, [note], { budget: { databases: 1 } })
+      .then(() => null, (e: Error) => e)) as BudgetSpent;
+    assert.equal(err.name, "BudgetSpent");
+    assert.equal(err.what, "databases");
+  });
+
+  it("gives up on the deadline, which is the one a stalled responder spends", async () => {
+    const { f, note } = await two({
+      wrap: () => async () => new Promise<Response>((_, fail) => {
+        const held = setTimeout(() => fail(new Error("gave up")), 5_000);
+        void held;
+      }),
+      foreign: { deadlineMs: 10_000 },
+    });
+    // The budget's deadline is the query's, and it is checked before a request is sent — so a second
+    // hop after a slow first one is refused rather than queued behind it.
+    const notes = f.member(NOTES);
+    const err = (await notes.db
+      .query(ABOUT_PLAN, [note], { budget: { deadlineMs: -1 } })
+      .then(() => null, (e: Error) => e)) as BudgetSpent;
+    assert.equal(err.what, "deadline");
+  });
+});
+
+describe("keeping an answer for as long as the responder permitted", () => {
+  it("answers a repeated read from the cache, and only while the response allows", async () => {
+    let now = 1_000_000;
+    const cache = new ResponseCache(() => now);
+    const { f, note } = await two({ foreign: { cache } });
+    const notes = f.member(NOTES);
+    const wiki = f.member(WIKI);
+
+    await notes.db.query(ABOUT_PLAN, [note]);
+    assert.equal(wiki.served.read, 1);
+    // The wiki's PUBLIC policy says public for 60 seconds, so the same read inside that window is
+    // answered from here rather than sent.
+    await notes.db.query(ABOUT_PLAN, [note]);
+    assert.equal(wiki.served.read, 1, "the second read was not sent");
+    assert.equal(cache.hits, 1);
+
+    now += 61_000;
+    await notes.db.query(ABOUT_PLAN, [note]);
+    assert.equal(wiki.served.read, 2, "and past the window it is sent again");
+  });
+
+  it("keeps nothing a response said may not be kept", async () => {
+    let now = 1_000_000;
+    const cache = new ResponseCache(() => now);
+    const f = await federate({
+      members: [
+        {
+          uri: WIKI,
+          lock: WIKI_LOCK,
+          database: "wiki",
+          policy: { object: () => true, count: () => true, cache: () => ({ reuse: "never" }) },
+        },
+        { uri: NOTES, lock: NOTES_LOCK, database: "notes" },
+      ],
+      foreign: { cache },
+    });
+    const wiki = f.member(WIKI);
+    const notes = f.member(NOTES);
+    const page = await wiki.db.create(T.page, { title: "Country" }, { vshard: "3" });
+    const note = await notes.db.create(T.note, { body: "n" }, { vshard: "7" });
+    await notes.db.assocAdd(T.about, note, `${WIKI}#${page}`, 1);
+
+    await notes.db.query(ABOUT_PLAN, [note]);
+    await notes.db.query(ABOUT_PLAN, [note]);
+    // Only the responder knows its own enforcement granularity, so `never` is kept for no time at
+    // all — a policy per request caches not at all, and this is what saying so buys.
+    assert.equal(wiki.served.read, 2);
+    assert.equal(cache.hits, 0);
+  });
+});
+
+describe("type agreement, one step further", () => {
+  it("declines a type whose shape the two catalogs do not agree on", async () => {
+    // The notes database declares a field on `wiki.page` that the wiki does not expose. A name is
+    // only half of an agreement: this side would get every page missing a field its own schema says
+    // is always there, which is not something it can read through.
+    const DISAGREEING: Lock = planLock({
+      notes: {
+        objects: { "notes.note": { fields: { body: "string" } } },
+        edges: { "notes.note_about": { from: "notes.note", to: "wiki.page", foreign: true } },
+      },
+      wiki: { objects: { "wiki.page": { fields: { title: "string", summary: "string" } } } },
+    });
+    const catalog = Catalog.compile(DISAGREEING);
+    const f = await federate({
+      members: [
+        { uri: WIKI, lock: WIKI_LOCK, database: "wiki", projection: WIKI_PUBLIC },
+        { uri: NOTES, lock: DISAGREEING, database: "notes" },
+      ],
+      foreign: { agree: true },
+    });
+    const wiki = f.member(WIKI);
+    const notes = f.member(NOTES);
+    const page = await wiki.db.create(T.page, { title: "Country" }, { vshard: "3" });
+    const note = await notes.db.create(catalog.objectNamed("notes.note")!.otype, { body: "n" }, { vshard: "7" });
+    const about = catalog.edgeNamed("notes.note_about")!.atype!;
+    await notes.db.assocAdd(about, note, `${WIKI}#${page}`, 1);
+
+    const rows = (await notes.db.query(
+      {
+        frames: [
+          { source: { kind: "ids" }, children: [{ alias: "about", frame: 1 }], counts: [] },
+          { source: { kind: "edge", atype: about }, children: [], counts: [] },
+        ],
+      },
+      [note],
+    )) as { about: unknown[] }[];
+    // Declined as absent, not as a guess at the missing field.
+    assert.deepEqual(rows[0].about, []);
+  });
+
+  it("reads a type the responder exposes more of than this side declares", async () => {
+    // The other direction, which is fine: the reader reads what it declares, and the field it has
+    // not heard of is dropped rather than carried into its own view of the object.
+    const f = await federate({
+      members: [
+        { uri: WIKI, lock: WIKI_LOCK, database: "wiki" }, // exposes `secret` too
+        { uri: NOTES, lock: NOTES_LOCK, database: "notes" },
+      ],
+      foreign: { agree: true },
+    });
+    const wiki = f.member(WIKI);
+    const notes = f.member(NOTES);
+    const page = await wiki.db.create(T.page, { title: "Country", secret: "not yours" }, { vshard: "3" });
+    const note = await notes.db.create(T.note, { body: "n" }, { vshard: "7" });
+    await notes.db.assocAdd(T.about, note, `${WIKI}#${page}`, 1);
+    const rows = (await notes.db.query(ABOUT_PLAN, [note])) as { about: Record<string, unknown>[] }[];
+    assert.deepEqual(Object.keys(rows[0].about[0]!).sort(), ["$edge", "$version", "id", "title"]);
   });
 });

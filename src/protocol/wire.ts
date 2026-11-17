@@ -20,6 +20,7 @@
 // `WireError` naming where, for the same reason `Refused` carries an `at`.
 
 import { parseId } from "../host/ids.ts";
+import { parseRef } from "../query/ref.ts";
 import type { Cost } from "../query/request.ts";
 import type { Cacheability, Served } from "../query/serve.ts";
 import type { ListEntry, QueryResult } from "../query/normalize.ts";
@@ -224,13 +225,35 @@ function idList(v: unknown, at: string): Id[] {
   });
 }
 
+/**
+ * A list's members, which may be references.
+ *
+ * Unlike `objects`, whose keys must be bare — that is the check that stops a responder answering for
+ * a database it does not own — a list legitimately holds references out of the answering database.
+ * Those are the ones it did not follow, and they are the whole of how a read continues past it: the
+ * coordinator reads the reference and asks that database itself. A reference must be canonical, for
+ * the same reason every other one must.
+ */
+function refList(v: unknown, at: string): Id[] {
+  if (!Array.isArray(v)) throw new WireError(at, "expected an array");
+  return v.map((id, i) => {
+    const s = string(id, `${at}[${i}]`);
+    try {
+      parseRef(s);
+    } catch (e) {
+      throw new WireError(`${at}[${i}]`, `expected a bare id or a canonical reference: ${(e as Error).message}`);
+    }
+    return s;
+  });
+}
+
 function fields(v: unknown, at: string): Fields {
   return object(v, at) as Fields;
 }
 
 function list(v: unknown, at: string): ListEntry {
   const entry = object(v, at);
-  const ids = idList(entry.ids, `${at}.ids`);
+  const ids = refList(entry.ids, `${at}.ids`);
   const out: ListEntry = {
     ids,
     cursor: entry.cursor === null || entry.cursor === undefined ? null : string(entry.cursor, `${at}.cursor`),

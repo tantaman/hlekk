@@ -29,7 +29,7 @@ interface Node {
   source: Source;
   where?: Pred;
   limit?: number;
-  after?: { time: number; db: number; id2: Id };
+  after?: { time: number; db: number; id2: Id; token?: string };
   children: Child[];
   counts: { alias: string; atype: number }[];
 }
@@ -63,13 +63,34 @@ export interface Page<T> {
  *  edge in it before this point. */
 export const CURSOR_VERSION = "v2";
 
+/** The prefix of a cursor that wraps another database's own continuation token. A token is opaque
+ *  here: the responder minted it, drops rows its policy hides, and is the only party that knows
+ *  where the list resumes. So it is carried rather than understood. */
+export const TOKEN_VERSION = "t2";
+
 export const encodeCursor = (time: number, db: number, id2: Id): string => `${CURSOR_VERSION}:${time}:${db}:${id2}`;
+
+/** Wraps a foreign continuation as a cursor an application can hold and hand back. Base64url, so a
+ *  token holding a colon does not read as a cursor's fields. */
+export const encodeToken = (token: string): string =>
+  `${TOKEN_VERSION}:${btoa(String.fromCharCode(...new TextEncoder().encode(token)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "")}`;
 
 /** Strict, because a cursor now arrives from an untrusted caller as well as from an answer this
  *  process minted: `Hop.after` is a continuation token a stranger may submit, and a malformed one
  *  that decoded to `NaN` would reach a SQL parameter rather than a refusal. */
-export function decodeCursor(cursor: string): { time: number; db: number; id2: Id } {
+export function decodeCursor(cursor: string): { time: number; db: number; id2: Id; token?: string } {
   const parts = cursor.split(":");
+  if (parts[0] === TOKEN_VERSION) {
+    if (parts.length !== 2 || !/^[A-Za-z0-9_-]{1,4096}$/.test(parts[1]!)) {
+      throw new TypeError(`not a continuation token: ${JSON.stringify(cursor)}`);
+    }
+    const padded = parts[1]!.replace(/-/g, "+").replace(/_/g, "/");
+    const raw = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
+    return { time: 0, db: 0, id2: "0", token: new TextDecoder().decode(Uint8Array.from(raw, (c) => c.charCodeAt(0))) };
+  }
   const legacy = parts[0] === "v1";
   if (!legacy && parts[0] !== CURSOR_VERSION) {
     throw new TypeError(`cursor version ${parts[0]}, expected ${CURSOR_VERSION}`);
