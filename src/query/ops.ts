@@ -7,8 +7,8 @@
 // window, a node's relationships), so a remote store can batch them and a slow branch doesn't hold up
 // the rest.
 
-import { UNKNOWN, localId } from "./types.ts";
-import type { Cond, Cursor, End, Fields, Id, Json, Maybe, Miss, Node, Obj, Plan, Row, Store, Stream, Unknown } from "./types.ts";
+import { UNKNOWN, cursorOf, isReference, referenceRow, targetOf } from "./types.ts";
+import type { Cond, Cursor, Edge, End, Fields, Id, Json, Maybe, Miss, Node, Obj, Plan, Ref, Row, Store, Stream, Unknown } from "./types.ts";
 
 export const DEFAULT_LIMIT = 50;
 /** The lowest pass rate Where assumes when sizing its window, so a filter that has passed nothing yet
@@ -30,19 +30,39 @@ export interface Op {
   fetch(p: Pass, req: Req): Stream;
 }
 
+/**
+ * What a pass does when it meets an edge into another database. Three answers, each with one owner.
+ *
+ * - `"miss"` is a **host**. It cannot follow one: the target is in a database it holds no part of,
+ *   and it stores an alias it cannot even resolve. So it reports the row as a miss carrying the
+ *   alias, skips it, and goes on prefetching the local rows around it. The coordinator judges
+ *   membership anyway.
+ * - `"follow"` is a **coordinator reading its own query**. The seam in `Hlekk.#exec` has already
+ *   turned the alias into a URI, so the target is an ordinary reference to load — through a client
+ *   for that database rather than for a host, which is the whole of what routing had to learn.
+ * - `"reference"` is a **coordinator answering someone else's read**. A database answering a read
+ *   never follows a reference out of itself, or it becomes the deputy `docs/protocol.md` rules out:
+ *   it would be fetching from a third party on a caller's behalf, under its own identity, with the
+ *   caller unable to tell whose answer it was. So the reference is listed and nothing is loaded.
+ */
+export type Foreign = "miss" | "follow" | "reference";
+
 /** One evaluation of a plan against one store. */
 export class Pass {
   readonly store: Store;
   readonly plan: Plan;
+  /** What to do with an edge into another database. */
+  readonly foreign: Foreign;
   /** What this pass needed and its store didn't have. On a host, the frontier it sends back. */
   readonly misses: Miss[] = [];
   readonly #background = new Set<Promise<unknown>>();
   readonly #full = new Map<number, Op>();
   readonly #rows = new Map<number, Op>();
 
-  constructor(store: Store, plan: Plan) {
+  constructor(store: Store, plan: Plan, foreign: Foreign = "follow") {
     this.store = store;
     this.plan = plan;
+    this.foreign = foreign;
   }
 
   miss(m: Miss): void {
@@ -153,29 +173,65 @@ export class EdgeHop implements Op {
         p.miss({ kind: "edges", id1, atype: this.atype, frame: this.frame, after, n });
         return "short";
       }
-      const ids = page.rows.map(localId);
-      const targets = ids.map((id) => p.background(p.store.object(id, this.frame)));
-      for (let i = 0; i < ids.length; i++) {
-        const o = await targets[i];
+      // A foreign row is settled before any target is asked for, because what to do with it is not a
+      // read: "follow" turns it into an ordinary reference, and the other two answer it here.
+      const rows = page.rows.filter((e) => e.db === 0 || keepForeign(p, e, this.frame));
+      const ids = rows.map(targetOf);
+      const targets = rows.map((e, i) =>
+        foreignReference(p, e) ? null : p.background(p.store.object(ids[i], this.frame)),
+      );
+      for (let i = 0; i < rows.length; i++) {
+        const e = rows[i]!;
+        if (foreignReference(p, e)) {
+          // Listed, not loaded: the reference is in the answer and there is no object behind it,
+          // which is exactly what a caller must be able to tell from an object that is absent.
+          yield node(referenceRow(ids[i]!, e));
+          continue;
+        }
+        const o = await targets[i]!;
         if (o === UNKNOWN) {
-          await missFrom(p, ids, targets, i, this.frame);
+          await missFrom(p, ids, targets as Promise<Maybe<Obj | null>>[], i, this.frame, rows);
           return "short";
         }
-        if (o !== null) yield node({ obj: o, edge: page.rows[i] }); // an edge to a deleted object is dropped
+        if (o !== null) yield node({ obj: o, edge: e }); // an edge to a deleted object is dropped
       }
-      if (page.complete || ids.length === 0) return "done";
-      after = page.rows[page.rows.length - 1];
+      if (page.complete || page.rows.length === 0) return "done";
+      after = cursorOf(page.rows[page.rows.length - 1]!);
     }
   }
 }
 
 /** Ending short at ids[from]: record it and every later load that is unknown too, so one request
  *  fetches them together. */
-async function missFrom(p: Pass, ids: Id[], loads: Promise<Maybe<Obj | null>>[], from: number, frame: number): Promise<void> {
+async function missFrom(
+  p: Pass,
+  ids: Ref[],
+  loads: (Promise<Maybe<Obj | null>> | null)[],
+  from: number,
+  frame: number,
+  rows?: Edge[],
+): Promise<void> {
   for (let i = from; i < ids.length; i++) {
-    if ((await loads[i]) === UNKNOWN) p.miss({ kind: "object", id: ids[i], frame });
+    const load = loads[i];
+    if (load !== null && (await load) === UNKNOWN) {
+      // The alias rides with the miss where there is one, because a host cannot resolve it and the
+      // client's seam turns it into a URI on the way back.
+      const db = rows?.[i]?.db ?? 0;
+      p.miss(db === 0 ? { kind: "object", id: ids[i]!, frame } : { kind: "object", id: ids[i]!, db, frame });
+    }
   }
 }
+
+/** Whether a foreign row survives to be a row of this frame at all. A host reports it and drops it;
+ *  the two coordinator modes both keep it. */
+function keepForeign(p: Pass, e: Edge, frame: number): boolean {
+  if (p.foreign !== "miss") return true;
+  p.miss({ kind: "object", id: e.id2, db: e.db, frame });
+  return false;
+}
+
+/** Whether this row is one to list rather than load. */
+const foreignReference = (p: Pass, e: Edge): boolean => e.db !== 0 && p.foreign === "reference";
 
 /** A to-one hop through an id stored in the parent's payload (fieldRel). */
 export class FieldHop implements Op {
@@ -190,6 +246,9 @@ export class FieldHop implements Op {
   async *fetch(p: Pass, req: Req): Stream {
     const id = req.parent?.obj.data[this.field];
     if (typeof id !== "string") return "done";
+    // A payload id may be qualified: that is the other place `query/ref.ts` allows one. A host
+    // answers UNKNOWN for it rather than refusing, and this is the miss that sends it to the
+    // database that holds it — already absolute, since a payload carries the URI and not an alias.
     const o = await p.store.object(id, this.frame);
     if (o === UNKNOWN) {
       p.miss({ kind: "object", id, frame: this.frame });
@@ -225,7 +284,10 @@ export class Where implements Op {
       return Math.min(MAX_AHEAD, Math.ceil(Math.max(1, need - passed) / rate));
     };
     const rows = this.input.fetch(p, { ...req, want: window() });
-    const ahead = new Ahead(p, rows, (n) => evalCond(p, this.cond, n.row));
+    // A filter cannot judge a reference: this database does not hold the object, so every field test
+    // over it would read as false and the row would be dropped — which would hide that the reference
+    // exists. It passes through undecided and the caller, who can follow it, judges.
+    const ahead = new Ahead(p, rows, (n) => (isReference(n.row.obj) ? Promise.resolve(true) : evalCond(p, this.cond, n.row)));
     try {
       for (;;) {
         ahead.fill(window());
@@ -414,6 +476,10 @@ export class Join implements Op {
   fetch(p: Pass, req: Req): Stream {
     return each(p, this.input.fetch(p, req), (n) => {
       const parent = n.row;
+      // Nothing hangs off a reference. This database holds no edge list for an object it does not
+      // have, so attaching one would read as an empty list where the truth is "ask the database that
+      // holds it" — and the caller does, because the reference is in the answer.
+      if (isReference(parent.obj)) return;
       n.rels.push({ alias: this.alias, stream: () => p.frameOp(this.frame).fetch(p, { parent }) });
     });
   }
@@ -434,6 +500,7 @@ export class CountRel implements Op {
 
   fetch(p: Pass, req: Req): Stream {
     return each(p, this.input.fetch(p, req), (n) => {
+      if (isReference(n.row.obj)) return; // a count of edges this database does not hold is not zero
       const id1 = n.row.obj.id;
       n.counts.push({
         alias: this.alias,

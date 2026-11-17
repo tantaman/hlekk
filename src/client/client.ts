@@ -7,13 +7,14 @@
 
 import type { Catalog } from "../catalog/catalog.ts";
 import { vshardOf } from "../host/ids.ts";
-import type { Refusal, Reply } from "../host/host.ts";
+import type { ExecReply, Refusal, Reply } from "../host/host.ts";
 import type { HostClient, HostReply } from "../query/driver.ts";
 import { runAsync, runRounds } from "../query/driver.ts";
 import type { Answer } from "../query/driver.ts";
 import { normalize as normalizeAnswer } from "../query/normalize.ts";
 import type { QueryResult } from "../query/normalize.ts";
 import type { Stats } from "../query/driver.ts";
+import type { Foreign } from "../query/ops.ts";
 import type { ReadSet } from "../query/stores.ts";
 import { missOwner } from "../query/types.ts";
 import type { Id, Json, Miss, Plan } from "../query/types.ts";
@@ -22,7 +23,7 @@ import type { FieldMap } from "../schema/define.ts";
 import type { Fields } from "../query/types.ts";
 import { systemClock } from "../runtime/runtime.ts";
 import type { Clock } from "../runtime/runtime.ts";
-import { parseRef } from "../query/ref.ts";
+import { formatRef, isQualified, parseRef } from "../query/ref.ts";
 import type { Ref } from "../query/ref.ts";
 import { Routes } from "./routes.ts";
 import { anchorOf } from "./transport.ts";
@@ -36,6 +37,17 @@ export class Unroutable extends Error {
   constructor(vshard: bigint) {
     super(`no host owns vshard ${vshard}`);
     this.name = "Unroutable";
+  }
+}
+
+/** A host sent back an alias the registry never allocated. An alias binding is permanent, so this is
+ *  not staleness: it is a number that means nothing, and the edge carrying it names no database. */
+export class UnknownAlias extends Error {
+  readonly alias: number;
+  constructor(alias: number) {
+    super(`a host holds an edge into database ${alias}, which this database's registry never allocated`);
+    this.name = "UnknownAlias";
+    this.alias = alias;
   }
 }
 
@@ -73,6 +85,12 @@ export interface QueryOptions {
    *  lands. Async is the default: its latency is the longest chain of dependent reads. */
   driver?: "async" | "rounds";
   stats?: Stats;
+  /**
+   * What to do with an edge into another database. `"follow"`, the default, asks that database.
+   * `"reference"` lists the reference and loads nothing, which is what a database ANSWERING a read
+   * does — see `Foreign` in `query/ops.ts` for why that is not an option but a rule.
+   */
+  foreign?: Foreign;
 }
 
 /** This database's own URI and the aliases it has allocated, read once per isolate. */
@@ -87,25 +105,41 @@ export class Hlekk {
   readonly clock: Clock;
   readonly #transport: Transport;
   readonly #clients = new Map<number, HostClient>();
+  readonly #foreign = new Map<string, HostClient>();
+  readonly #openForeign: ((database: string) => HostClient) | undefined;
   /** Cached for the life of the isolate. An alias binding is permanent — an alias is never
    *  repointed — so there is nothing here that can go stale; only new aliases can appear, and a
    *  write that needs one interns it and adds it. That permanence is what makes a foreign hop cost
    *  no directory round trip at read time. */
   #registry: Promise<Registry> | null = null;
 
-  private constructor(transport: Transport, clock: Clock) {
+  private constructor(transport: Transport, clock: Clock, openForeign?: (database: string) => HostClient) {
     this.#transport = transport;
     this.clock = clock;
+    this.#openForeign = openForeign;
     this.routes = new Routes(transport);
   }
 
   /** Memoized per transport: the same client for the life of the isolate. Its shard-map chunks are
    *  what keep the directory and the published map off the request path, and a client built fresh per
    *  request reuses none of them. */
-  static from(transport: Transport, clock: Clock = systemClock): Hlekk {
+  static from(
+    transport: Transport,
+    clock: Clock = systemClock,
+    openForeign?: (database: string) => HostClient,
+  ): Hlekk {
     let client = pool.get(transport);
-    if (!client) pool.set(transport, (client = new Hlekk(transport, clock)));
+    if (!client) pool.set(transport, (client = new Hlekk(transport, clock, openForeign)));
     return client;
+  }
+
+  /** Drops the memoized client for a transport, so the next `from` builds a fresh one.
+   *
+   *  For a harness that has to hand the same database two different clients — one that cannot follow
+   *  an edge out of it and one that can. A deployment builds its client once, with whatever it needs
+   *  already in hand, and never calls this. */
+  static forget(transport: Transport): void {
+    pool.delete(transport);
   }
 
   catalog(): Promise<Catalog> {
@@ -192,18 +226,27 @@ export class Hlekk {
   /** The answer and the graph it was read from. The builder uses the graph for cursors; `normalized`
    *  turns it into a result that holds each object once. */
   async answer(plan: Plan, rootIds: Id[], opts: QueryOptions = {}): Promise<Answer> {
-    const route = await this.#router(rootIds.map(vshardOf));
+    const route = await this.#router(rootIds.filter((id) => !isQualified(id)).map(vshardOf));
     // The async driver's batching window is a deferred turn, so it goes through the clock too: a
     // virtual one closes the window without waiting, and closes it at a repeatable point.
     return opts.driver === "rounds"
-      ? runRounds(plan, rootIds, route, opts.stats)
-      : runAsync(plan, rootIds, route, opts.stats, (f) => this.clock.defer(f));
+      ? runRounds(plan, rootIds, route, opts.stats, opts.foreign)
+      : runAsync(plan, rootIds, route, opts.stats, (f) => this.clock.defer(f), opts.foreign);
   }
 
-  /** One client per host, so a driver batching by client identity sends one request per host. */
-  async #router(seed: readonly bigint[]): Promise<(id: Id) => HostClient> {
+  /**
+   * One client per host, and one per foreign database, so a driver batching by client identity sends
+   * one request per holder.
+   *
+   * That is the whole of what routing had to learn for a cross-database read. Both drivers already
+   * group by client identity, so a foreign database gets one request per batching window however
+   * many of its objects a query needs — the same property that makes a wide local fan-out one
+   * request per host.
+   */
+  async #router(seed: readonly bigint[]): Promise<(id: Ref) => HostClient> {
     await this.routes.routeAll(seed);
-    return (id: Id) => {
+    return (id: Ref) => {
+      if (isQualified(id)) return this.#foreignClientFor(parseRef(id).db!);
       const vshard = vshardOf(id);
       const route = this.routes.peek(vshard);
       // A driver's route() is synchronous, so a vshard the cache has never seen cannot be resolved
@@ -212,6 +255,21 @@ export class Hlekk {
       const host = route?.host ?? this.#anyHost();
       return this.#clientFor(host);
     };
+  }
+
+  /** One client per foreign database, built on first use and kept for the life of the isolate. */
+  #foreignClientFor(database: string): HostClient {
+    let client = this.#foreign.get(database);
+    if (!client) {
+      if (this.#openForeign === undefined) {
+        throw new TypeError(
+          `this query reaches ${database}, and no foreign client was configured.` +
+            " Pass `foreign` to `Hlekk.from` with a client factory — `protocol/client.ts` has one over HTTP.",
+        );
+      }
+      this.#foreign.set(database, (client = this.#openForeign(database)));
+    }
+    return client;
   }
 
   #anyHost(): number {
@@ -258,7 +316,7 @@ export class Hlekk {
       const r = this.routes.peek(v);
       if (r) routed.set(v, r.epoch);
     }
-    const reply = await this.#transport.exec(host, plan, tasks, routed);
+    const reply = await this.#absolute(await this.#transport.exec(host, plan, tasks, routed));
     if (reply.refusals.length === 0) return { reads: reply.reads, misses: reply.misses };
     if (depth >= MAX_REROUTES) throw new TooManyReroutes(reply.refusals);
 
@@ -280,6 +338,50 @@ export class Hlekk {
       reads: merge([reply.reads, ...retries.map((r) => r.reads)]),
       misses: [...reply.misses, ...retries.flatMap((r) => r.misses)],
     };
+  }
+
+  /**
+   * The seam. Every alias a host sent back becomes a URI, here and nowhere else.
+   *
+   * A host stores an alias and cannot resolve one; the registry that can is the directory's, and the
+   * coordinator holds it cached for the life of the isolate. So this is the one line where the two
+   * meet, and past it the coordinator sees only references: `targetOf` on an edge gives a `Ref`,
+   * `missOwner` gives a `Ref`, and `#router` dispatches on whether it is qualified. The alias stays
+   * on the edge for ordering alone, because the order an edge list is read in is `(time, db, id2)`
+   * and that is storage, not identity.
+   *
+   * Doing it at the seam rather than at each use is what keeps the rest of the coordinator from
+   * needing to know that aliases exist at all.
+   */
+  async #absolute(reply: ExecReply): Promise<ExecReply> {
+    const foreign =
+      reply.misses.some((m) => m.kind === "object" && m.db) ||
+      reply.reads.lists.some((l) => l.rows.some((e) => e.db !== 0));
+    if (!foreign) return reply;
+
+    const uri = async (alias: number): Promise<string> => {
+      const held = (await this.registry()).byAlias.get(alias);
+      if (held !== undefined) return held;
+      // An alias allocated by another isolate since this one cached the registry. Aliases are
+      // append-only and never repointed, so one re-read is enough and there is nothing to
+      // invalidate; a number still missing after it was never allocated at all.
+      this.#registry = null;
+      const again = (await this.registry()).byAlias.get(alias);
+      if (again === undefined) throw new UnknownAlias(alias);
+      return again;
+    };
+
+    for (const list of reply.reads.lists) {
+      for (const e of list.rows) {
+        if (e.db !== 0) e.target = formatRef(await uri(e.db), e.id2);
+      }
+    }
+    const misses: Miss[] = [];
+    for (const m of reply.misses) {
+      if (m.kind === "object" && m.db) misses.push({ kind: "object", id: formatRef(await uri(m.db), m.id), frame: m.frame });
+      else misses.push(m);
+    }
+    return { ...reply, misses };
   }
 
   // ---- writes

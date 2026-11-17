@@ -1,7 +1,8 @@
 // Stores behind the operators: a host's local data (a stand-in for DO SQLite) and the coordinator's
 // gathered graph. The async driver's store, which reaches the hosts, is in driver.ts.
 
-import { UNKNOWN, edgeOrder, listKey } from "./types.ts";
+import { isQualified } from "./ref.ts";
+import { UNKNOWN, cursorOf, edgeOrder, listKey } from "./types.ts";
 import type { Cursor, Edge, EdgePage, Id, Maybe, Obj, Store } from "./types.ts";
 
 /** One host DO's data. It owns some vshards; everything else is UNKNOWN to it. */
@@ -20,7 +21,7 @@ export class HostData {
 
   putEdge(e: Edge): void {
     const k = listKey(e.id1, e.atype);
-    this.lists.set(k, [...(this.lists.get(k) ?? []), e].sort(edgeOrder));
+    this.lists.set(k, [...(this.lists.get(k) ?? []), e].sort((a, b) => edgeOrder(cursorOf(a), cursorOf(b))));
   }
 }
 
@@ -37,6 +38,7 @@ export class HostStore implements Store {
   }
 
   object(id: Id): Promise<Maybe<Obj | null>> {
+    if (isQualified(id)) return Promise.resolve(UNKNOWN); // another database's object; see SqlStore
     if (!this.host.owns(id)) return Promise.resolve(UNKNOWN);
     // SELECT otype, version, data FROM objects WHERE id = ?
     const o = this.host.objects.get(id) ?? null;
@@ -49,7 +51,9 @@ export class HostStore implements Store {
     // SELECT id2, time, data FROM assocs WHERE id1 = ? AND atype = ? AND (time, id2) < (?, ?)
     // ORDER BY time DESC, id2 DESC LIMIT n + 1 -- the extra row only says whether the list goes on.
     // Read into an array: a cursor must not stay open across an await.
-    const rest = (this.host.lists.get(listKey(id1, atype)) ?? []).filter((e) => after === null || edgeOrder(after, e) < 0);
+    const rest = (this.host.lists.get(listKey(id1, atype)) ?? []).filter(
+      (e) => after === null || edgeOrder(after, cursorOf(e)) < 0,
+    );
     const page: EdgePage = { rows: rest.slice(0, n), complete: rest.length <= n };
     this.#lists.push({ id1, atype, after, ...page });
     return Promise.resolve(page);
@@ -122,7 +126,7 @@ export class Cache {
       return;
     }
     // A continuation joins the known run where its cursor falls inside it.
-    const i = cur.rows.findIndex((e) => edgeOrder(e, after) === 0);
+    const i = cur.rows.findIndex((e) => edgeOrder(cursorOf(e), after) === 0);
     if (i >= 0) {
       const rows = [...cur.rows.slice(0, i + 1), ...s.rows];
       if (s.complete || rows.length > cur.rows.length) this.lists.set(k, { from: cur.from, rows, complete: s.complete });
@@ -154,11 +158,11 @@ export class Cache {
     } else if (
       list.from !== null &&
       edgeOrder(list.from, after) !== 0 &&
-      !list.rows.some((e) => edgeOrder(e, after) === 0)
+      !list.rows.some((e) => edgeOrder(cursorOf(e), after) === 0)
     ) {
       return UNKNOWN;
     }
-    const i = after === null ? 0 : list.rows.findIndex((e) => edgeOrder(after, e) < 0);
+    const i = after === null ? 0 : list.rows.findIndex((e) => edgeOrder(after, cursorOf(e)) < 0);
     const from = i < 0 ? list.rows.length : i;
     const rows = list.rows.slice(from, from + n);
     if (rows.length === 0 && !list.complete) return UNKNOWN;

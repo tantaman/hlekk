@@ -7,6 +7,7 @@ import { UNKNOWN, listKey } from "../query/types.ts";
 import type { Cursor, Edge, EdgePage, Fields, Id, Maybe, Obj, Store } from "../query/types.ts";
 import type { EdgeSegment, ReadSet } from "../query/stores.ts";
 import { fromKey, toKey, vshardOf } from "./ids.ts";
+import { isQualified } from "../query/ref.ts";
 import { formatOf } from "./schema.ts";
 import type { StorageFormat } from "./schema.ts";
 import type { Sql } from "./sql.ts";
@@ -140,6 +141,10 @@ export class SqlStore implements Store {
   }
 
   object(id: Id): Promise<Maybe<Obj | null>> {
+    // A qualified reference read out of a payload by a field relationship. Not here, and not a bad
+    // route either — no vshard of this database could hold it — so it is UNKNOWN with no refusal
+    // recorded, and the coordinator asks the database that does hold it.
+    if (isQualified(id)) return Promise.resolve(UNKNOWN);
     if (!this.owns(id)) return Promise.resolve(UNKNOWN);
     const row = this.sql.all<ObjectRow>(OBJECT, toKey(id))[0];
     const o: Obj | null = row ? { id, otype: row.otype, version: row.version, data: JSON.parse(row.data) as Fields } : null;

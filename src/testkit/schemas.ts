@@ -30,6 +30,16 @@ export interface SchemaOptions {
    *  the delete, which is the design's open question on cross-vshard cascades rather than something a
    *  convergence test should trip over. */
   onDelete?: readonly OnDelete[];
+  /**
+   * How often an edge type is declared as half of an inverse pair. 0.5 by default.
+   *
+   * 0 is what the federation oracle asks for. The catalog refuses `foreign` on an edge type with an
+   * inverse — delivery routes through the host's own client, which is scoped to one database and
+   * never gives up — so a schema of mostly paired types is a schema whose edges mostly cannot cross a
+   * database boundary, and a graph split along the ones that can would collapse into one database.
+   * Inverses and cascades are what the differential oracle covers; crossing is what this one does.
+   */
+  pairs?: number;
 }
 
 /** A field as both a lock spec and a runtime Field, with the values a payload draws from. */
@@ -99,7 +109,11 @@ interface PlannedRel {
 }
 
 /** Adds `types` object types and attempts `edges` edge types, on top of whatever is there already. */
-function grow(r: Random, bp: Blueprint, opts: { types: number; edges: number; spaces: number; rules: readonly OnDelete[] }): void {
+function grow(
+  r: Random,
+  bp: Blueprint,
+  opts: { types: number; edges: number; spaces: number; rules: readonly OnDelete[]; pairs?: number },
+): void {
   const first = bp.short.length;
   for (let i = first; i < first + opts.types; i++) {
     bp.short.push(`T${i}`);
@@ -136,7 +150,7 @@ function grow(r: Random, bp: Blueprint, opts: { types: number; edges: number; sp
     const forward = declare(from, to);
     // A pair, so the outbox has an inverse to carry. Its mirror runs the other way and names it back,
     // which is the only form the catalog accepts.
-    if (r.chance(0.5)) {
+    if (r.chance(opts.pairs ?? 0.5)) {
       const back = declare(to, from);
       forward.inverse = back.name;
       back.inverse = forward.name;
@@ -236,6 +250,7 @@ function blueprint(r: Random, opts: SchemaOptions): Blueprint {
     edges: opts.edges ?? 4 + r.int(5),
     spaces: Math.min(opts.namespaces ?? 1 + r.int(3), types),
     rules: opts.onDelete ?? ["detach", "cascade"],
+    pairs: opts.pairs,
   });
   return bp;
 }

@@ -52,6 +52,19 @@ export interface GraphOptions {
   deletes?: number;
   /** How many edges to take back out. */
   removes?: number;
+  /**
+   * How edge times are drawn. `"pool"`, the default, draws from eight values so ties happen and the
+   * id tie-break is exercised.
+   *
+   * `"distinct"` gives every edge its own time, which the FEDERATION oracle needs: the order an edge
+   * list is read in is `(time, db, id2)`, so at a tie a list with foreign rows in it orders them
+   * ahead of local ones while the same list in one database orders purely by id. That is a stated
+   * property of storage format 2, not a bug — but it means a limit cutting a list mid-tie keeps
+   * different rows on the two layouts, and no normalization of the answers can undo that. Distinct
+   * times make the order total, so the comparison is about what crossing a database boundary does
+   * and not about which of two tied rows a limit kept.
+   */
+  times?: "pool" | "distinct";
 }
 
 export function generateGraph(r: Random, shape: Shape, opts: GraphOptions = {}): Script {
@@ -93,6 +106,7 @@ export function generateGraph(r: Random, shape: Shape, opts: GraphOptions = {}):
   // originate nothing — every pair is written from one side, so the other side's type may have no
   // writable edge at all — and the graph comes out thin.
   const origins = made.map((_, j) => j).filter((j) => writableOut(shape, made[j]).length > 0);
+  const timeOf = (i: number) => (opts.times === "distinct" ? edges - i : r.int(8));
   for (let i = 0; i < edges && origins.length > 0; i++) {
     const from = r.pick(origins);
     const out = writableOut(shape, made[from]);
@@ -105,8 +119,9 @@ export function generateGraph(r: Random, shape: Shape, opts: GraphOptions = {}):
       atype: rel.atype!,
       from,
       to,
-      // A small pool of times, so ties happen and the id tie-break is exercised.
-      time: r.int(8),
+      // A small pool by default, so ties happen and the id tie-break is exercised. See
+      // `GraphOptions.times` for the one oracle that needs them distinct instead.
+      time: timeOf(i),
       data: r.chance(0.3) ? { tag: r.pick(["x", "y"]) } : null,
     });
     written.push({ atype: rel.atype!, from, to });
@@ -210,6 +225,16 @@ export interface QueryOptions {
   depth?: number;
   /** How many relations one level may follow. */
   width?: number;
+  /**
+   * How many levels down a count may be asked for. Unbounded by default; 0 keeps counts on the root
+   * alone.
+   *
+   * The federation oracle asks for 0, because a count below the root is a count of an object's edges
+   * and that object may be in another database — which is a request with `counts`, and PLAN.md step
+   * 6's work. The root is always the asking database's own, so a count there is local whatever the
+   * split did.
+   */
+  countsBelow?: number;
 }
 
 /** A random query from a root type. Loosely typed on purpose: a generated tree cannot be checked
@@ -223,6 +248,7 @@ export function generateQuery(
 ): Query<never, unknown> {
   const depth = opts.depth ?? 3;
   const width = opts.width ?? 2;
+  const countsBelow = opts.countsBelow ?? Infinity;
 
   const build = (q: unknown, type: string, left: number): unknown => {
     let out = q as Record<string, (...a: unknown[]) => unknown>;
@@ -231,7 +257,7 @@ export function generateQuery(
     // Every level carries a limit. A small one, so a filter's read-ahead window matters.
     out = out.limit(1 + r.int(6)) as typeof out;
 
-    if (r.chance(0.5)) {
+    if (r.chance(0.5) && depth - left <= countsBelow) {
       const countable = options.filter((o) => o.atype !== undefined);
       if (countable.length > 0) {
         const c = r.pick(countable);

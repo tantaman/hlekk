@@ -1,6 +1,8 @@
 // Value types shared by the Hlekk query engine: rows, streams, plans, misses and the store seam.
 
 export type Id = string;
+/** A local `Id`, or `<database URI>#<id>`. Re-exported from `ref.ts`, which owns the spelling. */
+export type Ref = string;
 export type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
 export type Fields = { [k: string]: Json };
 
@@ -17,7 +19,19 @@ export interface Edge {
   /** The target's database, as this database's own interned alias: 0 is local. Always 0 on storage
    *  format 1, which has no column for it. See `host/schema.ts`. */
   db: number;
+  /** The target's id IN ITS OWN DATABASE. With `db` it is the whole of the reference, and the two
+   *  together are the storage coordinates an edge list is ordered by. Never a reference on its own:
+   *  see `targetOf`. */
   id2: Id;
+  /**
+   * The reference the target is reached by, absolute once the client has resolved the alias.
+   *
+   * Set only for a foreign edge, and only past the seam in `Hlekk.#exec` where every alias becomes a
+   * URI. A host never sets it — a host stores an alias and cannot resolve one — so its absence on a
+   * foreign row means the seam has not run, which `targetOf` turns into a loud failure rather than a
+   * read of whichever local object shares those bits.
+   */
+  target?: Ref;
   time: number;
   data: Fields | null;
 }
@@ -106,22 +120,45 @@ export class ForeignEdge extends Error {
 }
 
 /**
- * An edge's target as one of this database's ids, throwing on a foreign one.
+ * The reference an edge's target is reached by: a bare id for a local one, and the absolute
+ * reference for a foreign one.
  *
- * The two alternatives are both worse than a throw, which is why this is not a filter. Dropping a
- * foreign edge would read as a dangling reference, so a database that holds the reference and a
- * database that does not would answer identically — and the whole point of storing it is that the
- * reference exists. Loading it by number would return whichever LOCAL object happens to share those
- * 47 bits, which is an answer about the wrong object with nothing to mark it as one.
- *
- * Step 4 replaces this: a host sends a foreign row back as a miss carrying the alias, and the
- * coordinator resolves the alias to a URI and asks that database. Every call site here is a site
- * that step touches.
+ * Throws on a foreign edge the seam has not resolved. The two alternatives are both worse than a
+ * throw, which is why this is not a fallback. Dropping the edge would read as a dangling reference,
+ * so a database that holds the reference and one that does not would answer identically — and the
+ * whole point of storing it is that the reference exists. Loading it by its low half would return
+ * whichever LOCAL object happens to share those 47 bits, which is an answer about the wrong object
+ * with nothing to mark it as one.
  */
-export function localId(e: Edge): Id {
-  if (e.db !== 0) throw new ForeignEdge(e);
-  return e.id2;
+export function targetOf(e: Edge): Ref {
+  if (e.db === 0) return e.id2;
+  if (e.target === undefined) throw new ForeignEdge(e);
+  return e.target;
 }
+
+/** The storage coordinates an edge list is ordered by. Separate from `targetOf` because the order is
+ *  `(time, db, id2)` and `id2` is the target's id in its own database, never the reference: a cursor
+ *  carries what the responder's own `ORDER BY` compares. */
+export const cursorOf = (e: Edge): Cursor => ({ time: e.time, db: e.db, id2: e.id2 });
+
+/**
+ * The otype of a row that is a reference rather than an object.
+ *
+ * A database answering a read never follows an edge into another database, or it becomes the deputy
+ * `docs/protocol.md` rules out. What it does instead is list the reference and load nothing, which
+ * needs a row whose only true field is its id — this is how such a row says so. Catalog otypes are
+ * allocated from 1 upwards, so a negative one belongs to no type in any catalog and `catalog.object`
+ * answers undefined for it, which is what keeps it from being named in an answer.
+ */
+export const REFERENCE = -1;
+
+export const isReference = (o: Obj): boolean => o.otype === REFERENCE;
+
+/** A row that is an unfollowed reference. */
+export const referenceRow = (ref: Ref, edge: Edge): Row => ({
+  obj: { id: ref, otype: REFERENCE, version: 0, data: {} },
+  edge,
+});
 
 /** One read of an edge list: up to n edges after a cursor. complete: no edges follow them. */
 export interface EdgePage {
@@ -166,20 +203,26 @@ export type Cond =
 /** Something a pass needed and its store didn't have. A host's misses are the frontier it sends back;
  *  the coordinator sends the same shapes to hosts as tasks. */
 export type Miss =
-  | { kind: "object"; id: Id; frame: number } // load id as a row of `frame`, prefetching below it
+  /** Load id as a row of `frame`, prefetching below it. `db` is set only by a host that met an edge
+   *  into another database and cannot resolve the alias; the seam in `Hlekk.#exec` replaces the pair
+   *  with an absolute reference, so past that line a miss carries a `Ref` and no alias. */
+  | { kind: "object"; id: Ref; db?: number; frame: number }
   | { kind: "edges"; id1: Id; atype: number; frame: number; after: Cursor | null; n: number } // a page; its targets as rows of `frame`
   | { kind: "count"; id1: Id; atype: number };
 
 /** Names the data a miss asks for. Objects key by id alone: the first frame to ask decides what the
  *  host prefetches below the object. */
 export function missKey(m: Miss): string {
-  if (m.kind === "object") return `o:${m.id}`;
+  // The alias is part of the key while it is still there: before the seam runs, a foreign target and
+  // a local object can have the same low half, and one key for both would drop one of them.
+  if (m.kind === "object") return m.db ? `o:${m.db}:${m.id}` : `o:${m.id}`;
   if (m.kind === "count") return `c:${listKey(m.id1, m.atype)}`;
   return `e:${listKey(m.id1, m.atype)}:${m.after ? `${m.after.time}:${m.after.db}:${m.after.id2}` : "head"}`;
 }
 
-/** The id whose vshard holds the data, so its host is the one to ask. */
-export const missOwner = (m: Miss): Id => (m.kind === "object" ? m.id : m.id1);
+/** The reference whose holder is the one to ask: a local id, whose vshard names a host, or a
+ *  qualified reference, whose prefix names a database. */
+export const missOwner = (m: Miss): Ref => (m.kind === "object" ? m.id : m.id1);
 
 /** Reads, as promises. A host's DO SQLite settles at once, and so does the round driver's view of the
  *  gathered graph, which answers UNKNOWN for gaps. The async driver's store waits on the owning host

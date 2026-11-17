@@ -1,10 +1,11 @@
 // The coordinator's two drivers, rounds and async, and a host's handler for one batch of tasks.
 
 import { Pass, drain, materialize } from "./ops.ts";
+import type { Foreign } from "./ops.ts";
 import { Cache, CacheStore } from "./stores.ts";
 import type { ReadSet } from "./stores.ts";
-import { UNKNOWN, localId, missKey, missOwner } from "./types.ts";
-import type { Cursor, EdgePage, Id, Json, Maybe, Miss, Obj, Plan, Store } from "./types.ts";
+import { UNKNOWN, missKey, missOwner, targetOf } from "./types.ts";
+import type { Cursor, EdgePage, Id, Json, Maybe, Miss, Obj, Plan, Ref, Store } from "./types.ts";
 
 export interface HostReply {
   reads: ReadSet;
@@ -25,7 +26,9 @@ export interface LocalStore extends Store {
  *  read settles at once, so the batch runs to completion before the DO takes another event: one
  *  snapshot, and no SQL cursor open across real I/O. */
 export async function hostExec(store: LocalStore, plan: Plan, tasks: Miss[]): Promise<HostReply> {
-  const p = new Pass(store, plan);
+  // "miss": a host cannot follow an edge out of its own database, so it reports one and prefetches
+  // nothing below it.
+  const p = new Pass(store, plan, "miss");
   await Promise.all(tasks.map((t) => runTask(p, store, t)));
   await p.settle(); // speculative reads too, so what the reply holds doesn't depend on timing
   return { reads: store.reads(), misses: p.misses };
@@ -41,7 +44,17 @@ async function runTask(p: Pass, store: LocalStore, t: Miss): Promise<void> {
   // target doesn't stop the prefetch below the others. The coordinator judges membership.
   const page = await store.edges(t.id1, t.atype, t.after, t.n, t.frame);
   if (page === UNKNOWN) return;
-  await Promise.all(page.rows.map((e) => drain(p.rowOp(t.frame).fetch(p, { ids: [localId(e)] }))));
+  await Promise.all(
+    page.rows.map((e) => {
+      // A host cannot follow an edge out of its own database, so it reports the row and prefetches
+      // nothing below it. The alias rides along because only the client can resolve it.
+      if (e.db !== 0) {
+        p.miss({ kind: "object", id: e.id2, db: e.db, frame: t.frame });
+        return Promise.resolve();
+      }
+      return drain(p.rowOp(t.frame).fetch(p, { ids: [targetOf(e)] }));
+    }),
+  );
 }
 
 export const MAX_ROUNDS = 16;
@@ -67,15 +80,16 @@ export interface Stats {
 export async function runRounds(
   plan: Plan,
   rootIds: Id[],
-  route: (id: Id) => HostClient,
+  route: (id: Ref) => HostClient,
   stats: Stats = { rounds: 0, requests: 0 },
+  foreign: Foreign = "follow",
 ): Promise<Answer> {
   const cache = new Cache();
   let tasks: Miss[] = rootIds.map((id) => ({ kind: "object", id, frame: 0 }));
   for (;;) {
     tasks = outstanding(tasks, cache);
     if (tasks.length === 0) {
-      const p = new Pass(new CacheStore(cache), plan);
+      const p = new Pass(new CacheStore(cache), plan, foreign);
       const out = await materialize(p.frameOp(0).fetch(p, { ids: rootIds }));
       if (out !== UNKNOWN) return { rows: out, graph: cache };
       await p.settle();
@@ -123,12 +137,13 @@ function outstanding(tasks: Miss[], cache: Cache): Miss[] {
 export async function runAsync(
   plan: Plan,
   rootIds: Id[],
-  route: (id: Id) => HostClient,
+  route: (id: Ref) => HostClient,
   stats: Stats = { rounds: 0, requests: 0 },
   defer: (f: () => void) => void = (f) => setTimeout(f, 0),
+  foreign: Foreign = "follow",
 ): Promise<Answer> {
   const store = new LoaderStore(plan, route, defer, stats);
-  const p = new Pass(store, plan);
+  const p = new Pass(store, plan, foreign);
   const out = await materialize(p.frameOp(0).fetch(p, { ids: rootIds }));
   if (out === UNKNOWN) throw new Error("ended short over a store that never answers UNKNOWN");
   return { rows: out, graph: store.cache };
@@ -140,13 +155,13 @@ export async function runAsync(
 export class LoaderStore implements Store {
   readonly cache = new Cache();
   readonly #plan: Plan;
-  readonly #route: (id: Id) => HostClient;
+  readonly #route: (id: Ref) => HostClient;
   readonly #defer: (f: () => void) => void;
   readonly #stats: Stats;
   readonly #open = new Map<HostClient, { tasks: Miss[]; reply: Promise<void> }>();
   readonly #inflight = new Map<string, Promise<void>>();
 
-  constructor(plan: Plan, route: (id: Id) => HostClient, defer: (f: () => void) => void, stats: Stats) {
+  constructor(plan: Plan, route: (id: Ref) => HostClient, defer: (f: () => void) => void, stats: Stats) {
     this.#plan = plan;
     this.#route = route;
     this.#defer = defer;
