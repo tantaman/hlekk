@@ -5,8 +5,12 @@ Nov 17, 2026 · @Matt Wonlaw
 From one database to a graph of them. The first seven steps of this plan are built: a reference has
 one spelling, the protocol is on HTTP, a foreign edge is stored, a read follows one and keeps going
 inside the database it reaches, requests are signed and keys are pinned, and there is a normative
-spec with a conformance suite and a package. What is left is step 8, which is product on top of the
-standard.
+spec with a conformance suite and a package.
+
+Step 8 was hosting and an agent surface. Two decisions taken after step 7 — **one deployment is one
+database**, and **reads are public by default** — remove most of it, and §8 below records what it was
+and why it is not that. What is left is deploying what exists, which needs an account rather than a
+decision.
 
 [`docs/design.md`](docs/design.md) owns the engine. [`docs/global-ids.md`](docs/global-ids.md) owns
 how a reference into another database is stored and named, and
@@ -86,30 +90,66 @@ Two more were settled while building, and belong in this table for the same reas
 | --- | --- |
 | An unknown member of a request | Refused. A caller that cannot tell whether its field took effect is the thing `at` exists to prevent, so a new optional member is a new wire version |
 | A signature a responder cannot verify | Refused, including by a responder that verifies none and says so in its descriptor. A caller reads the descriptor and does not sign to a keyless database |
+| How many databases a deployment serves | **One.** A Durable Object's env comes from the deployment that defines its namespace, so a Worker holding two names gets one set of hosts and not two databases — measured on workerd. Density traded for separate namespaces, separate limits and a blast radius of one |
+| Whether a mounted database is readable | **Public by default**, because the protocol exists so a database can be read by another and one that answers nothing is not participating. Safe because mounting the handler is the act of exposure, which is only true while no layer mounts one automatically |
 
-## 8. Hosting and the agent surface
+## 8. What is left, after two decisions
 
-Milestone C. The least specified step, and deliberately last: it is product on top of the standard,
-and the standard is now done.
+Step 8 was "hosting and the agent surface", and it was four bullets. Two decisions taken after step 7
+remove three of them, so what it was is recorded here along with why it is not that any more.
 
-- **Many databases in one deployment.** The database's name comes from the request path instead of
-  `HLEKK_DATABASE`. Host and directory names are already scoped by database, so the namespaces can
-  hold many. What has to change is that a Durable Object learns its database from the call that first
-  reaches it and records it, where today it reads its own configuration.
-- **A database that costs nothing until its first write.** `global-ids.md` needs this for "create as
-  many as you like", and a URI is already mintable before the database behind it exists. Today
-  `Directory.open` assigns a first batch of 64 vshards and a host, so an empty database is ~2 KB and
-  two Durable Objects rather than nothing.
-- **Who may write.** Principle 10 keeps the engine's caller trusted, so this is a layer above it: an
-  owner credential per database, set at creation, required for writes and for reads outside the
-  protocol. `src/worker/guard.ts` is the shape of it for operator routes; this is the same idea per
-  database rather than per deployment.
-- **The agent surface.** The read protocol is already usable by an agent as plain HTTP, and
-  `/vocabulary` describes each database. Creation, schema changes, writes and links need tools. An
-  MCP server over the hosting layer is the proposal, and its shape was deliberately left until step 7
-  was done. It is now, so this is the decision to make next — and it is a product decision rather
-  than one this plan can settle: what an agent may create, under whose credential, and what it is
-  billed.
+**One deployment is one database.** Not a limitation worked around but the arrangement, and it was
+always the conclusion rather than the starting assumption: a Durable Object's env comes from the
+deployment that defines its namespace and never from whoever called it, so a Worker holding two
+database names does not get two databases — it gets one set of hosts that the second database's
+directory adopts vshards on and one set of map chunks the second publishes over the first's. That was
+tried, and workerd reported it as `indexLookup: host does not hold index vshard 155` with two
+"databases" sharing all 43 hosts (`src/worker/wiki-app.ts`).
+
+What is given up is density, and what is kept is the stronger thing: separate Durable Object
+namespaces, separate KV, separate account limits, and a blast radius of exactly one database. The
+database prefix on DO names and KV keys stays, because it costs nothing and lets a second deployment
+share the namespaces rather than needing its own.
+
+**Reads are public by default.** The protocol exists so that one database can be read by another, and
+a database that answers nothing is not participating in it — so readable is the state that makes the
+thing work, and a responder narrows from there with a `Policy` per request and a projection over what
+it exposes at all. What makes that safe is that mounting the handler is the act of exposure: a
+database that exists and is not mounted is reachable by nobody.
+
+The hazard is recorded in `src/query/serve.ts` beside the default rather than guarded against:
+anything that mounts the handler for a database *automatically* inverts the argument, because then
+nobody chose to expose it. That would be a hosting layer, and there is not going to be one — which is
+the same decision as the first, read from the other end. If that ever changes, the default is the
+first thing that has to.
+
+### What those two decisions removed
+
+- ~~**Many databases in one deployment.**~~ Out. It has no subject: one deployment is one database.
+  The mechanism it needed — a Durable Object learning its database from the first call that reaches it
+  rather than from its own configuration — is not built and is not wanted.
+- ~~**A database that costs nothing until its first write.**~~ Out. `global-ids.md` wanted it for
+  "create as many as you like", and creating one is now a deployment, so the ~2 KB floor of a
+  directory and 64 vshard rows is not a figure anybody multiplies by a trillion. The reasoning in
+  that document stands as the reasoning for a service nobody is running.
+- ~~**The agent surface, as an MCP server.**~~ Out as a proposal; what it was for is already there.
+  The read protocol is plain HTTP an agent can call, and it is a better agent interface than a wrapper
+  would be because it was designed for an untrusted caller rather than for a model: `GET {db}` states
+  the limits, `GET {db}/vocabulary` states the types and their fields, `/price` says what a read costs
+  before it is spent, and a refusal carries `at` so a wrong request corrects itself. The one thing an
+  MCP server would have bought is credential custody on a WRITE surface — and with one deployment per
+  database there is no public write surface to hold a credential for.
+
+### What is actually left
+
+**Writes stay the owner's.** Principle 10 keeps the engine's caller a trusted server, and with one
+deployment per database that is the application's own client behind whatever the application already
+has. The demo Workers' operator routes are closed behind `HLEKK_ADMIN_TOKEN` and refuse everything
+while it is unset. So the third bullet — an owner credential per database — is a deployment concern
+that is already met at the deployment level, and there is nothing per-database to add.
+
+**The deployments.** Everything under *Left out of steps 1–7* below, which is the real remaining work
+and needs an account rather than a decision.
 
 ## Deliberately not in this plan
 

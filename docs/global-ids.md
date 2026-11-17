@@ -308,7 +308,12 @@ A links to it. Local IDs are sequential and so guessable, which is fine under pr
 fine across a boundary. That permission system has to live in the infrastructure, and **this is the
 principle the idea actually breaks.** Entropy in an identifier is not a substitute for it.
 
-**"Trillions of databases" is not an ID question.** 40 bits covers a trillion. What does not is
+**"Trillions of databases" is not an ID question**, and is now not a question at all: one deployment
+serves one database ([`../PLAN.md`](../PLAN.md) §8), so nobody multiplies an empty one by anything.
+The arithmetic below stands as the reasoning for a service that is not being run, and is kept because
+it is the argument for why a URI rather than an allocated identifier — which does not depend on the
+service existing, and matters more without it. Every deployment is independent, so a URI is the only
+name there could be. 40 bits covers a trillion. What does not is
 already open in design.md: classic KV caps namespaces at 1,000, the map's one-namespace-keyed-by-
 database arrangement works because "a hosted multi-tenant deployment would not" have few databases,
 and KV Instant's envelope is 1 MB *per namespace* over at most 10,000 keys. Alongside it sits idle

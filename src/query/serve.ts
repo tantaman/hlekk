@@ -61,7 +61,24 @@ export interface Policy {
   cache(): Cacheability;
 }
 
-/** Everything exposed, reusable by anyone. For a database serving public data, and for tests. */
+/**
+ * Everything exposed, reusable by anyone — and the DEFAULT, which is a decision rather than a
+ * convenience.
+ *
+ * The protocol exists so that one database can be read by another. A database that answers nothing
+ * is not participating in it, so "readable" is the state that makes the thing work and the one to
+ * start from; a responder narrows from there, with a `Policy` per request and a projection over what
+ * it exposes at all.
+ *
+ * What makes the default safe is that **mounting the handler is the act of exposure**. A database
+ * that exists and is not mounted is reachable by nobody: the protocol does not turn itself on, and
+ * one deployment serves one database that somebody deliberately put on a route.
+ *
+ * The hazard, stated rather than guarded: anything that mounts the handler for a database
+ * AUTOMATICALLY inverts that argument, because then nobody chose to expose it. That would be a
+ * hosting layer creating databases on request, which is not what is being built — one deployment is
+ * one database. If that ever changes, this default is the first thing that has to.
+ */
 export const PUBLIC: Policy = {
   object: () => true,
   count: () => true,

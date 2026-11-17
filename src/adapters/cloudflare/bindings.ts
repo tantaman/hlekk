@@ -67,7 +67,15 @@ export interface Env {
   HLEKK_HOSTS: Namespace;
   HLEKK_DIRECTORY: Namespace;
   HLEKK_MAP: Kv;
-  /** Scopes DO names, so one namespace can hold many databases. */
+  /**
+   * This deployment's database. One deployment serves one database, by decision: a Durable Object's
+   * env comes from the deployment that defines its namespace and never from whoever called it, so a
+   * Worker holding two names does not get two databases — it gets one set of hosts that the second
+   * database's directory adopts vshards on. That was tried; see `worker/wiki-app.ts`.
+   *
+   * It still scopes the DO names and the map's KV keys, which costs nothing and means a second
+   * deployment can share the namespaces rather than needing its own.
+   */
   HLEKK_DATABASE?: string;
   /**
    * The canonical URI this database is linked to by, for the cross-database protocol.

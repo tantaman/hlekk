@@ -80,10 +80,27 @@ implementation under test would be checking that the implementation agrees with 
 - **Backlinks across databases.** A subscription protocol with its own threat model.
 - **A global directory of databases.** A URI is the name and DNS arbitrates it. Discovery is not
   identity.
+- **Many databases in one deployment.** One deployment serves one database, by decision rather than
+  by accident — a Durable Object's env comes from the deployment that defines its namespace, so a
+  Worker holding two names gets one set of hosts and not two databases. What that gives up is
+  density; what it keeps is separate namespaces, separate limits, and a blast radius of exactly one.
 - **A permission model above the engine.** Principle 10 keeps the engine's caller trusted, which
-  holds inside one database owned by one application and is false the moment arbitrary agents create
-  databases and link between them. `docs/global-ids.md` says so plainly; it is the principle the
-  design actually breaks, and it is not fixed here.
+  holds inside one database owned by one application — which is the arrangement above — and would be
+  false the moment arbitrary agents created databases and linked between them. `docs/global-ids.md`
+  says so plainly; it is the principle the design would actually break, and the answer here is not to
+  break it.
+
+## Two defaults worth knowing
+
+- **A mounted database is publicly readable.** The protocol exists so a database can be read by
+  another, and one that answers nothing is not participating in it, so that is where a responder
+  starts and it narrows from there — a `Policy` per request, and a projection over what it exposes at
+  all. What makes it safe is that **mounting the handler is the act of exposure**: a database that
+  exists and is not mounted is reachable by nobody. `src/query/serve.ts` records the one thing that
+  would invert that argument.
+- **Writes are nobody's but yours.** There is no write operation in the protocol and there is not
+  going to be one. Writing is your own client, inside your own deployment, behind whatever you
+  already have.
 
 ## Contributing
 

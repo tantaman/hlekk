@@ -68,7 +68,8 @@ export interface Binding {
   catalog: Catalog;
   source: ReadSource;
   surface: Surface;
-  /** The policy for every caller alike. `policyFor` overrides it per caller. */
+  /** The policy for every caller alike, defaulting to `PUBLIC` — see its own note for why reads are
+   *  public by default and what that rests on. `policyFor` overrides it per caller. */
   policy?: Policy;
   /**
    * The policy for one caller, and whether this database distinguished it.
