@@ -82,14 +82,18 @@ export class Repudiated extends Error {
   }
 }
 
-/** A read this step does not build. Step 6 turns a list or a count that lives elsewhere into a
- *  one-hop request; until then it is named rather than silently answered as empty. */
+/**
+ * A read this client cannot turn into a request, named rather than answered as empty.
+ *
+ * Objects, lists and counts in another database are all fetched. What is left are the two things
+ * that cannot be asked for at all: an edge type whose name this catalog does not have, since the
+ * wire carries names and not integers; and a continuation of a foreign list by this database's own
+ * sort key, since only the responder's token can place a page in a list whose hidden rows it
+ * dropped. An empty list for either would be a wrong answer wearing a right one's clothes.
+ */
 export class NotFollowed extends Error {
   constructor(database: string, what: string) {
-    super(
-      `${what} lives in ${database}, and only objects are fetched across a database boundary yet.` +
-        " A list or a count in another database is PLAN.md step 6.",
-    );
+    super(`${what}: ${database} holds it, and this is not a read that can be asked for`);
     this.name = "NotFollowed";
   }
 }
@@ -112,7 +116,7 @@ export interface ForeignOptions {
   /** Refuses a URI before it is reached, where the platform can tell. See `adapters/node/guard.ts`. */
   guard?: (database: string) => Promise<void>;
   /** Collects what could not be reached instead of failing the query. Absent, a failure throws,
-   *  which is the default `docs/../PLAN.md` proposes and the one this leaves reversible. */
+   *  which is the default [`PLAN.md`](../../PLAN.md) settled on and the one this leaves reversible. */
   omit?: Omitted;
   /**
    * The asking database's own URI, when it has one.
