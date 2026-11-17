@@ -10,10 +10,11 @@
 // A `Plan` never crosses the wire in either direction — see `request.ts` for why.
 
 import type { Catalog } from "../catalog/catalog.ts";
+import { parseId } from "../host/ids.ts";
 import { decodeCursor } from "../schema/query.ts";
 import { normalize } from "./normalize.ts";
 import type { ListEntry, QueryResult } from "./normalize.ts";
-import { DEFAULT_HOP_LIMIT, DEFAULT_LIMITS, Refused, check, countEdge } from "./request.ts";
+import { DEFAULT_HOP_LIMIT, DEFAULT_LIMITS, REQUEST_MEMBERS, Refused, check, countEdge } from "./request.ts";
 import type { Cmp, Cost, CountSpec, Hop, Limits, Request, Vocabulary } from "./request.ts";
 import type { Cond, Frame, Id, Plan, Source } from "./types.ts";
 
@@ -313,10 +314,29 @@ export const MAX_IDS = 100;
  */
 export function price(req: ReadRequest, opts: ServeOptions): Cost {
   const { vocabulary, limits = DEFAULT_LIMITS, maxIds = MAX_IDS } = opts;
+  if (req === null || typeof req !== "object") throw new Refused("query", "expected an object");
+  // The entry is this protocol's, so the set of members is known here and not in `check`, which is
+  // shared with callers that enter from something else.
+  for (const name of Object.keys(req)) {
+    if (!(REQUEST_MEMBERS as readonly string[]).includes(name)) {
+      throw new Refused("query", `no such member "${name}"; a read takes ${REQUEST_MEMBERS.join(", ")}`);
+    }
+  }
   const ids = req?.ids;
   if (!Array.isArray(ids) || ids.length === 0) throw new Refused("ids", "at least one id is required");
   if (ids.length > maxIds) throw new Refused("ids", `${ids.length} ids, the maximum is ${maxIds}`);
-  if (ids.some((id) => typeof id !== "string")) throw new Refused("ids", "every id must be a decimal string");
+  for (const [i, id] of ids.entries()) {
+    if (typeof id !== "string") throw new Refused("ids", `ids[${i}] must be a decimal string`);
+    // Parsed, not merely typed. The entry is the one part of a request that is not a name from the
+    // vocabulary, so it is also the one part whose shape nothing else checks — and an id that is a
+    // string but not an id reaches a key conversion inside the engine, which is a fault reported as
+    // "this database broke" rather than as "that is not an id".
+    try {
+      parseId(id);
+    } catch (e) {
+      throw new Refused("ids", `ids[${i}] is not an id: ${(e as Error).message}`);
+    }
+  }
   return check(req, vocabulary, limits, ids.length);
 }
 

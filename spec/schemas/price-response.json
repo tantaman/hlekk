@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hlekk.dev/spec/schemas/price-response.json",
+  "title": "POST {db}/price \u2014 the answer",
+  "description": "What the read would cost, with nothing read. The same arithmetic as the read reports, because there is one implementation of it and both routes call it.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "cost": {
+      "type": "object",
+      "properties": {
+        "frames": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "nodes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "frames",
+        "nodes"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "v",
+    "cost"
+  ],
+  "additionalProperties": false
+}

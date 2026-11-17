@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    // The sources import each other with `.ts`, which is what lets Node run them directly and the
+    // suite need no build step at all. This rewrites those to `.js` on the way out, so the emitted
+    // package resolves without the consumer needing the same flag.
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts", "src/query/demo.ts"]
+}

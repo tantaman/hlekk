@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hlekk.dev/spec/schemas/read-request.json",
+  "title": "POST {db}/read and POST {db}/price \u2014 the request",
+  "description": "A TREE, never a plan. A hop holds its children, so there is no frame index for a caller to get wrong and no way to name an ancestor and build a cycle \u2014 both of which are reachable in a plan a caller writes. Its cost is computable from this text before any I/O.",
+  "type": "object",
+  "properties": {
+    "ids": {
+      "description": "The objects the read enters from, as this database's own ids. The entry is ids and only ids: a reference into another database IS an id, since that is what an edge stores.",
+      "type": "array",
+      "items": {
+        "$ref": "common.json#/$defs/id"
+      },
+      "minItems": 1
+    },
+    "counts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/countSpec"
+      }
+    },
+    "hops": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/hop"
+      }
+    }
+  },
+  "required": [
+    "ids"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "countSpec": {
+      "description": "An edge name, or the alias the result should carry its count under.",
+      "oneOf": [
+        {
+          "$ref": "common.json#/$defs/typeName"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "as": {
+              "type": "string",
+              "minLength": 1
+            },
+            "edge": {
+              "$ref": "common.json#/$defs/typeName"
+            }
+          },
+          "required": [
+            "as",
+            "edge"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "hop": {
+      "type": "object",
+      "properties": {
+        "as": {
+          "description": "The name this hop's result appears under. The edge's name by default.",
+          "type": "string",
+          "minLength": 1
+        },
+        "edge": {
+          "$ref": "common.json#/$defs/typeName"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "after": {
+          "description": "A continuation this database handed back in an earlier answer. Opaque to the caller.",
+          "type": "string",
+          "minLength": 1
+        },
+        "where": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/cmp"
+          }
+        },
+        "counts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/countSpec"
+          }
+        },
+        "hops": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/hop"
+          }
+        }
+      },
+      "required": [
+        "edge"
+      ],
+      "additionalProperties": false
+    },
+    "cmp": {
+      "type": "object",
+      "properties": {
+        "field": {
+          "type": "string",
+          "minLength": 1
+        },
+        "op": {
+          "enum": [
+            "=",
+            "!=",
+            "<",
+            "<=",
+            ">",
+            ">="
+          ]
+        },
+        "value": {}
+      },
+      "required": [
+        "field",
+        "op",
+        "value"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

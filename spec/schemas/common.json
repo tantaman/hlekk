@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hlekk.dev/spec/schemas/common.json",
+  "title": "Shapes every hlekk protocol body is built from",
+  "$defs": {
+    "id": {
+      "title": "A local object id",
+      "description": "An unsigned 64-bit integer as a bare decimal string, below 2^63. Relative to the database that answered.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "maxLength": 19
+    },
+    "reference": {
+      "title": "A reference",
+      "description": "A local id, or a canonical database URI, '#', and that database's own local id.",
+      "type": "string",
+      "pattern": "^((0|[1-9][0-9]*)|https?://[^#]+#(0|[1-9][0-9]*))$",
+      "maxLength": 532
+    },
+    "database": {
+      "title": "A canonical database URI",
+      "description": "https, lowercase host as A-labels, no userinfo, no default port, no trailing slash, no query, no fragment. http only for a loopback host, for development.",
+      "type": "string",
+      "pattern": "^https?://[^?#]*$",
+      "maxLength": 512
+    },
+    "typeName": {
+      "title": "An object or edge type name",
+      "description": "A name, never the catalog's integer: integers are allocated per database and mean nothing to a caller.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "cost": {
+      "title": "What a request was priced at",
+      "type": "object",
+      "properties": {
+        "frames": { "type": "integer", "minimum": 1 },
+        "nodes": { "description": "The upper bound on answer nodes.", "type": "integer", "minimum": 0 }
+      },
+      "required": ["frames", "nodes"],
+      "additionalProperties": false
+    },
+    "cacheability": {
+      "title": "How much of an answer the caller may keep",
+      "description": "Stated by the responder because only the responder knows its own enforcement granularity.",
+      "type": "object",
+      "properties": {
+        "reuse": { "enum": ["never", "caller", "public"] },
+        "seconds": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["reuse"],
+      "additionalProperties": false
+    },
+    "refusal": {
+      "title": "A refused request",
+      "description": "The body of a 400, 401, 403 or 413. `at` is a path into the submitted request, so a caller can correct the part that was wrong instead of retrying blind.",
+      "type": "object",
+      "properties": {
+        "error": { "type": "string", "minLength": 1 },
+        "at": { "type": "string" },
+        "offset": { "description": "For a request submitted as text, where to put the caret.", "type": "integer", "minimum": 0 }
+      },
+      "required": ["error"],
+      "additionalProperties": false
+    },
+    "key": {
+      "title": "A published signing key",
+      "type": "object",
+      "properties": {
+        "id": { "description": "The base64url SHA-256 of the key, so an id is a fact about the key and not a claim.", "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "alg": { "const": "ed25519" },
+        "key": { "description": "The raw 32-byte public key, base64url, unpadded.", "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "signedBy": {
+          "description": "A signature by the key this one replaces, over this one, so a holder of the old pin can walk forward.",
+          "type": "object",
+          "properties": {
+            "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+            "signature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{86}$" }
+          },
+          "required": ["id", "signature"],
+          "additionalProperties": false
+        },
+        "retired": { "description": "When it stopped being the current key.", "type": "integer" }
+      },
+      "required": ["id", "alg", "key"],
+      "additionalProperties": false
+    }
+  }
+}

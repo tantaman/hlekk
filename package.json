@@ -3,24 +3,74 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "demo": "node src/query/demo.ts",
-    "typecheck": "tsc -p .",
-    "test": "node --test \"src/**/*.test.ts\"",
-    "smoke": "node scripts/smoke.mjs",
     "app": "node scripts/app.mjs",
     "app:dev": "wrangler dev --config wrangler.app.jsonc",
-    "ingest:local": "node scripts/ingest-local.ts",
-    "ingest:deployed": "node scripts/ingest-deployed.ts",
-    "wiki:deploy": "wrangler deploy --config wrangler.wiki.jsonc",
-    "og": "node scripts/make-og.mjs",
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
     "conformance": "node scripts/conformance.mjs",
+    "conformance:fixture": "node scripts/conformance-fixture.mjs",
     "conformance:node": "node scripts/conformance-node.mjs",
+    "demo": "node src/query/demo.ts",
+    "ingest:deployed": "node scripts/ingest-deployed.ts",
+    "ingest:local": "node scripts/ingest-local.ts",
+    "og": "node scripts/make-og.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "test": "node --test \"src/**/*.test.ts\"",
     "test:format1": "HLEKK_STORAGE_FORMAT=1 node --test \"src/**/*.test.ts\"",
-    "test:formats": "npm test && npm run test:format1"
+    "test:formats": "npm test && npm run test:format1",
+    "typecheck": "tsc -p .",
+    "wiki:deploy": "wrangler deploy --config wrangler.wiki.jsonc"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
     "typescript": "^7.0.2",
     "wrangler": "^4.156.0"
+  },
+  "version": "0.1.0",
+  "description": "A graph database you can run yourself, and a protocol that lets two of them be read in one query.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tantaman/hlekk.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist",
+    "spec",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schema": {
+      "types": "./dist/schema/index.d.ts",
+      "default": "./dist/schema/index.js"
+    },
+    "./catalog": {
+      "types": "./dist/catalog/catalog.d.ts",
+      "default": "./dist/catalog/catalog.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol/index.d.ts",
+      "default": "./dist/protocol/index.js"
+    },
+    "./adapters/node": {
+      "types": "./dist/adapters/node/index.d.ts",
+      "default": "./dist/adapters/node/index.js"
+    },
+    "./adapters/cloudflare": {
+      "types": "./dist/adapters/cloudflare/index.d.ts",
+      "default": "./dist/adapters/cloudflare/index.js"
+    },
+    "./testkit": {
+      "types": "./dist/testkit/index.d.ts",
+      "default": "./dist/testkit/index.js"
+    }
   }
 }

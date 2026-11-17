@@ -1,0 +1,49 @@
+# Typecheck, the suite on both storage formats, and the conformance suite against the published
+# fixture. Nothing here needs an account: the Node adapter is a directory of files and a port, which
+# is the whole argument for its existing.
+
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # node:sqlite and WebCrypto's Ed25519, both of which the engine uses with no dependency.
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Both formats. A database created before `assocs` gained the target's database still has to
+      # answer everything a new one does, and the only way that stays true is by being checked.
+      - name: Test, storage format 2
+        run: npm test
+
+      - name: Test, storage format 1
+        run: npm run test:format1
+
+      # Black box, against this repository's own Node adapter over a real socket. The suite imports
+      # nothing from src/, so this is the same run someone else's database would get.
+      - name: Conformance, no fixture
+        run: npm run conformance:node
+
+      - name: Conformance, against the published fixture
+        run: npm run conformance:fixture
+
+      - name: Build
+        run: npm run build

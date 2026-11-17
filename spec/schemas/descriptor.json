@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hlekk.dev/spec/schemas/descriptor.json",
+  "title": "GET {db} \u2014 the descriptor",
+  "description": "What a caller reads before it sends anything: the protocol versions, the keys and the limits. Public and unsigned, because verifying it would need the key it carries.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "protocol": {
+      "const": "hlekk"
+    },
+    "wire": {
+      "description": "Wire versions this database speaks, newest last.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "minItems": 1
+    },
+    "database": {
+      "$ref": "common.json#/$defs/database"
+    },
+    "catalog": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "maxDepth": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxLimit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxFrames": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxNodes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxCounts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxWhere": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxIds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxBody": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "maxDepth",
+        "maxLimit",
+        "maxFrames",
+        "maxNodes",
+        "maxCounts",
+        "maxWhere",
+        "maxIds",
+        "maxBody"
+      ],
+      "additionalProperties": false
+    },
+    "keys": {
+      "description": "Empty means this database authenticates nobody, which a caller must be able to tell from one that does and did not say so.",
+      "type": "array",
+      "items": {
+        "$ref": "common.json#/$defs/key"
+      }
+    },
+    "routes": {
+      "type": "object",
+      "properties": {
+        "read": {
+          "type": "string"
+        },
+        "price": {
+          "type": "string"
+        },
+        "vocabulary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "read",
+        "price",
+        "vocabulary"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "v",
+    "protocol",
+    "wire",
+    "database",
+    "catalog",
+    "limits",
+    "keys",
+    "routes"
+  ],
+  "additionalProperties": false
+}

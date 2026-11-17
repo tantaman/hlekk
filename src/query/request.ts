@@ -164,7 +164,31 @@ function checkValue(at: string, field: string, value: Json, objectType: string, 
   }
 }
 
+/**
+ * Refuses a member this protocol does not define.
+ *
+ * Ignoring one is the other choice, and it is the wrong one here. A caller that writes `limitt` gets
+ * a silent default and an answer it cannot tell from the one it asked for — which is the situation
+ * the whole `at` path exists to avoid. The cost is that a new optional field needs a version rather
+ * than arriving unannounced, and a protocol whose bodies already carry a version can afford that.
+ */
+function onlyKnown(value: object, known: readonly string[], at: string): void {
+  for (const name of Object.keys(value)) {
+    if (!known.includes(name)) {
+      throw new Refused(at, `no such member "${name}"; this one takes ${known.join(", ")}`);
+    }
+  }
+}
+
+const HOP_MEMBERS = ["as", "edge", "limit", "after", "where", "counts", "hops"] as const;
+const CMP_MEMBERS = ["field", "op", "value"] as const;
+const COUNT_MEMBERS = ["as", "edge"] as const;
+
+/** Every member a read request itself may carry, for a caller that validates the entry too. */
+export const REQUEST_MEMBERS = ["ids", "counts", "hops"] as const;
+
 function checkCount(c: CountSpec, at: string, vocab: Vocabulary): void {
+  if (typeof c === "object" && c !== null) onlyKnown(c, COUNT_MEMBERS, at);
   const edge = vocab.edge(countEdge(c));
   if (edge === undefined) throw new Refused(at, `no edge "${countEdge(c)}"`);
   if (edge.counted === false) {
@@ -181,6 +205,8 @@ interface Counted {
 
 /** Validates one hop and everything under it, and counts what it would cost. */
 function checkHop(hop: Hop, at: string, depth: number, reaching: number, vocab: Vocabulary, limits: Limits): Counted {
+  if (hop === null || typeof hop !== "object") throw new Refused(at, "expected an object");
+  onlyKnown(hop, HOP_MEMBERS, at);
   if (depth > limits.maxDepth) {
     throw new Refused(at, `hops nest ${depth} deep, the maximum is ${limits.maxDepth}`);
   }
@@ -206,6 +232,8 @@ function checkHop(hop: Hop, at: string, depth: number, reaching: number, vocab: 
     }
   }
   for (const [i, c] of (hop.where ?? []).entries()) {
+    if (c === null || typeof c !== "object") throw new Refused(`${at}.where[${i}]`, "expected an object");
+    onlyKnown(c, CMP_MEMBERS, `${at}.where[${i}]`);
     if (!OPS.includes(c.op)) throw new Refused(`${at}.where[${i}]`, `operator must be one of ${OPS.join(" ")}`);
     checkValue(`${at}.where[${i}]`, c.field, c.value, edge.to, vocab);
   }

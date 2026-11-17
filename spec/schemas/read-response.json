@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hlekk.dev/spec/schemas/read-response.json",
+  "title": "POST {db}/read \u2014 the answer",
+  "description": "The normalized form: every object once with its version, and the structure separately. Ids are relative to the database answering, and a reference into any other database is absolute. Type NAMES, never the catalog's integers.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "roots": {
+      "type": "array",
+      "items": {
+        "$ref": "common.json#/$defs/id"
+      }
+    },
+    "objects": {
+      "description": "Every key is a bare id of the database answering. That is what stops a responder supplying objects for a database it does not own.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "common.json#/$defs/id"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "$ref": "common.json#/$defs/typeName"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "data": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "type",
+          "version",
+          "data"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "lists": {
+      "description": "Keyed `<frame>:<parent id>`. By frame and not by edge type: two aliases over one edge type with different filters or limits are two answers and must not collide.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/listKey"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/list"
+      }
+    },
+    "counts": {
+      "description": "Keyed `<frame>:<parent id>`, then by the alias the count was asked for under. A count is separately authorized: an object may be readable while its count is not.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/listKey"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "shape": {
+      "description": "Per frame, which alias leads to which frame. A consumer that does not hold the plan needs this to walk the lists, and a caller that chose the aliases uses it to map the responder's frame numbers back to its own.",
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "cost": {
+      "$ref": "common.json#/$defs/cost"
+    },
+    "cache": {
+      "$ref": "common.json#/$defs/cacheability"
+    }
+  },
+  "required": [
+    "v",
+    "roots",
+    "objects",
+    "lists",
+    "counts",
+    "shape",
+    "cost",
+    "cache"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "listKey": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$"
+    },
+    "list": {
+      "type": "object",
+      "properties": {
+        "ids": {
+          "description": "In order, after the filter and the limit. A member may be a REFERENCE: those are the ones this database did not follow, and they are how a read continues past it \u2014 the caller asks that database itself.",
+          "type": "array",
+          "items": {
+            "$ref": "common.json#/$defs/reference"
+          }
+        },
+        "edges": {
+          "description": "The edge that reached each id, positionally. Absent where no edge did.",
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "time": {
+                    "type": "integer"
+                  },
+                  "data": {
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "time"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "cursor": {
+          "description": "Where this list continues, to be handed back as a hop's `after`. Opaque: the responder dropped whatever its policy hides, so only the responder knows where the next page begins.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "more": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ids",
+        "cursor",
+        "more"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

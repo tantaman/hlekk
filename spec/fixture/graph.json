@@ -1,0 +1,253 @@
+{
+  "comment": "See README.md. An implementation under test loads this by its own means and reports the id it gave each named object.",
+  "objects": [
+    {
+      "name": "root",
+      "type": "conf.page",
+      "fields": {
+        "title": "root",
+        "rank": 0
+      }
+    },
+    {
+      "name": "visible-a",
+      "type": "conf.page",
+      "fields": {
+        "title": "visible a",
+        "rank": 1
+      }
+    },
+    {
+      "name": "visible-b",
+      "type": "conf.page",
+      "fields": {
+        "title": "visible b",
+        "rank": 2,
+        "note": "has a note"
+      }
+    },
+    {
+      "name": "visible-c",
+      "type": "conf.page",
+      "fields": {
+        "title": "visible c",
+        "rank": 8
+      }
+    },
+    {
+      "name": "hidden",
+      "type": "conf.page",
+      "fields": {
+        "title": "hidden",
+        "rank": 3
+      }
+    },
+    {
+      "name": "behind-hidden",
+      "type": "conf.page",
+      "fields": {
+        "title": "behind hidden",
+        "rank": 4
+      }
+    },
+    {
+      "name": "countless-owner",
+      "type": "conf.page",
+      "fields": {
+        "title": "countless owner",
+        "rank": 5
+      }
+    },
+    {
+      "name": "tag-1",
+      "type": "conf.tag",
+      "fields": {
+        "label": "one"
+      }
+    },
+    {
+      "name": "tag-2",
+      "type": "conf.tag",
+      "fields": {
+        "label": "two"
+      }
+    },
+    {
+      "name": "tag-3",
+      "type": "conf.tag",
+      "fields": {
+        "label": "three"
+      }
+    },
+    {
+      "name": "paged",
+      "type": "conf.page",
+      "fields": {
+        "title": "paged",
+        "rank": 6
+      }
+    },
+    {
+      "name": "page-1",
+      "type": "conf.page",
+      "fields": {
+        "title": "page 1",
+        "rank": 11
+      }
+    },
+    {
+      "name": "page-2",
+      "type": "conf.page",
+      "fields": {
+        "title": "page 2",
+        "rank": 12
+      }
+    },
+    {
+      "name": "page-3",
+      "type": "conf.page",
+      "fields": {
+        "title": "page 3",
+        "rank": 13
+      }
+    },
+    {
+      "name": "page-4",
+      "type": "conf.page",
+      "fields": {
+        "title": "page 4",
+        "rank": 14
+      }
+    },
+    {
+      "name": "page-5",
+      "type": "conf.page",
+      "fields": {
+        "title": "page 5",
+        "rank": 15
+      }
+    },
+    {
+      "name": "elsewhere-owner",
+      "type": "conf.page",
+      "fields": {
+        "title": "elsewhere owner",
+        "rank": 7
+      }
+    }
+  ],
+  "edges": [
+    {
+      "edge": "conf.page_links",
+      "from": "root",
+      "to": "visible-a",
+      "time": 10
+    },
+    {
+      "edge": "conf.page_links",
+      "from": "root",
+      "to": "visible-b",
+      "time": 9
+    },
+    {
+      "edge": "conf.page_links",
+      "from": "root",
+      "to": "visible-c",
+      "time": 11
+    },
+    {
+      "edge": "conf.page_links",
+      "from": "root",
+      "to": "hidden",
+      "time": 8
+    },
+    {
+      "edge": "conf.page_links",
+      "from": "hidden",
+      "to": "behind-hidden",
+      "time": 7
+    },
+    {
+      "edge": "conf.page_tags",
+      "from": "countless-owner",
+      "to": "tag-1",
+      "time": 3
+    },
+    {
+      "edge": "conf.page_tags",
+      "from": "countless-owner",
+      "to": "tag-2",
+      "time": 2
+    },
+    {
+      "edge": "conf.page_tags",
+      "from": "countless-owner",
+      "to": "tag-3",
+      "time": 1
+    },
+    {
+      "edge": "conf.page_links",
+      "from": "paged",
+      "to": "page-1",
+      "time": 101
+    },
+    {
+      "edge": "conf.page_links",
+      "from": "paged",
+      "to": "page-2",
+      "time": 102
+    },
+    {
+      "edge": "conf.page_links",
+      "from": "paged",
+      "to": "page-3",
+      "time": 103
+    },
+    {
+      "edge": "conf.page_links",
+      "from": "paged",
+      "to": "page-4",
+      "time": 104
+    },
+    {
+      "edge": "conf.page_links",
+      "from": "paged",
+      "to": "page-5",
+      "time": 105
+    }
+  ],
+  "foreignEdges": [
+    {
+      "edge": "conf.page_elsewhere",
+      "from": "elsewhere-owner",
+      "to": "https://nobody.invalid/db#1",
+      "time": 1,
+      "why": "A reference into a database nobody runs. A URI is mintable before the database behind it exists, which is the point of the design \u2014 so a read of this has to list the reference and have no object for it."
+    }
+  ],
+  "policy": {
+    "comment": "What the implementation under test must enforce. Three rules, each the smallest that makes one protocol property observable from outside.",
+    "hidden": {
+      "objects": [
+        "hidden"
+      ],
+      "why": "Never visible to anyone. Forbidden has to be indistinguishable from absent, and TRANSITIVELY so: `behind-hidden` is reachable only through `hidden`, and had `hidden` genuinely not existed it would never have been gathered either."
+    },
+    "countless": {
+      "edges": [
+        "conf.page_tags"
+      ],
+      "why": "Objects yes, counts no. A count is one maintained row and therefore free, so it rides along on a read authorized for something else unless it is asked about separately."
+    },
+    "signedOnly": {
+      "objects": [
+        "visible-b"
+      ],
+      "why": "Visible to a verified caller and not to the anonymous one, so a suite that can sign has something to show for it."
+    },
+    "cache": {
+      "reuse": "public",
+      "seconds": 60
+    }
+  }
+}
