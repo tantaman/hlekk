@@ -151,7 +151,7 @@ const base = out[0];
 const f = (n) => n.toLocaleString();
 
 console.log(`${f(PAGES)} objects, ${f(base.edges)} local edges, no foreign edges written.`);
-console.log(`Projection columns assume PLAN.md's enwiki figures: 35M pages, 2.6B edges.\n`);
+console.log(`Projection columns assume docs/wikimedia-plan.md's enwiki figures: 35M pages, 2.6B edges.\n`);
 console.log("| where the reference lives | total bytes | bytes/edge-row | vs today | enwiki |");
 console.log("| --- | --- | --- | --- | --- |");
 for (const r of out) {

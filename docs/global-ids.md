@@ -63,9 +63,9 @@ page_size`, the figure `databaseSize` reports:
 | a second table | 51,253,248 | 64.5 | 1.000x | 170 GB |
 | 128-bit ids | 79,421,440 | 100.5 | **1.550x** | 264 GB |
 
-The enwiki column is *arithmetic*, from these per-row figures and [`../PLAN.md`](../PLAN.md)'s 35M
+The enwiki column is *arithmetic*, from these per-row figures and [`wikimedia-plan.md`](wikimedia-plan.md)'s 35M
 pages and 2.6B edges after the namespace filter. The control's **measured** 64.5 bytes/edge-row sits
-next to PLAN.md's **measured** 61.5 on the loaded simplewiki databases, which is what makes the
+next to that plan's **measured** 61.5 on the loaded simplewiki databases, which is what makes the
 comparison worth trusting; the small gap is the synthetic graph's degree being uniform where the real
 one's is not.
 
@@ -360,7 +360,7 @@ Nothing needs reserving in `ids.ts` beside it. Qualification lives outside the i
 ID's layout is untouched by all of this.
 
 **Not now:** the alias column, the registry, the global directory, the permission model. There is
-also a scheduling reason, not only a scope one. PLAN.md step 3 is an irreversible enwiki placement
+also a scheduling reason, not only a scope one. [`wikimedia-plan.md`](wikimedia-plan.md) step 3 is an irreversible enwiki placement
 decision resting on step 1's three-way reading, and a wider row changes every figure that decision is
 made against — 61.5 bytes/row, 163 GB, the host count, `HLEKK_VSHARDS`. Take the step 1 measurement
 on today's IDs, make the enwiki call, then decide this. The other order means choosing a permanent
