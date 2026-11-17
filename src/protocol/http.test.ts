@@ -160,25 +160,31 @@ describe("the protocol over HTTP", () => {
         /has no count/,
       ],
       [
+        // Every hop starts where its parent lands, so what refuses this is the budget and not the
+        // shape: three roots times 100 comments times 100 authors is 30,303 answer nodes, and
+        // nothing about the I/O underneath would reveal that.
         "an over-budget request",
         {
-          ids: [issue],
+          ids: [issue, issue, issue],
           hops: [
             {
               edge: "issues.issue_comments",
               limit: 100,
-              hops: [
-                {
-                  edge: "issues.comment_author",
-                  limit: 100,
-                  hops: [{ edge: "issues.issue_comments", limit: 100 }],
-                },
-              ],
+              hops: [{ edge: "issues.comment_author", limit: 100 }],
             },
           ],
         },
         "query",
         /answer nodes/,
+      ],
+      [
+        "a hop that does not start where its parent lands",
+        {
+          ids: [issue],
+          hops: [{ edge: "issues.issue_comments", hops: [{ edge: "issues.issue_comments" }] }],
+        },
+        "hops[0].hops[0]",
+        /starts at issues\.issue, and this hop is under issues\.comment/,
       ],
     ];
     for (const [why, body, where, message] of cases) {

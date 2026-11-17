@@ -12,10 +12,10 @@ const FIELDS: Record<string, Record<string, FieldSpec>> = {
   "issues.issue": { title: "string", open: "boolean" },
   "core.user": { name: "string", age: "number" },
 };
-const EDGES: Record<string, { to: string }> = {
-  "issues.issue_owner": { to: "core.user" },
-  "issues.issue_labels": { to: "issues.issue" },
-  "core.user_issues": { to: "issues.issue" },
+const EDGES: Record<string, { from: string; to: string }> = {
+  "issues.issue_owner": { from: "issues.issue", to: "core.user" },
+  "issues.issue_labels": { from: "issues.issue", to: "issues.issue" },
+  "core.user_issues": { from: "core.user", to: "issues.issue" },
 };
 const VOCAB: Vocabulary = {
   edge: (n) => EDGES[n],

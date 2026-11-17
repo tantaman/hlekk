@@ -68,6 +68,13 @@ Worth recording, because it is the argument for having built them rather than on
   conversion and coming back as a 500, and an unknown request member being accepted silently.
 - The **fixture's signature check** found that a database with no verifier ignored a presented
   signature: the caller had made a claim nobody checked and could not tell.
+- Writing the **discovery** test — a caller walking a database from one id with only the vocabulary to
+  go on — found three ways a caller's own names could be lost, each producing an answer it could not
+  tell from a true one. A count and a hop over one edge default to the same name, so the list came
+  back empty beside a count saying it was not; two hops under one name both ran and one was discarded;
+  and a hop named `id` did not shadow a field but collapsed the structure of the whole answer, since
+  the normalized form keys everything by `row.id`. The wiki demo's authored-query box had the first
+  of those too.
 
 ## Decisions now permanent
 
@@ -90,6 +97,8 @@ Two more were settled while building, and belong in this table for the same reas
 | --- | --- |
 | An unknown member of a request | Refused. A caller that cannot tell whether its field took effect is the thing `at` exists to prevent, so a new optional member is a new wire version |
 | A signature a responder cannot verify | Refused, including by a responder that verifies none and says so in its descriptor. A caller reads the descriptor and does not sign to a keyless database |
+| A hop that does not start where its parent lands | Refused, naming what is available from there. It could only ever return nothing, and nothing is an answer a caller cannot tell from a true empty list |
+| Two of a caller's own names landing on one | Refused, and so is a name a row already carries. Letting the later one win is what makes a wrong answer look like a right one |
 | How many databases a deployment serves | **One.** A Durable Object's env comes from the deployment that defines its namespace, so a Worker holding two names gets one set of hosts and not two databases — measured on workerd. Density traded for separate namespaces, separate limits and a blast radius of one |
 | Whether a mounted database is readable | **Public by default**, because the protocol exists so a database can be read by another and one that answers nothing is not participating. Safe because mounting the handler is the act of exposure, which is only true while no layer mounts one automatically |
 
@@ -188,10 +197,11 @@ steps above, so that nothing reads as finished that is not.
 - **Filters sent with a foreign hop.** Step 6 sends a frame's subtree without them, because the cache
   keys a list by object and edge type and a filtered list merged into it would answer another frame
   wrongly. Sending them means keying foreign lists by frame.
-- **A `where` over an edge type whose `from` does not match the parent.** `check` validates every
-  name against the vocabulary but not that a hop starts where its parent lands, so a nonsensical
-  traversal is answered as an empty list rather than refused. It costs nothing — the list is genuinely
-  empty — but a refusal would be better.
+- **A hop off the root cannot be checked against its parent's type.** A hop under another hop is now
+  refused when it does not start where that one lands (§5.1), but the entry is ids, an id does not
+  carry its type, and `ids` may hold objects of several types — so there is nothing sound to check a
+  root hop against, and pricing happens before any I/O that could find out. Closing it means a caller
+  optionally stating the root's type, which is a new request member and so a new wire version.
 
 ## Open
 

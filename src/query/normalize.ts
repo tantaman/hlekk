@@ -11,7 +11,7 @@
 
 import { encodeCursor, encodeToken } from "../schema/query.ts";
 import type { Cache } from "./stores.ts";
-import { listKey } from "./types.ts";
+import { RESERVED_KEYS, listKey } from "./types.ts";
 import type { Fields, Id, Json, Plan } from "./types.ts";
 
 export interface ObjectEntry {
@@ -42,7 +42,7 @@ export interface QueryResult {
   shape: Record<number, Record<string, number>>;
 }
 
-const RESERVED = new Set(["id", "$version", "$edge"]);
+const RESERVED = RESERVED_KEYS;
 
 /** Turns a nested answer and the graph it was read from into the normalized form. Takes the driver's
  *  rows, before the builder reshapes them. */

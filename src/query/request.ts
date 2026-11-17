@@ -28,6 +28,7 @@
 
 import type { FieldSpec } from "../catalog/catalog.ts";
 import { decodeCursor } from "../schema/query.ts";
+import { isReservedKey } from "./types.ts";
 import type { CmpOp, Json } from "./types.ts";
 
 export const OPS: readonly CmpOp[] = ["=", "!=", "<", "<=", ">", ">="];
@@ -123,10 +124,19 @@ export class Refused extends Error {
  * decision rather than a schema fact.
  */
 export interface Vocabulary {
-  /** The object type an edge lands on, or undefined when the edge is not exposed. `counted` is false
-   *  for a field relationship, which follows an id in a payload and stores nothing — so it can be
-   *  traversed but has no maintained counter to read. Absent means countable. */
-  edge(name: string): { to: string; counted?: boolean } | undefined;
+  /**
+   * Where an edge starts and lands, or undefined when the edge is not exposed.
+   *
+   * `counted` is false for a field relationship, which follows an id in a payload and stores
+   * nothing — so it can be traversed but has no maintained counter to read. Absent means countable.
+   *
+   * `from` is here so that a hop can be checked against where its parent lands. Without it the
+   * guard can tell that an edge exists and not that it starts anywhere near the rows it is hung
+   * under, and a nonsensical traversal comes back as an empty list — which a caller cannot tell from
+   * a true one. That matters most to a caller building its tree from the vocabulary rather than from
+   * a schema it holds, which is what an agent discovering a database does.
+   */
+  edge(name: string): { from: string; to: string; counted?: boolean } | undefined;
   /** Every exposed edge name, so a refusal can say what was available instead. */
   edges(): readonly string[];
   /** The fields of an object type, so a filter's value is checked against what it declares. */
@@ -180,6 +190,67 @@ function onlyKnown(value: object, known: readonly string[], at: string): void {
   }
 }
 
+/** How a caller turns a hop and a count into the names its answer carries. Supplied rather than
+ *  assumed, because a caller that enters from somewhere else may derive them differently — the wiki
+ *  demo strips its own namespace prefix — and the collision rule has to be checked against the names
+ *  that will actually be used. */
+export interface Aliasing {
+  hop(hop: Hop): string;
+  count(count: CountSpec): string;
+}
+
+/** What the protocol itself does: a hop's `as` or its edge name, and a count's `as` or the bare
+ *  string it was written as. */
+export const PROTOCOL_ALIASING: Aliasing = {
+  hop: (hop) => (hop.as !== undefined && hop.as.length > 0 ? hop.as : hop.edge),
+  count: (count) => (typeof count === "string" ? count : count.as),
+};
+
+/**
+ * Refuses a name the answer would lose, and names what lost it.
+ *
+ * A result is `{...payload, id, $version, $edge, ...relationships, ...counts}` in that order, so two
+ * of a caller's own names colliding means one of them silently wins — and what comes back is an
+ * answer the caller cannot tell from a true one. Three ways that happened:
+ *
+ * - **A count and a hop over the same edge.** Both default their name to the edge's, and naming them
+ *   that way is the obvious thing for a caller working from the vocabulary to do. The count was
+ *   written last, so the list came back empty beside a count that said it was not — which is exactly
+ *   the shape that makes it look right.
+ * - **Two hops under one name.** Both were read and one was thrown away.
+ * - **A name a row already carries.** `id` does not shadow a field: the normalized form reads
+ *   `row.id` to key every object, list and count, so a relationship called `id` takes the structure
+ *   of the whole answer with it.
+ *
+ * Separate from `check` because it depends on the aliasing, which `check` does not own.
+ */
+export function checkAliases(req: Request, aliasing: Aliasing = PROTOCOL_ALIASING): void {
+  const level = (node: { counts?: CountSpec[]; hops?: Hop[] }, at: string): void => {
+    const taken = new Map<string, string>();
+    const take = (name: string, where: string, what: string): void => {
+      if (typeof name !== "string" || name.length === 0) return; // reported by `check`
+      if (isReservedKey(name)) {
+        throw new Refused(where, `"${name}" is a name a row already carries, so ${what} cannot use it`);
+      }
+      const held = taken.get(name);
+      if (held !== undefined) throw new Refused(where, `"${name}" is already ${held}, and one answer cannot be both`);
+      taken.set(name, what);
+    };
+    for (const [i, hop] of (node.hops ?? []).entries()) {
+      if (hop === null || typeof hop !== "object" || typeof hop.edge !== "string") continue;
+      take(aliasing.hop(hop), `${at}hops[${i}]`, `the "${hop.edge}" hop`);
+    }
+    for (const [i, c] of (node.counts ?? []).entries()) {
+      if (typeof c !== "string" && (c === null || typeof c !== "object")) continue;
+      take(aliasing.count(c), `${at}counts[${i}]`, `the "${countEdge(c)}" count`);
+    }
+    for (const [i, hop] of (node.hops ?? []).entries()) {
+      if (hop !== null && typeof hop === "object") level(hop, `${at}hops[${i}].`);
+    }
+  };
+  level(req, "");
+}
+
 const HOP_MEMBERS = ["as", "edge", "limit", "after", "where", "counts", "hops"] as const;
 const CMP_MEMBERS = ["field", "op", "value"] as const;
 const COUNT_MEMBERS = ["as", "edge"] as const;
@@ -204,7 +275,16 @@ interface Counted {
 }
 
 /** Validates one hop and everything under it, and counts what it would cost. */
-function checkHop(hop: Hop, at: string, depth: number, reaching: number, vocab: Vocabulary, limits: Limits): Counted {
+function checkHop(
+  hop: Hop,
+  at: string,
+  depth: number,
+  reaching: number,
+  vocab: Vocabulary,
+  limits: Limits,
+  /** The type the rows this hop is hung under are, where it is known. */
+  parent: string | undefined,
+): Counted {
   if (hop === null || typeof hop !== "object") throw new Refused(at, "expected an object");
   onlyKnown(hop, HOP_MEMBERS, at);
   if (depth > limits.maxDepth) {
@@ -213,6 +293,17 @@ function checkHop(hop: Hop, at: string, depth: number, reaching: number, vocab: 
   const edge = typeof hop.edge === "string" ? vocab.edge(hop.edge) : undefined;
   if (edge === undefined) {
     throw new Refused(at, `no edge "${String(hop.edge)}"; the schema has ${vocab.edges().join(", ")}`);
+  }
+  // A hop has to start where its parent lands. It can only ever return nothing otherwise, and
+  // "nothing" is an answer a caller cannot tell from a true empty list — which is the one thing a
+  // caller building its tree from the vocabulary must be able to rely on.
+  if (parent !== undefined && edge.from !== parent) {
+    const available = vocab.edges().filter((name) => vocab.edge(name)?.from === parent);
+    throw new Refused(
+      at,
+      `"${hop.edge}" starts at ${edge.from}, and this hop is under ${parent}.` +
+        ` From ${parent} the schema has ${available.length === 0 ? "no edges" : available.join(", ")}`,
+    );
   }
   const limit = hop.limit ?? DEFAULT_HOP_LIMIT;
   if (!Number.isInteger(limit) || limit < 1 || limit > limits.maxLimit) {
@@ -253,7 +344,7 @@ function checkHop(hop: Hop, at: string, depth: number, reaching: number, vocab: 
   let frames = 1;
   let nodes = produced;
   for (const [i, child] of (hop.hops ?? []).entries()) {
-    const under = checkHop(child, `${at}.hops[${i}]`, depth + 1, produced, vocab, limits);
+    const under = checkHop(child, `${at}.hops[${i}]`, depth + 1, produced, vocab, limits, edge.to);
     frames += under.frames;
     nodes += under.nodes;
   }
@@ -287,7 +378,13 @@ export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_
   let nodes = roots; // the root objects themselves
   for (const [i, hop] of (req.hops ?? []).entries()) {
     // `reaching` is how many rows arrive at this hop, which at the top is one per root.
-    const under = checkHop(hop, `hops[${i}]`, 1, roots, vocab, limits);
+    //
+    // No parent type for a hop off the root. The entry is ids, an id does not carry its type, and
+    // `ids` may legitimately hold objects of several types — so there is nothing sound to check
+    // against here, and pricing happens before any I/O that could find out. Closing that would mean
+    // a caller optionally stating the root's type, which is a new request member and so a new wire
+    // version; it is recorded in PLAN.md rather than guessed at.
+    const under = checkHop(hop, `hops[${i}]`, 1, roots, vocab, limits, undefined);
     frames += under.frames;
     nodes += under.nodes;
   }
