@@ -12,7 +12,7 @@
   //
   // WHAT IS DELIBERATELY NOT HERE: no HLEKK_ALT, so nothing forwards to it and nothing forwards out;
   // no HLEKK_WIPE, so it carries no route that destroys 200 GB.
-  "main": "src/worker/wiki-app.ts",
+  "main": "examples/wiki/wiki-app.ts",
   "compatibility_date": "2026-10-01",
   "durable_objects": {
     "bindings": [

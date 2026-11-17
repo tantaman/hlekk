@@ -113,7 +113,7 @@ deployment that defines its namespace and never from whoever called it, so a Wor
 database names does not get two databases — it gets one set of hosts that the second database's
 directory adopts vshards on and one set of map chunks the second publishes over the first's. That was
 tried, and workerd reported it as `indexLookup: host does not hold index vshard 155` with two
-"databases" sharing all 43 hosts (`src/worker/wiki-app.ts`).
+"databases" sharing all 43 hosts (`examples/wiki/wiki-app.ts`).
 
 What is given up is density, and what is kept is the stronger thing: separate Durable Object
 namespaces, separate KV, separate account limits, and a blast radius of exactly one database. The

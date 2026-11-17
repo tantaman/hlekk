@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { normalize } from "../client/client.ts";
+import { normalize } from "../../src/client/client.ts";
 import { LIMITS, QueryRefused, build, check, parseQuery, planOf, price, schemaView, unparse } from "./wiki-query.ts";
 import type { QuerySpec } from "./wiki-query.ts";
 import { categoryPages, legacyTitleKey, linkedFrom, pageCategories, pageLinks, titleKey } from "./wiki.ts";

@@ -39,7 +39,7 @@ And two findings that land on the demo side rather than here; both are live bugs
 - **`client.normalize` lowercases every index key**, and MediaWiki titles are case-sensitive after the
   first character. A `${ns}:${title}` key is not enough: `Ash` and `ASH` are both real enwiki pages
   and collide under it, so the second one loaded is refused with `ValueTaken` and silently dropped.
-  `titleKey` in `src/worker/wiki.ts` escapes uppercase letters to lowercase hex, which makes the key
+  `titleKey` in `examples/wiki/wiki.ts` escapes uppercase letters to lowercase hex, which makes the key
   lowercase-stable — verified on that pair. The real fix is normalization per index rather than one
   function per database; *Global lookups and uniqueness* says values are normalized "once, in one
   place", and is right that the place has to be per index.
@@ -94,7 +94,7 @@ that is the difference between the dump's row count and the database's edge coun
 
 ## The catalog
 
-`src/worker/wiki.ts`. One object type and four edge types; the lock plans, and the query compiles.
+`examples/wiki/wiki.ts`. One object type and four edge types; the lock plans, and the query compiles.
 
 **One object type for every namespace.** In MediaWiki a category *is* a page, and so is a template.
 Giving categories their own object type would mean two types for one row in `page` and an edge whose
@@ -312,7 +312,7 @@ rather than given a mechanism it did not have.
 ## The same ingest, deployed, which also works
 
 `npm run ingest:deployed -- --base https://hlekk-wiki.tantaman.workers.dev --pages 10000` —
-`scripts/ingest-deployed.ts` against `src/worker/wiki-app.ts`, deployed with `wrangler.wiki.jsonc`:
+`scripts/ingest-deployed.ts` against `examples/wiki/wiki-app.ts`, deployed with `wrangler.wiki.jsonc`:
 43 host Durable Objects, one directory Durable Object, a real KV namespace holding the published
 shard map, 128 vshards, four index vshards.
 

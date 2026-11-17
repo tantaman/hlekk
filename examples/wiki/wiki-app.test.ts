@@ -9,10 +9,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { LocalCluster } from "../client/local.ts";
+import { LocalCluster } from "../../src/client/local.ts";
 import { altTarget, cardQuery, probeKey, probeRange, relationPage, titleLookup, wipeTarget } from "./wiki-app.ts";
 import { LOCK, Page, legacyTitleKey, pageLinks, storedTitle, titleKey } from "./wiki.ts";
-import type { Env } from "../adapters/cloudflare/bindings.ts";
+import type { Env } from "../../src/adapters/cloudflare/bindings.ts";
 
 /** The card's row, as the Worker hands it to the UI. */
 interface CardRow {

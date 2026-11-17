@@ -205,7 +205,7 @@ filter makes the static product loose, and the scan cap is its own piece of work
 None of this blocks the Wikipedia UI, whose queries are fixed and written by us. It all blocks the
 editor.
 
-**Built, and two of the three holes are now unrepresentable rather than guarded.** `src/worker/wiki-query.ts`
+**Built, and two of the three holes are now unrepresentable rather than guarded.** `examples/wiki/wiki-query.ts`
 takes a *nested description* of a query instead of a `Plan`, which settles the open question below in
 the direction that removes the holes. A hop holds its children, so there is no frame index for an
 author to get wrong (hole 3), and no way to name an ancestor and make a cycle (hole 2) — and

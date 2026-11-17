@@ -1,7 +1,7 @@
 // A bounded request an untrusted caller may submit, and the static guard that decides whether it may
 // run at all.
 //
-// Lifted out of `worker/wiki-query.ts`, which built this because the wiki demo exposes a query box to
+// Lifted out of `examples/wiki/wiki-query.ts`, which built this because the wiki demo exposes a query box to
 // the public internet. A database reached over the cross-database protocol has the same exposure for
 // the same reason: the caller is another database rather than a trusted server, so principle 10 does
 // not reach it. The guard therefore belongs beside the engine, not inside one application.

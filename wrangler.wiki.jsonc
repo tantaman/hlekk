@@ -5,7 +5,7 @@
   // harnesses the suite drives on workerd, this one is meant to be `wrangler deploy`-ed: it is how
   // the import is proven against real Durable Objects, real KV and a real network before anything
   // the size of enwiki is committed to it.
-  "main": "src/worker/wiki-app.ts",
+  "main": "examples/wiki/wiki-app.ts",
   "compatibility_date": "2026-10-01",
   "durable_objects": {
     "bindings": [
@@ -57,7 +57,7 @@
   // and `wrangler secret delete` it afterwards to close the deployment again. The same Worker runs
   // from wrangler.wiki-hash.jsonc, wrangler.wiki-graph.jsonc and wrangler.enwiki.jsonc; each holds
   // its own token, and a driver's `--placement` forward needs the two ends to share one. Locally,
-  // put it in `.dev.vars`, which is ignored. See `src/worker/guard.ts`.
+  // put it in `.dev.vars`, which is ignored. See `examples/wiki/guard.ts`.
   //
   // HLEKK_SHED_BYTES is deliberately absent. It lowers the placement controller's threshold so a
   // demo can be watched rebalancing, and this database must not rebalance: wikimedia-demo.md puts

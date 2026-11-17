@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { MIN_TOKEN_LENGTH } from "../../src/worker/guard.ts";
+import { MIN_TOKEN_LENGTH } from "../wiki/guard.ts";
 
 const token = process.env.HLEKK_ADMIN_TOKEN;
 if (!token || token.length < MIN_TOKEN_LENGTH) throw new Error("Set HLEKK_ADMIN_TOKEN in .dev.vars.");

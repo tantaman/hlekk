@@ -56,7 +56,7 @@ import { records } from "./import-enwiki.mjs";
 import { RESERVATION_TTL_MS } from "../src/client/client.ts";
 import { makeId, vshardOf } from "../src/host/ids.ts";
 import type { Id } from "../src/query/types.ts";
-import { operatorHeaders, operatorRefusal } from "../src/worker/guard.ts";
+import { operatorHeaders, operatorRefusal } from "../examples/wiki/guard.ts";
 
 /** A record as the importer emits it. `more` marks a continuation: the same page, more edges. */
 interface Rec {

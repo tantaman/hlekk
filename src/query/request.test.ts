@@ -5,7 +5,7 @@ import type { FieldSpec } from "../catalog/catalog.ts";
 import { DEFAULT_LIMITS, Refused, check } from "./request.ts";
 import type { Request, Vocabulary } from "./request.ts";
 
-// A vocabulary with more than one object type, which is the case `worker/wiki-query.test.ts` cannot
+// A vocabulary with more than one object type, which is the case `examples/wiki/wiki-query.test.ts` cannot
 // reach: every relation in that schema is page-to-page, so checking a filter against its hop's target
 // type and checking it against the one object type are indistinguishable. Here they are not.
 const FIELDS: Record<string, Record<string, FieldSpec>> = {

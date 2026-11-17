@@ -30,7 +30,7 @@ import {
   pageCategories,
   pageLinks,
   titleKey,
-} from "../src/worker/wiki.ts";
+} from "../examples/wiki/wiki.ts";
 // The subset selection, shared with the deployed ingest so the two runs load the same pages.
 import { selectSubset } from "./wiki-subset.ts";
 import type { Rec } from "./wiki-subset.ts";

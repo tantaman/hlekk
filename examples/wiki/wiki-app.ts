@@ -17,20 +17,20 @@
 // reference them. The driver keeps the `page_id -> hlekk id` map between them, which is also what
 // keeps this Worker stateless.
 
-import { Hlekk } from "../client/client.ts";
-import { ValueTaken } from "../client/client.ts";
-import { vshardOf } from "../host/ids.ts";
-import type { Id, Json } from "../query/types.ts";
-import { chunkKey } from "../directory/map.ts";
-import { databaseOf, directoryStub, hostStub } from "../adapters/cloudflare/bindings.ts";
-import type { Env } from "../adapters/cloudflare/bindings.ts";
-import { call } from "../adapters/cloudflare/rpc.ts";
-import { cloudflareTransport } from "../adapters/cloudflare/transport.ts";
-import { Catalog } from "../catalog/catalog.ts";
-import { handle } from "../protocol/http.ts";
-import type { Binding } from "../protocol/http.ts";
-import { surfaceOf } from "../protocol/surface.ts";
-import { canonicalDb, isQualified } from "../query/ref.ts";
+import { Hlekk } from "../../src/client/client.ts";
+import { ValueTaken } from "../../src/client/client.ts";
+import { vshardOf } from "../../src/host/ids.ts";
+import type { Id, Json } from "../../src/query/types.ts";
+import { chunkKey } from "../../src/directory/map.ts";
+import { databaseOf, directoryStub, hostStub } from "../../src/adapters/cloudflare/bindings.ts";
+import type { Env } from "../../src/adapters/cloudflare/bindings.ts";
+import { call } from "../../src/adapters/cloudflare/rpc.ts";
+import { cloudflareTransport } from "../../src/adapters/cloudflare/transport.ts";
+import { Catalog } from "../../src/catalog/catalog.ts";
+import { handle } from "../../src/protocol/http.ts";
+import type { Binding } from "../../src/protocol/http.ts";
+import { surfaceOf } from "../../src/protocol/surface.ts";
+import { canonicalDb, isQualified } from "../../src/query/ref.ts";
 import { isOperatorPath, refuseOperator } from "./guard.ts";
 import { ROSTER_TTL_MS, narrowRoster, rosterOf } from "./roster.ts";
 import { OG_CARD, OG_CARD_ETAG } from "./wiki-og.ts";
@@ -50,8 +50,8 @@ import {
   titleKey,
 } from "./wiki.ts";
 
-export { HlekkHostDO } from "../adapters/cloudflare/host.ts";
-export { HlekkDirectoryDO } from "../adapters/cloudflare/directory.ts";
+export { HlekkHostDO } from "../../src/adapters/cloudflare/host.ts";
+export { HlekkDirectoryDO } from "../../src/adapters/cloudflare/directory.ts";
 
 /** What the roster is held under. One deployment is one database, so one slot per isolate is the
  *  whole of it — and a module-level object is that without assuming anything about whether the

@@ -5,7 +5,7 @@
 // a deployed one cannot be told apart from a difference in what was selected.
 
 import { records } from "./import-enwiki.mjs";
-import { linkedFrom } from "../src/worker/wiki.ts";
+import { linkedFrom } from "../examples/wiki/wiki.ts";
 
 export interface Rec {
   key: string;

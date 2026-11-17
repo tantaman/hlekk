@@ -1,1 +1,1 @@
-export { default, HlekkDirectoryDO, HlekkHostDO } from "../../src/worker/wiki-app.ts";
+export { default, HlekkDirectoryDO, HlekkHostDO } from "../wiki/wiki-app.ts";

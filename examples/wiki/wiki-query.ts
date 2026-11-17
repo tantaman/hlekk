@@ -31,12 +31,12 @@
 // `where` over a page with a million backlinks reads the million. design.md's "A scan cap per
 // query, returning a cursor, is not built yet" is still true, and `maxLimit` is not a bound on it.
 
-import type { Cond, Json, Plan } from "../query/types.ts";
-import type { CmpOp } from "../query/types.ts";
-import type { FieldSpec } from "../catalog/catalog.ts";
-import { Query } from "../schema/query.ts";
+import type { Cond, Json, Plan } from "../../src/query/types.ts";
+import type { CmpOp } from "../../src/query/types.ts";
+import type { FieldSpec } from "../../src/catalog/catalog.ts";
+import { Query } from "../../src/schema/query.ts";
 import { LOCK, Page, categoryPages, linkedFrom, pageCategories, pageLinks } from "./wiki.ts";
-import type { EdgeType, FieldMap } from "../schema/define.ts";
+import type { EdgeType, FieldMap } from "../../src/schema/define.ts";
 import {
   DEFAULT_HOP_LIMIT,
   DEFAULT_LIMITS,
@@ -46,8 +46,8 @@ import {
   checkAliases,
   countEdge,
   describe,
-} from "../query/request.ts";
-import type { Cmp, Cost, CountSpec, Hop, Limits, Request, Vocabulary } from "../query/request.ts";
+} from "../../src/query/request.ts";
+import type { Cmp, Cost, CountSpec, Hop, Limits, Request, Vocabulary } from "../../src/query/request.ts";
 
 /** Every relation the editor may traverse, by the name the schema gives it. Taken from the typed
  *  values rather than re-listed, so the editor cannot offer an edge the catalog does not have. */

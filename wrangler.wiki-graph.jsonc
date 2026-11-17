@@ -14,7 +14,7 @@
   // from the edge list instead, by scripts/partition-wiki.mjs. The partitioner's objective -- edges
   // that cross a host -- is the same number the A/B measures, which is the whole reason to derive
   // the key rather than hunt for a cleverer field.
-  "main": "src/worker/wiki-app.ts",
+  "main": "examples/wiki/wiki-app.ts",
   "compatibility_date": "2026-10-01",
   "durable_objects": {
     "bindings": [

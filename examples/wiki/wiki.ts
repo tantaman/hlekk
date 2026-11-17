@@ -5,8 +5,8 @@
 // from. Revisions would be `wiki.revision` plus an edge type, and both are additions, which What a
 // change costs puts in the catalog-only column — so nothing here has to move to add them.
 
-import { plan } from "../catalog/catalog.ts";
-import { bool, defineObject, edge, num, str } from "../schema/define.ts";
+import { plan } from "../../src/catalog/catalog.ts";
+import { bool, defineObject, edge, num, str } from "../../src/schema/define.ts";
 
 export const LOCK = plan({
   wiki: {

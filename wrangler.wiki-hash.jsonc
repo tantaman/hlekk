@@ -13,7 +13,7 @@
   //
   // Its own `migrations` is the point: it gives this script its own HlekkHostDO and HlekkDirectoryDO
   // namespaces, so `wiki-simple-hash/h-0` here is a different object from anything in hlekk-wiki.
-  "main": "src/worker/wiki-app.ts",
+  "main": "examples/wiki/wiki-app.ts",
   "compatibility_date": "2026-10-01",
   "durable_objects": {
     "bindings": [

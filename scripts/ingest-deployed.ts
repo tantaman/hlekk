@@ -27,8 +27,8 @@
 import { selectSubset } from "./wiki-subset.ts";
 import type { Rec } from "./wiki-subset.ts";
 import { vshardOf } from "../src/host/ids.ts";
-import { operatorHeaders, operatorRefusal } from "../src/worker/guard.ts";
-import { categoryPages, linkedFrom, pageCategories, pageLinks } from "../src/worker/wiki.ts";
+import { operatorHeaders, operatorRefusal } from "../examples/wiki/guard.ts";
+import { categoryPages, linkedFrom, pageCategories, pageLinks } from "../examples/wiki/wiki.ts";
 
 const args = new Map<string, string>();
 for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i].replace(/^--/, ""), process.argv[i + 1]);

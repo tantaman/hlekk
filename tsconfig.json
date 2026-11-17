@@ -11,5 +11,5 @@
     "erasableSyntaxOnly": true,
     "types": ["node"]
   },
-  "include": ["src"]
+  "include": ["src", "examples/wiki", "examples/*/worker.ts"]
 }

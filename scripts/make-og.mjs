@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Renders scripts/og-card.html to a 1200x630 PNG and writes it into the Worker as
-// src/worker/wiki-og.ts. Run it after editing the card: `npm run og`.
+// examples/wiki/wiki-og.ts. Run it after editing the card: `npm run og`.
 //
 // WHY THE BYTES GO INTO A .ts MODULE instead of being imported as a file. wrangler can bundle a
 // .png with a `Data` rule, but `npm test` runs the Worker's own sources through `node --test`, and
@@ -25,7 +25,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
 const CARD = join(here, "og-card.html");
-const OUT = join(root, "src", "worker", "wiki-og.ts");
+const OUT = join(root, "examples", "wiki", "wiki-og.ts");
 const [W, H] = [1200, 630];
 
 const chrome =

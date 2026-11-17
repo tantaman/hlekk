@@ -1,6 +1,6 @@
 # Deploy a Hlekk database
 
-These examples run the same [wiki Worker](../src/worker/wiki-app.ts) on [Cloudflare Durable Objects](#cloudflare-durable-objects), [Rivet](#rivet), or [celld](#celld). Each starts with its own empty database. A directory object tracks which SQLite host owns each shard, and KV holds the published shard map. The sample creates two pages on a two-host deployment and reads the link between them.
+These examples run the same [wiki Worker](./wiki/wiki-app.ts) on [Cloudflare Durable Objects](#cloudflare-durable-objects), [Rivet](#rivet), or [celld](#celld). Each starts with its own empty database. A directory object tracks which SQLite host owns each shard, and KV holds the published shard map. The sample creates two pages on a two-host deployment and reads the link between them.
 
 ## Set up
 

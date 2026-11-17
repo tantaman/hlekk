@@ -15,8 +15,8 @@
     "ingest:local": "node scripts/ingest-local.ts",
     "og": "node scripts/make-og.mjs",
     "smoke": "node scripts/smoke.mjs",
-    "test": "node --test \"src/**/*.test.ts\"",
-    "test:format1": "HLEKK_STORAGE_FORMAT=1 node --test \"src/**/*.test.ts\"",
+    "test": "node --test \"src/**/*.test.ts\" \"examples/wiki/*.test.ts\"",
+    "test:format1": "HLEKK_STORAGE_FORMAT=1 npm test",
     "test:formats": "npm test && npm run test:format1",
     "typecheck": "tsc -p .",
     "wiki:deploy": "wrangler deploy --config wrangler.wiki.jsonc"
