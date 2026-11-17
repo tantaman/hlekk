@@ -423,6 +423,20 @@ describe("paging a related list", () => {
     assert.equal(new Set(seen).size, seen.length, "a row the card had already shown came back again");
   });
 
+  it("resumes after the last delivered edge when a filter drops the first row", async () => {
+    const { db, issue } = await seeded();
+    const query = (start?: string) => Issue.gen(issue).relatedPage("comments", issueComments, sub => {
+      const level = sub.where(objField("body", "!=", "c5")).limit(1);
+      return start ? level.after(start) : level;
+    });
+    const [first] = await query().run(db);
+    const cursor = first.comments.cursor!;
+    assert.equal(decodeCursor(cursor).time, 40);
+    assert.equal((await db.normalized(query().compile().plan, [issue])).lists[`1:${issue}`].cursor, cursor);
+    const [second] = await query(cursor).run(db);
+    assert.equal(second.comments.items[0].body, "c3");
+  });
+
   it("reports no more once the list is exhausted", async () => {
     const { db, issue } = await seeded();
     const [page] = await Issue.gen(issue).relatedPage("comments", issueComments, (q) => q.limit(50)).run(db);

@@ -6,6 +6,7 @@ import { after, describe, it } from "node:test";
 
 import { Catalog, plan as planLock } from "../../catalog/catalog.ts";
 import { open } from "./database.ts";
+import { listen } from "./http.ts";
 import { parse } from "./serve.ts";
 
 // A whole database over files, in one process. What this has to show is that the two platform seams
@@ -70,6 +71,27 @@ describe("a database in a directory", () => {
     const third = await open({ dir: d });
     assert.equal((await third.cluster.directory.identity(0)).public.id, key, "the key is generated once");
     third.close();
+  });
+
+  it("reads between two default signing bindings over HTTP", async (t) => {
+    async function start() {
+      const db = await open({ dir: dir(), lock: LOCK, allowLoopback: true });
+      t.after(() => db.close());
+      const server = await listen(db.binding, { path: "/db" });
+      t.after(() => server.close());
+      return { db, server };
+    }
+    const a = await start();
+    const b = await start();
+    let verified: string | undefined;
+    b.server.binding.policyFor = async (caller) => {
+      verified = caller?.database;
+      return { policy: { object: () => !!caller, count: () => !!caller, cache: () => ({ reuse: "never" }) } };
+    };
+    const id = await b.db.db.create(NOTE, { body: "signed read" }, { vshard: "1" });
+    const rows = await a.db.db.query({ frames: [{ source: { kind: "ids" }, counts: [], children: [] }] }, [b.server.database + "#" + id]);
+    assert.equal(verified, a.server.database);
+    assert.equal((rows[0] as { body: string }).body, "signed read");
   });
 
   it("grows past one host and keeps reading across them", async () => {

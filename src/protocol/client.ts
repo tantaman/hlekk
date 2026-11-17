@@ -25,19 +25,21 @@
 // then gets a report of which databases could not be reached and how many references were left
 // unresolved — because an empty list must never be the way a failure is reported.
 
+import { BudgetSpent } from "../client/client.ts";
 import { Catalog, idFieldsOf } from "../catalog/catalog.ts";
 import type { HostClient, HostReply } from "../query/driver.ts";
 import { canonicalDb, formatRef, parseRef } from "../query/ref.ts";
 import type { Ref } from "../query/ref.ts";
-import { listKey, targetOf } from "../query/types.ts";
+import { listKey, tokenCursor } from "../query/types.ts";
 import type { Cursor, Edge, Fields, Id, Miss, Obj, Plan } from "../query/types.ts";
 import type { EdgeSegment, ReadSet } from "../query/stores.ts";
-import { describe } from "../query/request.ts";
+import { describe, DEFAULT_HOP_LIMIT } from "../query/request.ts";
 import type { CountSpec, Hop } from "../query/request.ts";
 import type { ReadRequest } from "../query/serve.ts";
+import { DESCRIPTOR_VERSION } from "./http.ts";
 import { WIRE_VERSION, decodeRead } from "./wire.ts";
 import { reachable, signRequest, wellFormed } from "./identity.ts";
-import type { KeyPair, PublicKey, SignedHeaders } from "./identity.ts";
+import type { KeyPair, SignedHeaders } from "./identity.ts";
 import type { Descriptor } from "./http.ts";
 
 /** How long one request to another database may take. */
@@ -65,14 +67,7 @@ export class ForeignUnreachable extends Error {
   }
 }
 
-/** The database at this URI answered with a key its pin cannot reach.
- *
- *  A URI can be reassigned: a database torn down and another brought up at the same name is, to
- *  everyone holding an edge into it, a different database. An allocated identifier would make that
- *  detectable by having a second name, and would reintroduce the central allocator the whole design
- *  exists to avoid. The pin is the answer instead, and this is what it buys — the edge fails rather
- *  than resolving to a stranger's objects under a name that meant someone else. Only an operator
- *  clears it. */
+/** The origin advertised a different key without a valid rotation from the pin. */
 export class Repudiated extends Error {
   readonly database: string;
   constructor(database: string, why: string) {
@@ -114,7 +109,7 @@ export interface ForeignOptions {
   deadlineMs?: number;
   maxResponseBytes?: number;
   /** Refuses a URI before it is reached, where the platform can tell. See `adapters/node/guard.ts`. */
-  guard?: (database: string) => Promise<void>;
+  guard?: ((database: string) => Promise<void>) & { fetch?: typeof fetch };
   /** Collects what could not be reached instead of failing the query. Absent, a failure throws,
    *  which is the default [`PLAN.md`](../../PLAN.md) settled on and the one this leaves reversible. */
   omit?: Omitted;
@@ -190,8 +185,12 @@ export class ResponseCache {
   }
 
   put(key: string, body: unknown, seconds: number): void {
-    if (seconds <= 0) return;
-    this.#held.set(key, { body, until: this.#now() + seconds * 1000 });
+    if (!Number.isSafeInteger(seconds) || seconds <= 0) return;
+    const now = this.#now();
+    for (const [name, entry] of this.#held) if (entry.until <= now) this.#held.delete(name);
+    this.#held.delete(key);
+    if (this.#held.size >= 128) this.#held.delete(this.#held.keys().next().value!);
+    this.#held.set(key, { body, until: now + seconds * 1000 });
   }
 }
 
@@ -202,74 +201,9 @@ export interface Pins {
   repudiate(uri: string): Promise<void>;
 }
 
-/**
- * A client for one other database.
- *
- * Built once per database per isolate, so the descriptor it reads to learn the responder's limits is
- * read once too.
- */
+/** A client for one database. Each execution checks its current descriptor. */
 export function foreignClient(database: string, opts: ForeignOptions): HostClient {
   const db = canonicalDb(database);
-  const call = opts.fetch ?? fetch;
-  const deadline = opts.deadlineMs ?? DEADLINE_MS;
-  const cap = opts.maxResponseBytes ?? MAX_RESPONSE_BYTES;
-  let descriptor: Promise<Descriptor | null> | null = null;
-  let guarded: Promise<void> | null = null;
-
-  /** The responder's own limits, or null when it would not say. A caller that cannot read the
-   *  descriptor still reads: the defaults are this implementation's, which are what the protocol
-   *  states as the floor. */
-  const limits = (): Promise<Descriptor | null> => {
-    if (!descriptor) {
-      descriptor = request(db, "", undefined).then(
-        (body) => body as Descriptor,
-        () => null,
-      );
-    }
-    return descriptor;
-  };
-
-  async function request(base: string, route: string, body: unknown): Promise<unknown> {
-    if (opts.guard !== undefined) {
-      if (!guarded) guarded = opts.guard(db);
-      await guarded;
-    }
-    const url = route === "" ? base : `${base}/${route}`;
-    const payload = body === undefined ? undefined : JSON.stringify(body);
-    let res: Response;
-    try {
-      res = await call(url, {
-        method: payload === undefined ? "GET" : "POST",
-        headers:
-          payload === undefined
-            ? {}
-            : { "content-type": "application/json", ...(await signature("POST", url, payload)) },
-        body: payload,
-        // A database that moved is a different database.
-        redirect: "error",
-        signal: AbortSignal.timeout(deadline),
-      });
-    } catch (e) {
-      throw new ForeignUnreachable(db, (e as Error).message);
-    }
-    if (res.status === 400 || res.status === 401 || res.status === 403) {
-      // The responder answered, and said no. A caller cannot retry its way out of any of these — a
-      // malformed request, an unverifiable signature, a caller this database will not serve — so
-      // they are refusals with a reason rather than a transport failure to back off from.
-      const refusal = (await text(res, cap).then(parse, () => null)) as { error?: string; at?: string } | null;
-      throw new ForeignRefused(db, `${refusal?.at ?? "?"}: ${refusal?.error ?? `status ${res.status}`}`);
-    }
-    if (!res.ok) throw new ForeignUnreachable(db, `status ${res.status}`);
-    const raw = await text(res, cap).catch((e: Error) => {
-      throw new ForeignUnreachable(db, e.message);
-    });
-    try {
-      return parse(raw);
-    } catch {
-      throw new ForeignUnreachable(db, "the answer is not JSON");
-    }
-  }
-
   /**
    * A payload's id fields, made absolute.
    *
@@ -308,17 +242,12 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
    * responder then sees the anonymous caller, which is a thing its policy decides about rather than
    * an error.
    */
-  async function signature(method: string, url: string, body: string): Promise<SignedHeaders> {
-    if (opts.identity === undefined) return {};
-    // Nor when the responder said it takes none. A descriptor with no key is a database that
-    // authenticates nobody, and presenting a credential to one is making a claim nobody will check —
-    // which it refuses, rightly, rather than ignore.
-    const descriptor = (await limits()) as { keys?: unknown[] } | null;
-    if (descriptor !== null && (descriptor.keys?.length ?? 0) === 0) return {};
+  async function signature(url: string, body: string, descriptor: Descriptor): Promise<SignedHeaders> {
+    if (opts.identity === undefined || descriptor.keys.length === 0) return {};
     const { database, pair } = await opts.identity();
     if (database === null) return {};
     return signRequest({
-      method,
+      method: "POST",
       url,
       body,
       caller: database,
@@ -328,31 +257,15 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     });
   }
 
-  /**
-   * Trust on first use, checked on later contact.
-   *
-   * The descriptor is public and unsigned — it has to be, or verifying it would need the key it
-   * carries — so what makes it trustworthy is TLS for the first contact and the pin for every one
-   * after.
-   *
-   * **The recorded state is read on every batch**, and the descriptor only when the pin has moved.
-   * That is deliberate: a repudiation has to make every read through the alias fail, and a check
-   * memoized for the life of a client would let an isolate that happened to verify first keep
-   * reading a database another isolate has already refused. The cost is one directory call per
-   * foreign batch, beside an internet round trip — which is to say, not the expensive part. The
-   * alternative, caching the state with a short window, trades a guarantee for a few milliseconds
-   * and is not worth it while a foreign hop costs what it costs.
-   */
-  async function identify(): Promise<void> {
+  async function discoverPeer(spend?: () => AbortSignal): Promise<Descriptor> {
     const pins = opts.pins;
-    if (pins === undefined) return;
+    if (!pins) return discover(db, opts, spend);
     const held = await pins.pinOf(db);
     if (held.state === "repudiated") {
       throw new Repudiated(db, "an operator has to clear this before a read through it can run again");
     }
-    if (verified !== null && held.pinned === verified) return; // nothing has moved since the last check
-    const descriptor = (await limits()) as (Descriptor & { keys?: PublicKey[] }) | null;
-    const keys = descriptor?.keys ?? [];
+    const descriptor = await discover(db, opts, spend);
+    const keys = descriptor.keys;
     if (keys.length === 0) {
       // A database that publishes no key cannot be pinned, and a pin held against one that used to
       // publish keys is not something to quietly forget.
@@ -360,52 +273,44 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         await pins.repudiate(db);
         throw new Repudiated(db, "it published a key before and publishes none now");
       }
-      verified = null; // nothing to pin, so nothing is settled: the next batch asks again
-      return;
+      return descriptor;
     }
-    if (!(await wellFormed(keys))) throw new ForeignUnreachable(db, "its descriptor's keys are malformed");
+    const current = keys.find((k) => k.retired === undefined)!;
 
     if (held.pinned === null) {
       // First contact. The current key — the one it has not retired — is what gets pinned.
-      const current = keys.find((k) => k.retired === undefined) ?? keys[keys.length - 1]!;
       await pins.pin(db, current.id);
-      verified = current.id;
-      return;
+      return descriptor;
     }
     const reached = await reachable(keys, held.pinned);
-    if (reached === null) {
+    if (reached?.id !== current.id) {
       await pins.repudiate(db);
       throw new Repudiated(db, `it publishes no key reachable from the pinned ${held.pinned}`);
     }
     // The pin advances along the rotation chain, so the next contact starts from the newest key it
     // has proved rather than from one that may fall out of the grace window.
     if (reached.id !== held.pinned) await pins.pin(db, reached.id);
-    verified = reached.id;
+    return descriptor;
   }
 
-  /** The pin this client last checked a descriptor against. */
-  let verified: string | null = null;
-  /** The type names the two catalogs disagree on, read once. */
-  let agreed: Promise<ReadonlySet<string>> | null = null;
+  let agreed: ReadonlySet<string> | undefined;
 
   return {
-    async exec(plan: Plan, tasks: Miss[]): Promise<HostReply> {
-      const gathered: Gathered = { objects: new Map(), lists: [], counts: new Map(), asked: new Set() };
-      // Every reference this batch names is one it is entitled to an answer for, whatever happens
-      // next. A list's members join the set as they arrive.
-      for (const t of tasks) if (t.kind === "object") gathered.asked.add(t.id);
+    metersRequests: true,
+    async exec(plan, tasks, spend): Promise<HostReply> {
+      const gathered: Gathered = { objects: new Map(), lists: [], counts: new Map() };
       try {
-        await identify();
-        const advertised = (await limits())?.limits;
-        const max = advertised?.maxIds ?? DEFAULT_BATCH;
+        const descriptor = await discoverPeer(spend);
+        const advertised = descriptor.limits;
+        const max = advertised.maxIds;
         for (const batch of group(tasks, plan, opts.catalog, max, advertised)) {
-          await send(batch, plan, gathered);
+          await send(batch, plan, gathered, descriptor, spend);
         }
       } catch (e) {
         // `omit` covers a database that could not be reached. A repudiated one was reached and
         // answered — with a key that is not the one it proved before — and omitting that would turn
         // the loudest signal in the design into an empty list.
-        if (opts.omit === undefined || e instanceof Repudiated) throw e;
+        if (opts.omit === undefined || e instanceof Repudiated || e instanceof BudgetSpent) throw e;
         // Opted into an answer without it. Every reference this batch asked for comes back null and
         // the database is named in the report, so the answer says what is missing instead of
         // looking complete.
@@ -427,7 +332,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         // Nothing kept that was not asked for: an object is kept when it is one this batch named or
         // one a list in the answer points at. A responder that volunteers others is answering a
         // question nobody asked.
-        objects: [...gathered.objects].filter(([ref]) => gathered.asked.has(ref)),
+        objects: [...gathered.objects],
         lists: gathered.lists,
         counts: [...gathered.counts],
       };
@@ -440,8 +345,6 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     objects: Map<Ref, Obj | null>;
     lists: EdgeSegment[];
     counts: Map<string, number>;
-    /** References this batch is entitled to keep an object for. */
-    asked: Set<Ref>;
   }
 
   /** One request, and what of the asking plan it corresponds to. */
@@ -449,44 +352,64 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     body: ReadRequest;
     /** The asking frame each alias in the request stands for, so the answer maps back. */
     frames: Map<string, number>;
-    /** The root reference each id stands for. */
-    roots: Map<Id, Ref>;
-    /** For a list request: which list, which of this plan's frames it is, and where it was
-     *  continued from. */
-    list?: { atype: number; atypeFrame: number; after: Cursor | null };
   }
 
-  async function send(batch: Batch, plan: Plan, into: Gathered): Promise<void> {
+  async function send(batch: Batch, plan: Plan, into: Gathered, descriptor: Descriptor, spend?: () => AbortSignal): Promise<void> {
     // Keyed by the request, which is canonical because this side built it. Two frames asking the
     // same thing of the same database in one query then cost one request.
-    const key = JSON.stringify(batch.body);
+    const payload = JSON.stringify(batch.body);
+    const key = JSON.stringify([db, descriptor.keys.find(k => k.retired === undefined)?.id, payload]);
     const held = opts.cache?.get(key);
-    const body = held ?? (await request(db, "read", batch.body));
-    if (held === undefined && opts.cache !== undefined) {
-      const cache = (body as { cache?: { reuse?: string; seconds?: number } }).cache;
-      // `never` is kept for no time at all, which is what it means. The responder said it, and only
-      // it knows its own enforcement granularity.
-      if (cache?.reuse === "public" || cache?.reuse === "caller") opts.cache.put(key, body, cache.seconds ?? 0);
-    }
+    const url = db + "/read";
+    const body = held ?? await readJson(db, url, opts, {
+      method: "POST", body: payload,
+      headers: { "content-type": "application/json", ...await signature(url, payload, descriptor) },
+    }, spend);
     const decoded = decodeRead(body, opts.catalog);
-    const declined = new Set([...decoded.declined, ...(await disagreeing())]);
+    const declined = new Set([...decoded.declined, ...(await disagreeing(spend))]);
     // The responder numbers the frames of the plan IT compiled, which are not this plan's numbers.
     // `shape` is how the two are joined: this side chose the aliases, so walking `shape` from the
     // root with those aliases gives the responder's frame for each of this plan's.
-    const mine = new Map<number, number>();
-    const walk = (theirs: number, ours: number): void => {
-      mine.set(theirs, ours);
-      for (const [alias, to] of Object.entries(decoded.result.shape[theirs] ?? {})) {
-        const frame = batch.frames.get(alias);
-        if (frame !== undefined) walk(to, frame);
+    const lists = new Map<string, { frame: number; after: Cursor | null; requested: number }>();
+    const allowedObjects = new Set<Id>(batch.body.ids);
+    const visitedFrames = new Set<number>();
+    function walk(frame: number, parents: Set<Id>, node: Pick<ReadRequest, "hops" | "counts">) {
+      if (visitedFrames.has(frame)) throw new ForeignRefused(db, "a response frame appears twice");
+      visitedFrames.add(frame);
+      for (const parent of parents) {
+        const byAlias = decoded.result.counts[`${frame}:${parent}`];
+        if (!byAlias) continue;
+        for (const count of node.counts ?? []) {
+          if (typeof count === "string") continue;
+          const n = byAlias[count.as];
+          const atype = opts.catalog.edgeNamed(count.edge)?.atype;
+          if (atype !== undefined && Number.isSafeInteger(n) && n >= 0) into.counts.set(listKey(refOf(parent), atype), n);
+        }
       }
-    };
-    walk(0, batch.body.hops === undefined && batch.list === undefined ? 0 : 0);
+      for (const hop of node.hops ?? []) {
+        const alias = hop.as!;
+        const child = decoded.result.shape[frame]?.[alias];
+        const ours = batch.frames.get(alias);
+        if (child === undefined || ours === undefined) continue;
+        const targets = new Set<Id>();
+        for (const parent of parents) {
+          const key = `${child}:${parent}`;
+          const list = decoded.result.lists[key];
+          if (!list) continue;
+          lists.set(key, { frame: ours, requested: hop.limit ?? DEFAULT_HOP_LIMIT, after: hop.after === undefined ? null : tokenCursor(hop.after) });
+          for (const id of list.ids) {
+            if (parseRef(id).db !== null) continue;
+            targets.add(id);
+            allowedObjects.add(id);
+          }
+        }
+        walk(child, targets, hop);
+      }
+    }
+    walk(0, new Set(batch.body.ids), batch.body);
 
-    for (const ref of batch.roots.values()) into.asked.add(ref);
-
-    // Objects first, so a list's targets are in hand by the time the list is read.
     for (const [local, entry] of Object.entries(decoded.result.objects)) {
+      if (!allowedObjects.has(local)) continue;
       const ref = formatRef(db, local);
       const name = opts.catalog.object(entry.otype)?.name;
       if (name !== undefined && declined.has(name)) {
@@ -506,11 +429,10 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
 
     for (const [key, list] of Object.entries(decoded.result.lists)) {
       const cut = key.indexOf(":");
-      const theirs = Number(key.slice(0, cut));
+      const allowed = lists.get(key);
+      if (!allowed) continue;
       const parent = refOf(key.slice(cut + 1));
-      const ours = mine.get(theirs);
-      if (ours === undefined) continue; // a frame this side did not ask for
-      const source = plan.frames[ours]?.source;
+      const source = plan.frames[allowed.frame]?.source;
       if (source?.kind !== "edge") continue; // a field hop stores nothing and has no list to hold
       const rows: Edge[] = list.ids.map((id, i) => {
         const edge = list.edges?.[i] ?? null;
@@ -528,27 +450,20 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
           data: edge?.data ?? null,
         };
       });
-      for (const r of rows) into.asked.add(targetOf(r));
       into.lists.push({
         id1: parent,
         atype: source.atype,
-        after: batch.list !== undefined && ours === batch.list.atypeFrame ? batch.list.after : null,
+        after: allowed.after,
+        requested: allowed.requested,
         rows,
         complete: !list.more,
         // The responder's own cursor IS the continuation, and this side does not read it: a page
         // stops where the policy stopped it, and only the responder knows where the next one begins.
-        ...(list.more && list.cursor !== null ? { next: list.cursor } : {}),
+        ...(list.cursor !== null ? { next: list.cursor } : {}),
       });
     }
 
-    for (const [key, byAlias] of Object.entries(decoded.result.counts)) {
-      const cut = key.indexOf(":");
-      const parent = refOf(key.slice(cut + 1));
-      for (const [alias, n] of Object.entries(byAlias)) {
-        const atype = Number(alias.replace(/^a/, ""));
-        if (Number.isInteger(atype)) into.counts.set(listKey(parent, atype), n);
-      }
-    }
+    if (held === undefined && decoded.cache.reuse !== "never") opts.cache?.put(key, body, decoded.cache.seconds);
   }
 
   /**
@@ -577,33 +492,27 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
    * missing something its own schema says is always there. A field the responder exposes and this
    * side does not is the other direction and is fine — `declaredOnly` drops it.
    */
-  function disagreeing(): Promise<ReadonlySet<string>> {
-    if (opts.agree !== true) return Promise.resolve(new Set<string>());
-    agreed ??= (async () => {
-      const out = new Set<string>();
-      let doc: { types?: Record<string, { fields?: Record<string, { type: string; optional: boolean }> }> };
-      try {
-        doc = (await request(db, "vocabulary", undefined)) as typeof doc;
-      } catch {
-        // A responder that will not say cannot be checked. Names are then taken on trust, which is
-        // where step 4 left it and is no worse than it was.
-        return out;
-      }
-      for (const type of opts.catalog.objectTypes()) {
-        const theirs = doc.types?.[type.name];
-        if (theirs === undefined) continue; // not exposed at all: nothing of it will arrive
-        for (const [field, spec] of Object.entries(type.fields)) {
-          const mine = describe(spec);
-          const match = theirs.fields?.[field];
-          if (mine.optional && match === undefined) continue;
-          if (match === undefined || match.type !== mine.type) {
-            out.add(type.name);
-            break;
-          }
+  async function disagreeing(spend?: () => AbortSignal): Promise<ReadonlySet<string>> {
+    if (!opts.agree) return new Set();
+    if (agreed) return agreed;
+    const out = new Set<string>();
+    const doc = await readJson(db, db + "/vocabulary", opts, {}, spend) as {
+      types?: Record<string, { fields?: Record<string, { type: string; optional: boolean }> }>;
+    };
+    for (const type of opts.catalog.objectTypes()) {
+      const theirs = doc.types?.[type.name];
+      if (theirs === undefined) continue; // not exposed at all: nothing of it will arrive
+      for (const [field, spec] of Object.entries(type.fields)) {
+        const mine = describe(spec);
+        const match = theirs.fields?.[field];
+        if (mine.optional && match === undefined) continue;
+        if (match === undefined || match.type !== mine.type || (!mine.optional && match.optional)) {
+          out.add(type.name);
+          break;
         }
       }
-      return out;
-    })();
+    }
+    agreed = out;
     return agreed;
   }
 
@@ -652,7 +561,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         else heads.set(key, { atype: t.atype, frame: t.frame, n: t.n, parents: [t.id1] });
         continue;
       }
-      if (t.after.token === undefined) {
+      if (t.after.token === undefined && !t.after.resume) {
         // A sort-key cursor into a list this database does not hold. The coordinator only ever holds
         // a token for one of those, so reaching here means a cursor was carried across a boundary it
         // does not cross.
@@ -667,7 +576,6 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         out.push({
           body: { ids: slice.map((r) => parseRef(r).id), ...subtree(plan, frame, catalog, advertised, 1) },
           frames: labels(plan, frame),
-          roots: new Map(slice.map((r) => [parseRef(r).id, r])),
         });
       }
     }
@@ -684,7 +592,6 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         out.push({
           body: { ids: slice.map((r) => parseRef(r).id), counts: [{ as: `a${atype}`, edge: name }] },
           frames: new Map(),
-          roots: new Map(slice.map((r) => [parseRef(r).id, r])),
         });
       }
     }
@@ -708,15 +615,13 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
       edge: name,
       // Clamped to what the responder said it will take, rather than sent and refused. A refusal
       // costs a round trip and tells the caller nothing it could not have read in the descriptor.
-      limit: Math.min(n, advertised?.maxLimit ?? n),
+      limit: Math.min(Math.max(n, after?.resume?.limit ?? 0), advertised?.maxLimit ?? Infinity),
       ...(after?.token !== undefined ? { after: after.token } : {}),
       ...subtree(plan, frame, catalog, advertised, 2),
     };
     return {
       body: { ids: parents.map((r) => parseRef(r).id), hops: [hop] },
       frames: new Map([[`f${frame}`, frame], ...labels(plan, frame)]),
-      roots: new Map(parents.map((r) => [parseRef(r).id, r])),
-      list: { atype, after, atypeFrame: frame },
     };
   }
 
@@ -750,23 +655,26 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         source?.kind === "edge"
           ? catalog.edge(source.atype)?.name
           : source?.kind === "field"
-            ? catalog.edgeTypes().find((e) => e.field === source.field)?.name
+            ? fieldEdge(catalog, source.field)
             : undefined;
       // A type this catalog cannot name is one the two sides do not agree on, so the hop is left out
       // and the coordinator reads that level itself — which will fail by name rather than quietly.
       if (name === undefined) continue;
-      const limit = plan.frames[child.frame]?.limit;
+      const frame = plan.frames[child.frame];
+      // The coordinator requests continued lists explicitly, with their own cursor.
+      if (frame.after) continue;
+      const limit = Math.min(frame.limit ?? DEFAULT_HOP_LIMIT, advertised?.maxLimit ?? Infinity);
       hops.push({
         as: `f${child.frame}`,
         edge: name,
-        ...(limit !== undefined ? { limit: Math.min(limit, advertised?.maxLimit ?? limit) } : {}),
+        limit,
         ...subtree(plan, child.frame, catalog, advertised, depth + 1),
       });
     }
     const counts: CountSpec[] = [];
-    for (const c of f.counts) {
-      const name = catalog.edge(c.atype)?.name;
-      if (name !== undefined) counts.push({ as: `a${c.atype}`, edge: name });
+    for (const atype of new Set(f.counts.map(c => c.atype))) {
+      const name = catalog.edge(atype)?.name;
+      if (name !== undefined) counts.push({ as: `a${atype}`, edge: name });
     }
     return { ...(hops.length > 0 ? { hops } : {}), ...(counts.length > 0 ? { counts } : {}) };
   }
@@ -785,11 +693,83 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
   }
 }
 
+function fieldEdge(catalog: Catalog, field: string): string | undefined {
+  const matches = catalog.edgeTypes().filter(edge => edge.field === field);
+  return matches.length === 1 ? matches[0].name : undefined;
+}
+
+type TransportOptions = Pick<ForeignOptions, "fetch" | "guard" | "maxResponseBytes" | "deadlineMs">;
+
+async function readJson(db: string, url: string, opts: TransportOptions, init: RequestInit, spend?: () => AbortSignal): Promise<unknown> {
+  const budget = spend?.();
+  const timeout = AbortSignal.timeout(opts.deadlineMs ?? DEADLINE_MS);
+  const signal = budget ? AbortSignal.any([budget, timeout]) : timeout;
+  const cap = opts.maxResponseBytes ?? MAX_RESPONSE_BYTES;
+  const call = opts.fetch ?? opts.guard?.fetch ?? fetch;
+  async function exchange() {
+    if (opts.guard && call !== opts.guard.fetch) await opts.guard(db);
+    signal.throwIfAborted();
+    const res = await call(url, { ...init, signal, redirect: "error", cache: "no-store" });
+    if ([400, 401, 403].includes(res.status)) {
+      const refusal = await text(res, cap).then(parse).catch(() => null) as { error?: string; at?: string } | null;
+      throw new ForeignRefused(db, `${refusal?.at ?? "?"}: ${refusal?.error ?? `status ${res.status}`}`);
+    }
+    if (!res.ok) {
+      void res.body?.cancel().catch(() => {});
+      throw new ForeignUnreachable(db, `status ${res.status}`);
+    }
+    const raw = await text(res, cap);
+    try {
+      return parse(raw);
+    } catch {
+      throw new ForeignUnreachable(db, "the answer is not JSON");
+    }
+  }
+  let abort!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+  try {
+    return await Promise.race([exchange(), aborted]);
+  } catch (e) {
+    if (budget?.aborted) throw budget.reason;
+    if (e instanceof ForeignRefused || e instanceof ForeignUnreachable || (e as Error).name === "PrivateAddress") throw e;
+    throw new ForeignUnreachable(db, (e as Error).message);
+  } finally {
+    signal.removeEventListener("abort", abort);
+  }
+}
+
+export async function discover(database: string, opts: TransportOptions, spend?: () => AbortSignal): Promise<Descriptor> {
+  const db = canonicalDb(database);
+  const d = await readJson(db, db, opts, {}, spend) as Descriptor;
+  if (!d || d.protocol !== "hlekk" || d.v !== DESCRIPTOR_VERSION || d.database !== db ||
+      !Array.isArray(d.wire) || !d.wire.includes(WIRE_VERSION) || d.wire.some(v => !Number.isSafeInteger(v) || v < 1) ||
+      !Number.isSafeInteger(d.catalog) || d.catalog < 0 ||
+      !Array.isArray(d.keys) || !(await wellFormed(d.keys)) ||
+      (d.keys.length && d.keys.filter(k => k.retired === undefined).length !== 1)) {
+    throw new ForeignUnreachable(db, "invalid descriptor identity, wire version or keys");
+  }
+  for (const key of ["maxDepth", "maxLimit", "maxIds", "maxBody", "maxFrames", "maxNodes", "maxWhere", "maxCounts"] as const) {
+    const n = d.limits?.[key];
+    const min = key === "maxWhere" || key === "maxCounts" ? 0 : 1;
+    if (!Number.isSafeInteger(n) || n < min) throw new ForeignUnreachable(db, `invalid descriptor limit ${key}`);
+  }
+  for (const route of ["read", "price", "vocabulary"] as const) {
+    if (d.routes?.[route] !== db + "/" + route) throw new ForeignUnreachable(db, `invalid descriptor route ${route}`);
+  }
+  return d;
+}
+
 /** The body, up to the cap. A stranger's Content-Length is a claim, so the bytes are counted as they
  *  arrive and the read stops rather than filling this isolate's memory on request. */
 async function text(res: Response, cap: number): Promise<string> {
   const claimed = res.headers.get("content-length");
-  if (claimed !== null && Number(claimed) > cap) throw new Error(`the answer claims ${claimed} bytes, over the ${cap} cap`);
+  if (claimed !== null && Number(claimed) > cap) {
+    void res.body?.cancel().catch(() => {});
+    throw new Error(`the answer claims ${claimed} bytes, over the ${cap} cap`);
+  }
   const body = res.body;
   if (body === null) return "";
   const reader = body.getReader();

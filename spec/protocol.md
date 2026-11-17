@@ -302,14 +302,18 @@ implementation:
 > signer's choice accepts a signature over nothing much. Every component a verifier lets a signer
 > drop is one an attacker may drop, and every algorithm it accepts is one an attacker may choose.
 
-A responder **MUST NOT** sign a response. TLS and the key pin carry it, which means a proxy in the
-path is trusted as the origin is; this is a stated choice rather than an omission.
+A responder **MUST NOT** sign a response in version 1. TLS authenticates the responding origin.
+A proxy that terminates TLS is trusted to serve the response.
 
 ### 7.3 Keys, pinning and rotation
 
+A descriptor pin detects changes in the keys an origin advertises. An operator with control
+of that origin can copy the old public descriptor. Only the caller proves possession of its
+private key, through a signed request.
+
 - A database **SHOULD** publish exactly one current key. A key's `id` **MUST** be the base64url
-  SHA-256 of the key itself, so an id is a fact about a key and not a claim.
-- A caller **MUST** record the key a database proved on first contact (a **pin**), and on later
+  SHA-256 of the key itself.
+- A caller **MUST** record the current key a database publishes on first contact (a **pin**), and on later
   contact **MUST** accept the database only if it publishes the pinned key or a key reachable from it
   through rotation signatures. The pin then advances to the key reached.
 - A rotated key **MUST** carry `signedBy`: the id of the key it replaces, and that key's signature
@@ -320,7 +324,7 @@ path is trusted as the origin is; this is a stated choice rather than an omissio
   looked recently can still walk forward from its pin.
 - Where a database publishes no key reachable from the pin, a caller **MUST** treat the pin as
   **repudiated**: every read through that reference **MUST** fail by name, and **MUST NOT** resolve.
-  A caller **MUST NOT** clear a repudiation automatically.
+  A caller **MUST NOT** clear a repudiation automatically. Discovery errors are retryable and leave the pin intact.
 - A responder **MAY** record a caller's key. It **SHOULD** record a caller only where its policy
   distinguishes that caller; anyone else is verified and forgotten.
 

@@ -6,6 +6,10 @@ import type { Lock } from "../catalog/catalog.ts";
 import { federate } from "../testkit/federation.ts";
 import type { Federation } from "../testkit/federation.ts";
 import { ForeignUnreachable, NotFollowed, ResponseCache, foreignClient } from "./client.ts";
+import { defineObject, edge, str } from "../schema/define.ts";
+import { objField } from "../schema/query.ts";
+import { DEFAULT_LIMITS } from "../query/request.ts";
+import { PUBLIC } from "../query/serve.ts";
 import { BudgetSpent } from "../client/client.ts";
 import { assertSound } from "../testkit/invariants.ts";
 import type { Id, Plan } from "../query/types.ts";
@@ -95,6 +99,45 @@ async function two(opts: Partial<Parameters<typeof federate>[0]> = {}): Promise<
   await notes.db.assocAdd(T.about, note, `${WIKI}#${page}`, 1);
   return { f, note, page, other };
 }
+
+describe("foreign pages", () => {
+  const Page = defineObject("wiki.page", NOTES_CATALOG.objectNamed("wiki.page")!.otype, { title: str() });
+  const links = edge("wiki.page_links", T.links, Page, Page);
+
+  for (const driver of ["async", "rounds"] as const) {
+    it(`continues through empty pages, filters and application page boundaries on ${driver}`, async () => {
+      const { f, page } = await two();
+      const wiki = f.member(WIKI);
+      wiki.binding.limits = { ...DEFAULT_LIMITS, maxLimit: 2 };
+      const hidden = new Set<string>();
+      wiki.binding.policy = { ...PUBLIC, object: id => !hidden.has(id) };
+      for (let i = 2; i <= 8; i++) {
+        const id = await wiki.db.create(T.page, { title: i === 5 ? "skip" : String(i) }, { with: page });
+        if (i >= 7) hidden.add(id);
+        await wiki.db.assocAdd(T.wikiLinks, page, id, i);
+      }
+      const root = `${WIKI}#${page}`;
+      const db = f.member(NOTES).db;
+      const queryPage = (start: string | null) => Page.gen(root).relatedPage("links", links, sub => {
+        const level = sub.where(objField("title", "!=", "skip")).limit(2);
+        return start ? level.after(start) : level;
+      });
+      const seen: string[] = [];
+      let cursor: string | null = null;
+      for (let i = 0; i < 4; i++) {
+        const query = queryPage(cursor);
+        const [answer] = await query.run(db, { driver });
+        const normalized = await db.normalized(query.compile().plan, [root], { driver });
+        assert.equal(answer.links.cursor, normalized.lists[`1:${root}`].cursor);
+        seen.push(...answer.links.items.map(row => row.title));
+        if (!answer.links.more) break;
+        cursor = answer.links.cursor;
+        assert.ok(cursor);
+      }
+      assert.deepEqual(seen, ["6", "4", "3", "2", "Capital"]);
+    });
+  }
+});
 
 describe("the first cross-database read", () => {
   for (const driver of ["async", "rounds"] as const) {
@@ -222,7 +265,7 @@ describe("a database answering a read never follows a reference out of itself", 
     const res = await f.fetch(`${B}/read`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ids: [inB], hops: [{ as: "out", edge: "a.out" }] }),
+      body: JSON.stringify({ ids: [inB], hops: [{ as: "out", edge: "a.out", hops: [{ edge: "a.out" }] }] }),
     });
     assert.equal(res.status, 200);
     const body = (await res.json()) as {
@@ -238,7 +281,9 @@ describe("a database answering a read never follows a reference out of itself", 
 
     // And nothing hangs off it: B holds no edge list for an object it does not have, so an empty one
     // there would read as "C has nothing" rather than "ask C".
-    assert.equal(`2:${inC}` in body.lists, false);
+    assert.deepEqual(Object.keys(body.lists), [`1:${inB}`]);
+    await b.db.query(ABOUT_PLAN, [inB], { driver: "rounds", foreign: "reference" });
+    assert.equal(c.served.read, 0);
   });
 
   it("passes a reference through a filter undecided rather than dropping it", async () => {
@@ -354,8 +399,8 @@ describe("failure is stated, never inferred", () => {
     // A responder supplying objects for a third database would let it seed this one's view of that
     // database. Object keys must be bare ids of the answering database, and `decodeRead` checks it.
     const forged = await federate({
-      members: [{ uri: NOTES, lock: NOTES_LOCK, database: "notes2" }],
-      wrap: () => async () =>
+      members: [{ uri: NOTES, lock: NOTES_LOCK, database: "notes2" }, { uri: WIKI, lock: WIKI_LOCK }],
+      wrap: (inner) => async (input, init) => String(input) === WIKI ? inner(input, init) :
         new Response(
           JSON.stringify({
             v: 1,
@@ -510,6 +555,44 @@ describe("a foreign hop that fails", () => {
 });
 
 describe("what a responder may not slip into an answer", () => {
+  it("ignores lists and counts outside the requested frame and parents", async () => {
+    const { f, page } = await two({
+      wrap: inner => async (input, init) => {
+        const res = await inner(input, init);
+        if (!String(input).endsWith("/read")) return res;
+        const body = await res.json();
+        body.lists["1:999"] = { ids: [], cursor: null, more: false };
+        body.counts["0:999"] = { [`a${T.links}`]: 99 };
+        body.counts[`0:${body.roots[0]}`] = { a999: 99 };
+        return Response.json(body);
+      },
+    });
+    const reads = await foreignClient(WIKI, { catalog: NOTES_CATALOG, fetch: f.fetch }).exec({
+      frames: [
+        { source: { kind: "ids" }, children: [{ alias: "links", frame: 1 }], counts: [] },
+        { source: { kind: "edge", atype: T.links }, children: [], counts: [] },
+      ],
+    }, [{ kind: "object", id: WIKI + "#" + page, frame: 0 }]);
+    assert.deepEqual(reads.reads.lists.map(l => l.id1), [WIKI + "#" + page]);
+    assert.deepEqual(reads.reads.counts, []);
+  });
+
+  it("validates the peer identity, wire version and limits during discovery", async () => {
+    const { f, page } = await two();
+    const descriptor = await (await f.fetch(WIKI)).json();
+    for (const change of [
+      { database: GONE }, { wire: [123] },
+      { limits: { ...descriptor.limits, maxIds: 0 } },
+      { limits: { ...descriptor.limits, maxLimit: 1.5 } },
+    ]) {
+      const client = foreignClient(WIKI, {
+        catalog: NOTES_CATALOG,
+        fetch: async () => Response.json({ ...descriptor, ...change }),
+      });
+      await assert.rejects(client.exec({ frames: [] }, [{ kind: "object", id: WIKI + "#" + page, frame: 0 }]), ForeignUnreachable);
+    }
+  });
+
   it("keeps nothing that was not asked for", async () => {
     // A responder that volunteers objects is answering a question nobody asked, and keeping those
     // would let it seed this database's view of its own graph.
@@ -557,13 +640,15 @@ describe("what a responder may not slip into an answer", () => {
 describe("what one query may spend reaching other databases", () => {
   it("gives up when the request count is spent, saying which of the three ran out", async () => {
     const { f, note } = await two();
-    // One hop needs one request, so a budget of zero cannot even start.
+    // Discovery uses the only request available. The read must wait for another budget.
     const err = (await f
       .member(NOTES)
-      .db.query(ABOUT_PLAN, [note], { budget: { requests: 0 } })
+      .db.query(ABOUT_PLAN, [note], { budget: { requests: 1 } })
       .then(() => null, (e: Error) => e)) as BudgetSpent;
     assert.equal(err.name, "BudgetSpent");
     assert.equal(err.what, "requests");
+    assert.equal(f.member(WIKI).served.descriptor, 1);
+    assert.equal(f.member(WIKI).served.read, 0);
     // And the same query inside its budget is answered.
     const rows = (await f.member(NOTES).db.query(ABOUT_PLAN, [note], { budget: { requests: 4 } })) as {
       about: unknown[];
@@ -618,6 +703,18 @@ describe("what one query may spend reaching other databases", () => {
 });
 
 describe("keeping an answer for as long as the responder permitted", () => {
+  it("isolates identical reads from different databases sharing a cache", async () => {
+    const { f, page } = await two({ members: [
+      { uri: WIKI, lock: WIKI_LOCK }, { uri: GONE, lock: WIKI_LOCK }, { uri: NOTES, lock: NOTES_LOCK },
+    ], foreign: { cache: new ResponseCache() } });
+    const other = await f.member(GONE).db.create(T.page, { title: "Different" }, { vshard: "3" });
+    assert.equal(other, page);
+    const rows = await f.member(NOTES).db.query({ frames: [{ source: { kind: "ids" }, children: [], counts: [] }] }, [WIKI + "#" + page]);
+    const next = await f.member(NOTES).db.query({ frames: [{ source: { kind: "ids" }, children: [], counts: [] }] }, [GONE + "#" + page]);
+    assert.equal((rows[0] as { title: string }).title, "Country");
+    assert.equal((next[0] as { title: string }).title, "Different");
+  });
+
   it("answers a repeated read from the cache, and only while the response allows", async () => {
     let now = 1_000_000;
     const cache = new ResponseCache(() => now);

@@ -159,7 +159,8 @@ The caller is therefore named by its URI, and what remains is binding that claim
 - **A URI resolves to a key at a well-known path under it.** TLS already proves domain control, so
   this is exactly as strong as the domain and needs no new infrastructure or coordinated PKI.
 - **Pinned on first use, checked on later contact.** This is the `pinned` column in
-  [`global-ids.md`](global-ids.md)'s registry, and it is what makes substitution loud instead of silent.
+  [`global-ids.md`](global-ids.md)'s registry. A changed key requires a signed rotation.
+  The TLS origin authenticates the response. A replacement operator can republish an old descriptor.
 - **The registry is symmetric.** A pins B's key when A interns B; B pins A's when A first calls. The
   same columns serve both directions — only the alias is outbound-only, because only stored edges
   need it. There is one table, not two.

@@ -100,6 +100,7 @@ export interface Binding {
   prefix?: string;
   /** The keys this database publishes in its descriptor. */
   keys?: DescriptorKey[];
+  publishedKeys?: () => DescriptorKey[];
   /** Seconds since the epoch, as this database sees it, for the signature's creation window. */
   now?: () => number;
   maxSkewSeconds?: number;
@@ -136,7 +137,7 @@ export function descriptorOf(binding: Binding): Descriptor {
       maxIds: binding.maxIds ?? MAX_IDS,
       maxBody: binding.maxBody ?? MAX_BODY,
     },
-    keys: binding.keys ?? [],
+    keys: binding.publishedKeys?.() ?? binding.keys ?? [],
     routes: { read: at("read"), price: at("price"), vocabulary: at("vocabulary") },
   };
 }
@@ -158,8 +159,9 @@ const serveOptions = (binding: Binding, policy?: Policy): ServeOptions => ({
  * request made during an inbound one — that is what "a URI resolves to a key at a well-known path
  * under it" costs, and it is cached per caller by whatever supplies `callerKeys`.
  */
-async function authorize(request: Request, binding: Binding, body: string): Promise<{ policy?: Policy } | Response> {
+async function authorize(request: Request, binding: Binding, body: Uint8Array): Promise<{ policy?: Policy } | Response> {
   let caller: Caller | null = null;
+  let keys: readonly PublicKey[] = [];
   if (binding.callerKeys === undefined) {
     // This database verifies nothing, and its descriptor says so by publishing no key. A signature
     // presented anyway is refused rather than ignored: the caller took the trouble to make a claim,
@@ -175,12 +177,12 @@ async function authorize(request: Request, binding: Binding, body: string): Prom
     try {
       caller = await verifyRequest({
         method: request.method,
-        url: request.url,
+        url: binding.database + new URL(request.url).pathname.slice(mountOf(binding).length) + new URL(request.url).search,
         body,
         headers: request.headers,
         now: binding.now?.() ?? Math.floor(Date.now() / 1000),
         maxSkewSeconds: binding.maxSkewSeconds,
-        keysOf: binding.callerKeys,
+        keysOf: async (uri) => (keys = await binding.callerKeys!(uri)),
       });
     } catch (e) {
       if (e instanceof SignatureRefused) return json({ error: e.message, at: "signature" }, 401);
@@ -201,7 +203,6 @@ async function authorize(request: Request, binding: Binding, body: string): Prom
       // up with looks exactly like a substitution from here, and the descriptor is what tells them
       // apart — which is `pinned()` on the asking side. A responder that cannot walk the chain
       // refuses rather than advancing the pin on the strength of the request itself.
-      const keys = await binding.callerKeys!(caller.database);
       const reached = await reachable(keys, held.pinned);
       if (reached === null || reached.id !== caller.key.id) {
         await binding.pins.repudiate(caller.database);
@@ -260,7 +261,7 @@ export async function handle(request: Request, binding: Binding): Promise<Respon
     if (authorized instanceof Response) return authorized;
     let req: ReadRequest;
     try {
-      req = JSON.parse(raw) as ReadRequest;
+      req = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)) as ReadRequest;
     } catch {
       return json({ error: "body is not JSON" }, 400);
     }
@@ -297,25 +298,40 @@ function method(request: Request, allowed: "GET" | "POST"): Response | null {
  * The body, or the response that refuses it.
  *
  * The size is checked twice on purpose. `content-length` is the cheap check and refuses before a
- * byte is read, but it is a claim and a chunked body carries none, so the decoded text is checked as
- * well — before `JSON.parse`, which is the work a 413 exists to refuse.
+ * byte is read, but it is a claim and a chunked body carries none, so the stream is counted before
+ * decoding it. The digest covers these exact bytes.
  */
-async function body(request: Request, maxBody: number): Promise<string | Response> {
-  const claimed = request.headers.get("content-length");
-  if (claimed !== null && Number(claimed) > maxBody) {
-    return json({ error: `body of ${claimed} bytes, the maximum is ${maxBody}` }, 413);
+async function body(request: Request, maxBody: number): Promise<Uint8Array | Response> {
+  const over = () => json({ error: `body too large, the maximum is ${maxBody} bytes` }, 413);
+  if (Number(request.headers.get("content-length")) > maxBody) {
+    void request.body?.cancel().catch(() => {});
+    return over();
   }
-  let text: string;
+  const reader = request.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
   try {
-    text = await request.text();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBody) {
+        void reader.cancel().catch(() => {});
+        return over();
+      }
+      chunks.push(value);
+    }
   } catch {
     return json({ error: "could not read the body" }, 400);
+  } finally {
+    reader.releaseLock();
   }
-  // Bytes, not characters: a body of multi-byte text is as expensive as its bytes.
-  const bytes = new TextEncoder().encode(text).byteLength;
-  if (bytes > maxBody) return json({ error: `body of ${bytes} bytes, the maximum is ${maxBody}` }, 413);
-  // Returned as text and not as parsed JSON, because the signature covers a digest OF THE BYTES: a
-  // body re-serialized from a parse is a different body, and verifying against one would make the
-  // signature depend on this implementation's JSON writer.
-  return text;
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }

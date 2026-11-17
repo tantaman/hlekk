@@ -2,7 +2,7 @@
 // gathered graph. The async driver's store, which reaches the hosts, is in driver.ts.
 
 import { isQualified } from "./ref.ts";
-import { UNKNOWN, cursorOf, edgeOrder, listKey } from "./types.ts";
+import { UNKNOWN, cursorOf, edgeOrder, listKey, targetOf } from "./types.ts";
 import type { Cursor, Edge, EdgePage, Id, Maybe, Obj, Store } from "./types.ts";
 
 /** One host DO's data. It owns some vshards; everything else is UNKNOWN to it. */
@@ -76,6 +76,7 @@ export class HostStore implements Store {
 
 /** A run of one edge list as read: from the head (after = null) or after a cursor. */
 export interface EdgeSegment extends EdgePage {
+  requested?: number;
   id1: Id;
   atype: number;
   after: Cursor | null;
@@ -91,6 +92,7 @@ export interface ReadSet {
  *  immediately after, or null when it starts at the head: without that, a run read from the middle
  *  would answer a read of the head. */
 export interface KnownRun {
+  pages?: Map<string | null, EdgeSegment>;
   from: Cursor | null;
   rows: Edge[];
   complete: boolean;
@@ -116,31 +118,25 @@ export class Cache {
     const cur = this.lists.get(k);
     const after = s.after;
 
+    if (isQualified(s.id1)) {
+      const pages = cur?.pages ?? new Map<string | null, EdgeSegment>();
+      const start = after?.token ?? null;
+      const prev = pages.get(start);
+      if (prev && !s.complete && (prev.complete || prev.rows.length > s.rows.length)) return;
+      pages.set(start, s);
+      if (cur && !cur.complete && cur.next === start) {
+        cur.rows.push(...s.rows);
+        cur.complete = s.complete;
+        cur.next = s.next;
+      } else if (!cur || start === null || cur.from?.token === start) {
+        this.lists.set(k, { from: after, rows: [...s.rows], complete: s.complete, next: s.next, pages });
+      }
+      return;
+    }
     // Nothing known yet: the segment is the run, starting wherever it was read from. A plan can name
     // a starting cursor, so the first read of a list is not always a read of its head.
     if (!cur) {
       this.lists.set(k, { from: after, rows: s.rows, complete: s.complete, ...(s.next !== undefined ? { next: s.next } : {}) });
-      return;
-    }
-    // A list another database holds joins by TOKEN and not by sort key: the rows the responder
-    // dropped are rows this side never saw, so the last row it holds is not where the next page
-    // began. Only the token the responder handed back says that.
-    if (after?.token !== undefined || cur.next !== undefined || s.next !== undefined) {
-      if (after?.token !== undefined && cur.next === after.token) {
-        this.lists.set(k, {
-          from: cur.from,
-          rows: [...cur.rows, ...s.rows],
-          complete: s.complete,
-          ...(s.next !== undefined ? { next: s.next } : {}),
-        });
-        return;
-      }
-      if (after === null && (s.complete || s.rows.length > cur.rows.length || cur.from !== null)) {
-        // A re-read of the head supersedes whatever was held, as it does for a local list.
-        this.lists.set(k, { from: null, rows: s.rows, complete: s.complete, ...(s.next !== undefined ? { next: s.next } : {}) });
-      }
-      // Anything else is two runs of a foreign list that do not meet, and joining them would invent
-      // adjacency across rows a policy removed.
       return;
     }
     if (after === null) {
@@ -177,20 +173,17 @@ export class Cache {
   page(id1: Id, atype: number, after: Cursor | null, n: number): Maybe<EdgePage> {
     const list = this.lists.get(listKey(id1, atype));
     if (!list) return UNKNOWN;
-    // A foreign list is addressed by token, and a run is only an answer to the read that asked for
-    // the token it starts at. Anything else is UNKNOWN, which sends the read to the database that
-    // holds the list — the only party that can place a token.
-    if (after?.token !== undefined) {
-      if (list.from?.token !== after.token) return UNKNOWN;
-      const rows = list.rows.slice(0, n);
-      return { rows, complete: list.complete && n >= list.rows.length, ...(list.next !== undefined ? { next: list.next } : {}) };
-    }
-    if (list.from?.token !== undefined) return UNKNOWN; // held from a token, asked for by sort key
-    if (list.next !== undefined) {
-      // A head read of a foreign list: the run is what it is, and `next` is where it goes on.
-      if (list.from !== null) return UNKNOWN;
-      const rows = list.rows.slice(0, n);
-      return { rows, complete: list.complete && n >= list.rows.length, next: list.next };
+    if (list.pages) {
+      if (after && !after.token && !after.resume) return UNKNOWN;
+      const page = list.pages.get(after?.token ?? null);
+      if (!page) return UNKNOWN;
+      if (!after?.resume) return page;
+      const index = page.rows.findIndex(row => targetOf(row) === after.resume!.target);
+      if (index < 0) {
+        if (!page.complete && (page.requested ?? 0) < after.resume.limit) return UNKNOWN;
+        throw new Error("the foreign page no longer contains its continuation target");
+      }
+      return { ...page, rows: page.rows.slice(index + 1) };
     }
     // The known run has to cover where this read starts, or its rows say nothing about it.
     if (after === null) {

@@ -198,6 +198,38 @@ describe("the protocol over HTTP", () => {
     }
   });
 
+  it("refuses invalid request members at their paths", async () => {
+    const { binding, issue } = await served();
+    for (const [tree, path] of [
+      [{ counts: {} }, "counts"], [{ hops: null }, "hops"],
+      [{ hops: [{ edge: "issues.issue_comments", as: 1 }] }, "hops[0].as"],
+      [{ hops: [{ edge: "issues.issue_comments", where: {} }] }, "hops[0].where"],
+      [{ counts: [{ edge: "issues.issue_comments", as: false }] }, "counts[0].as"],
+    ] as const) {
+      const response = await post(binding, "/price", { ids: [issue], ...tree });
+      assert.equal(response.status, 400);
+      assert.equal((await response.json()).at, path);
+    }
+  });
+
+  it("cancels a chunked body as soon as its raw bytes exceed the cap", async () => {
+    const { binding } = await served();
+    let cancelled = false;
+    let chunks = 0;
+    const stream = new ReadableStream({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(3));
+        if (++chunks === 10) controller.close();
+      },
+      cancel() { cancelled = true; },
+    });
+    const init = { method: "POST", body: stream, duplex: "half" };
+    const response = await at({ ...binding, maxBody: 4 }, "/read", init);
+    assert.equal(response.status, 413);
+    assert.equal(cancelled, true);
+    assert.ok(chunks < 10);
+  });
+
   it("refuses a body over the cap before parsing it", async () => {
     const { binding } = await served();
     // A claimed length, refused before a byte is read.

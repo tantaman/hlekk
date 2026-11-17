@@ -85,12 +85,7 @@ export async function main(argv: readonly string[]): Promise<void> {
     allowLoopback: args.allowLoopback,
   });
 
-  const { database: _derived, ...parts } = database.binding;
-  const node = await listen(parts, { path: args.path, port: args.port, host: args.host });
-  // Recorded now and not before: the URI is an origin and a path, and the origin is not known until
-  // the socket is open. A deployment that passed `--uri` has already recorded that one, and the
-  // directory refuses to be renamed, so this is a no-op there.
-  if (args.uri === undefined) database.cluster.directory.setDatabaseUri(node.database);
+  const node = await listen(database.binding, { path: args.path, port: args.port, host: args.host, database: args.uri });
 
   const keys = database.binding.keys ?? [];
   console.log(`hlekk: serving ${node.database} from ${args.dir}`);

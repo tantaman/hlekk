@@ -356,7 +356,7 @@ export function price(req: ReadRequest, opts: ServeOptions): Cost {
   }
   // The names the answer will carry, against the aliasing this protocol uses. Separate from `check`,
   // which is shared with callers that derive their names differently.
-  checkAliases(req);
+  checkAliases(req, undefined, limits.maxDepth);
   return check(req, vocabulary, limits, ids.length);
 }
 

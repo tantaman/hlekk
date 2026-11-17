@@ -66,6 +66,16 @@ describe("the guard", () => {
     await assert.doesNotReject(resolving(["93.184.216.34"])("https://outside.example/db"));
   });
 
+  it("applies exact reserved prefixes to canonical URI literals", async () => {
+    const guard = privateAddressGuard();
+    for (const literal of ["[::ffff:c000:201]", "[febf::1]", "192.0.2.1", "198.51.100.2", "203.0.113.3"]) {
+      await assert.rejects(guard(`https://${literal}/db`), PrivateAddress);
+    }
+    for (const literal of ["192.0.3.1", "198.51.101.2", "203.0.114.3"]) {
+      await guard(`https://${literal}/db`);
+    }
+  });
+
   it("refuses a name with any private address, not just a first one", async () => {
     // A name with one public and one private record would otherwise pass the check and be reached at
     // whichever the connection picked.
@@ -97,7 +107,7 @@ describe("the guard", () => {
     await assert.rejects(privateAddressGuard()("http://127.0.0.1:8080/db"), PrivateAddress);
   });
 
-  it("checks a database once and remembers the answer", async () => {
+  it("resolves a database again on each check", async () => {
     let asked = 0;
     const guard = privateAddressGuard({
       resolve: async () => {
@@ -107,7 +117,7 @@ describe("the guard", () => {
     });
     await Promise.all([guard("https://a.example/db"), guard("https://a.example/db")]);
     await guard("https://a.example/db");
-    assert.equal(asked, 1);
+    assert.equal(asked, 3);
   });
 
   it("refuses a URI that is not canonical, before it resolves anything", async () => {

@@ -1,25 +1,9 @@
-// Refusing a database URI that resolves to an address inside this network, before anything is sent
-// to it.
-//
-// A database URI is drawn by whoever writes the edge, and an edge can be written at a name nobody
-// has deployed — that openness is the point of the design. The cost is that a URI is also an
-// instruction to this process to make a request, so a reference to `http://169.254.169.254/db` or to
-// a name whose A record points at `10.0.0.5` turns a read into a probe of whatever this deployment
-// can reach but a stranger cannot. That is server-side request forgery with the request body chosen
-// by the caller.
-//
-// This is in `adapters/node/` and not in `protocol/client.ts` because resolving a name is a platform
-// thing: `node:dns` does not exist on Workers, and on Workers it is not needed — a Worker's `fetch`
-// reaches the public internet and the platform's own bindings, not a VPC. So the check arrives as
-// `guard` where the platform can make it, and the protocol client knows only that something may
-// refuse before it sends.
-//
-// **What this is not.** It is not a defence against a hostile DNS server that answers differently
-// for the check and for the request, which is a time-of-check-to-time-of-use gap only a resolving
-// HTTP client can close. It raises the cost of the obvious attack and says plainly that it does not
-// close that gap.
-
 import { lookup } from "node:dns/promises";
+
+import { BlockList, isIP } from "node:net";
+import { request as http } from "node:http";
+import { request as https } from "node:https";
+import { Readable } from "node:stream";
 
 import { canonicalDb } from "../../query/ref.ts";
 
@@ -34,39 +18,25 @@ export class PrivateAddress extends Error {
   }
 }
 
-/** Whether an address is one a stranger's URI may send this process to. */
-export function isPublicAddress(address: string): boolean {
-  if (address.includes(":")) return isPublicV6(address);
-  const parts = address.split(".").map(Number);
-  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
-  const [a, b] = parts as [number, number, number, number];
-  if (a === 0) return false; // "this network"
-  if (a === 10) return false; // RFC 1918
-  if (a === 127) return false; // loopback
-  if (a === 169 && b === 254) return false; // link-local, and the cloud metadata services on it
-  if (a === 172 && b >= 16 && b <= 31) return false; // RFC 1918
-  if (a === 192 && b === 168) return false; // RFC 1918
-  if (a === 100 && b >= 64 && b <= 127) return false; // RFC 6598, carrier NAT
-  if (a === 192 && b === 0) return false; // 192.0.0.0/24 and 192.0.2.0/24
-  if (a === 198 && (b === 18 || b === 19)) return false; // benchmarking
-  if (a === 198 && b === 51) return false; // documentation
-  if (a === 203 && b === 0) return false; // documentation
-  if (a >= 224) return false; // multicast, and everything reserved above it
-  return true;
-}
+// BlockList compares numeric addresses and also applies IPv4 subnets to mapped IPv6.
+const reserved = new BlockList();
+for (const [network, prefix] of [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+  ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24],
+  ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24], ["203.0.113.0", 24],
+  ["224.0.0.0", 3],
+] as const) reserved.addSubnet(network, prefix, "ipv4");
+for (const [network, prefix] of [
+  ["::", 96], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8], ["2001:db8::", 32],
+] as const) reserved.addSubnet(network, prefix, "ipv6");
 
-function isPublicV6(address: string): boolean {
-  const a = address.replace(/^\[|\]$/g, "").toLowerCase();
-  if (a === "::1" || a === "::") return false;
-  // IPv4-mapped and IPv4-compatible: judged as the v4 address they carry, or the mapping is the way
-  // past this check.
-  const mapped = /^::(?:ffff:)?(\d+\.\d+\.\d+\.\d+)$/.exec(a);
-  if (mapped) return isPublicAddress(mapped[1]!);
-  if (a.startsWith("fe80")) return false; // link-local
-  if (/^f[cd]/.test(a)) return false; // unique local
-  if (a.startsWith("ff")) return false; // multicast
-  if (a.startsWith("2001:db8")) return false; // documentation
-  return true;
+const loopback = new BlockList();
+loopback.addSubnet("127.0.0.0", 8, "ipv4");
+loopback.addAddress("::1", "ipv6");
+
+export function isPublicAddress(address: string): boolean {
+  const family = isIP(address);
+  return family !== 0 && !reserved.check(address, family === 4 ? "ipv4" : "ipv6");
 }
 
 export interface GuardOptions {
@@ -84,35 +54,58 @@ export interface GuardOptions {
  * one private A record would otherwise pass the check and be reached at whichever the connection
  * picked.
  */
-export function privateAddressGuard(opts: GuardOptions = {}): (database: string) => Promise<void> {
-  const resolve = opts.resolve ?? ((hostname: string) => lookup(hostname, { all: true, verbatim: true }));
-  const cache = new Map<string, Promise<void>>();
-  return (database: string) => {
-    let checked = cache.get(database);
-    if (!checked) cache.set(database, (checked = check(database, resolve, opts.allowLoopback ?? false)));
-    return checked;
-  };
-}
-
-async function check(
-  database: string,
-  resolve: (hostname: string) => Promise<{ address: string }[]>,
-  allowLoopback: boolean,
-): Promise<void> {
-  const url = new URL(canonicalDb(database));
-  const hostname = url.hostname.replace(/^\[|\]$/g, "");
-
-  // An IP literal needs no resolver, and must not get one: `lookup` on one returns it unchanged,
-  // which would read as a confirmation rather than as the check being skipped.
-  const literal = /^\d+\.\d+\.\d+\.\d+$/.test(hostname) || hostname.includes(":");
-  const addresses = literal ? [{ address: hostname }] : await resolve(hostname);
-  if (addresses.length === 0) throw new PrivateAddress(database, "no address");
-  for (const { address } of addresses) {
-    if (isPublicAddress(address)) continue;
-    if (allowLoopback && isLoopback(address)) continue;
-    throw new PrivateAddress(database, address);
+export function privateAddressGuard(opts: GuardOptions = {}) {
+  const resolve = opts.resolve ?? ((name: string) => lookup(name, { all: true, verbatim: true }));
+  async function addresses(url: URL) {
+    const name = url.hostname.replace(/^\[|\]$/g, "");
+    const records = isIP(name) ? [{ address: name }] : await resolve(name);
+    if (!records.length) throw new PrivateAddress(url.href, "no address");
+    return records.map(({ address }) => {
+      const family = isIP(address);
+      if (!isPublicAddress(address) && !(family && opts.allowLoopback && loopback.check(address, family === 4 ? "ipv4" : "ipv6"))) {
+        throw new PrivateAddress(url.href, address);
+      }
+      return { address, family };
+    });
   }
-}
 
-const isLoopback = (address: string): boolean =>
-  address === "::1" || address.startsWith("127.") || /^::(?:ffff:)?127\./i.test(address);
+  async function guard(database: string) {
+    await addresses(new URL(canonicalDb(database)));
+  }
+
+  // Keep the hostname for Host, TLS SNI and certificate verification. Supply the
+  // checked records directly to the socket's lookup, including on later requests.
+  async function guardedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    const records = await addresses(url);
+    request.signal.throwIfAborted();
+    const payload = request.body ? Buffer.from(await request.arrayBuffer()) : undefined;
+    return new Promise((resolve, reject) => {
+      const connect = url.protocol === "https:" ? https : http;
+      const req = connect(url, {
+        method: request.method,
+        headers: Object.fromEntries(request.headers as unknown as Iterable<[string, string]>),
+        signal: request.signal,
+        agent: false,
+        lookup: (_name, options, callback) => {
+          if (options.all) callback(null, records);
+          else callback(null, records[0]!.address, records[0]!.family);
+        },
+      }, (res) => {
+        const headers = new Headers();
+        for (let i = 0; i < res.rawHeaders.length; i += 2) headers.append(res.rawHeaders[i]!, res.rawHeaders[i + 1]!);
+        const status = res.statusCode!;
+        if ([204, 205, 304].includes(status) || request.method === "HEAD") {
+          res.resume();
+          resolve(new Response(null, { status, headers }));
+        } else {
+          resolve(new Response(Readable.toWeb(res) as ReadableStream<Uint8Array>, { status, headers }));
+        }
+      });
+      req.on("error", reject);
+      req.end(payload);
+    });
+  }
+  return Object.assign(guard, { fetch: guardedFetch });
+}

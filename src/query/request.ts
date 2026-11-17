@@ -224,8 +224,11 @@ export const PROTOCOL_ALIASING: Aliasing = {
  *
  * Separate from `check` because it depends on the aliasing, which `check` does not own.
  */
-export function checkAliases(req: Request, aliasing: Aliasing = PROTOCOL_ALIASING): void {
-  const level = (node: { counts?: CountSpec[]; hops?: Hop[] }, at: string): void => {
+export function checkAliases(req: Request, aliasing: Aliasing = PROTOCOL_ALIASING, maxDepth = DEFAULT_LIMITS.maxDepth): void {
+  const level = (node: { counts?: CountSpec[]; hops?: Hop[] }, at: string, depth: number): void => {
+    for (const name of ["counts", "hops"] as const) {
+      if (node[name] !== undefined && !Array.isArray(node[name])) throw new Refused(at + name, "expected an array");
+    }
     const taken = new Map<string, string>();
     const take = (name: string, where: string, what: string): void => {
       if (typeof name !== "string" || name.length === 0) return; // reported by `check`
@@ -237,18 +240,29 @@ export function checkAliases(req: Request, aliasing: Aliasing = PROTOCOL_ALIASIN
       taken.set(name, what);
     };
     for (const [i, hop] of (node.hops ?? []).entries()) {
-      if (hop === null || typeof hop !== "object" || typeof hop.edge !== "string") continue;
+      const path = `${at}hops[${i}]`;
+      if (depth > maxDepth) throw new Refused(path, `hops nest ${depth} deep, the maximum is ${maxDepth}`);
+      if (hop === null || typeof hop !== "object" || Array.isArray(hop)) throw new Refused(path, "expected an object");
+      if (typeof hop.edge !== "string" || !hop.edge) throw new Refused(path + ".edge", "expected an edge name");
+      if (hop.as !== undefined && (typeof hop.as !== "string" || !hop.as)) throw new Refused(path + ".as", "expected an alias");
+      if (hop.where !== undefined && !Array.isArray(hop.where)) throw new Refused(path + ".where", "expected an array");
+      if (hop.limit !== undefined && !Number.isInteger(hop.limit)) throw new Refused(path + ".limit", "limit must be an integer");
       take(aliasing.hop(hop), `${at}hops[${i}]`, `the "${hop.edge}" hop`);
     }
     for (const [i, c] of (node.counts ?? []).entries()) {
-      if (typeof c !== "string" && (c === null || typeof c !== "object")) continue;
+      const path = `${at}counts[${i}]`;
+      if (typeof c !== "string") {
+        if (!c || typeof c !== "object" || Array.isArray(c)) throw new Refused(path, "expected an edge name or count");
+        if (typeof c.as !== "string" || !c.as) throw new Refused(path + ".as", "expected an alias");
+        if (typeof c.edge !== "string" || !c.edge) throw new Refused(path + ".edge", "expected an edge name");
+      }
       take(aliasing.count(c), `${at}counts[${i}]`, `the "${countEdge(c)}" count`);
     }
     for (const [i, hop] of (node.hops ?? []).entries()) {
-      if (hop !== null && typeof hop === "object") level(hop, `${at}hops[${i}].`);
+      if (hop !== null && typeof hop === "object") level(hop, `${at}hops[${i}].`, depth + 1);
     }
   };
-  level(req, "");
+  level(req, "", 1);
 }
 
 const HOP_MEMBERS = ["as", "edge", "limit", "after", "where", "counts", "hops"] as const;
@@ -325,6 +339,7 @@ function checkHop(
   for (const [i, c] of (hop.where ?? []).entries()) {
     if (c === null || typeof c !== "object") throw new Refused(`${at}.where[${i}]`, "expected an object");
     onlyKnown(c, CMP_MEMBERS, `${at}.where[${i}]`);
+    if (typeof c.field !== "string" || !c.field || !("value" in c)) throw new Refused(`${at}.where[${i}]`, "a comparison requires a field and value");
     if (!OPS.includes(c.op)) throw new Refused(`${at}.where[${i}]`, `operator must be one of ${OPS.join(" ")}`);
     checkValue(`${at}.where[${i}]`, c.field, c.value, edge.to, vocab);
   }

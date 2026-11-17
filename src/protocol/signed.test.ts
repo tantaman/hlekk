@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { LocalCluster } from "../client/local.ts";
 import { Catalog, plan as planLock } from "../catalog/catalog.ts";
 import type { Lock } from "../catalog/catalog.ts";
 import { federate, pinsOf } from "../testkit/federation.ts";
-import { Repudiated } from "./client.ts";
+import { foreignClient, ForeignUnreachable, Repudiated } from "./client.ts";
 import type { Caller } from "./identity.ts";
 import type { Policy } from "../query/serve.ts";
 import type { Id, Plan } from "../query/types.ts";
@@ -165,6 +166,32 @@ describe("a database authenticates a database", () => {
 });
 
 describe("the pin", () => {
+  it("serializes concurrent key creation and rotation into one chain", async () => {
+    const { directory } = new LocalCluster();
+    const first = await Promise.all(Array.from({ length: 4 }, () => directory.identity(0)));
+    assert.equal(new Set(first.map(pair => pair.public.id)).size, 1);
+    const rotations = await Promise.all([directory.rotateKey(1), directory.rotateKey(1)]);
+    assert.equal(rotations[0].signedBy?.id, first[0].public.id);
+    assert.equal(rotations[1].signedBy?.id, rotations[0].id);
+    assert.deepEqual(directory.publishedKeys().filter(key => key.retired === undefined).map(key => key.id), [rotations[1].id]);
+  });
+
+  it("keeps a persisted pin during an outage and retries discovery", async () => {
+    const { f, note, page } = await signed();
+    const notes = f.member(NOTES);
+    await notes.db.query(ABOUT_PLAN, [note]);
+    let offline = true;
+    const client = foreignClient(WIKI, {
+      catalog: notes.catalog, pins: pinsOf(notes),
+      fetch: (input, init) => offline ? Promise.resolve(new Response(null, { status: 503 })) : f.fetch(input, init),
+    });
+    const read = () => client.exec({ frames: [] }, [{ kind: "object", id: WIKI + "#" + page, frame: 0 }]);
+    await assert.rejects(read(), ForeignUnreachable);
+    assert.equal(notes.cluster.directory.stateOf(WIKI), "live");
+    offline = false;
+    await read();
+  });
+
   it("is taken on first contact and advanced along a rotation chain", async () => {
     const { f, note } = await signed();
     const notes = f.member(NOTES);
@@ -180,21 +207,7 @@ describe("the pin", () => {
     wiki.binding.keys = wiki.cluster.directory.publishedKeys();
     assert.equal(next.signedBy?.id, first);
 
-    // A fresh client, so the descriptor is read again. The pin walks forward without anyone being
-    // told to trust the new key — which is the whole reason rotation is signed rather than
-    // announced.
-    const again = await federate({ identity: true, members: [] });
-    void again;
-    const pins = pinsOf(notes);
-    const { foreignClient } = await import("./client.ts");
-    const client = foreignClient(WIKI, {
-      catalog: notes.catalog,
-      fetch: f.fetch,
-      self: NOTES,
-      identity: async () => ({ database: NOTES, pair: await notes.cluster.directory.identity(0) }),
-      pins,
-    });
-    await client.exec({ frames: [] }, [{ kind: "object", id: `${WIKI}#1`, frame: 0 }]);
+    await notes.db.query(ABOUT_PLAN, [note]);
     assert.equal(notes.cluster.directory.pinnedOf(WIKI), next.id, "the pin advanced to the key it proved");
   });
 
@@ -212,15 +225,8 @@ describe("the pin", () => {
       identity: true,
       members: [{ uri: WIKI, lock: WIKI_LOCK, database: "stranger", policyFor: admitting(NOTES) }],
     });
-    const { foreignClient } = await import("./client.ts");
-    const client = foreignClient(WIKI, {
-      catalog: notes.catalog,
-      fetch: stranger.fetch,
-      self: NOTES,
-      identity: async () => ({ database: NOTES, pair: await notes.cluster.directory.identity(0) }),
-      pins: pinsOf(notes),
-    });
-    await assert.rejects(client.exec({ frames: [] }, [{ kind: "object", id: `${WIKI}#1`, frame: 0 }]), Repudiated);
+    f.member(WIKI).binding.keys = stranger.member(WIKI).binding.keys;
+    await assert.rejects(notes.db.query(ABOUT_PLAN, [note]), Repudiated);
     assert.equal(notes.cluster.directory.stateOf(WIKI), "repudiated");
 
     // Every read through that alias fails from here on, by name, and local reads carry on: a
