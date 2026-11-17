@@ -9,7 +9,7 @@
 // old shape while new databases took the new one. Nothing would fail — every read and write names
 // its columns — so the fleet would diverge silently, which is what principle 7 exists to prevent.
 //
-// Two live reasons to wait, beyond that one. `PLAN.md`'s bulk-import oracle rests on a fourth
+// Two live reasons to wait, beyond that one. `docs/wikimedia-plan.md`'s bulk-import oracle rests on a fourth
 // simplewiki database, loaded through the bulk path, being comparable row for row against the two
 // loaded through the mutation path; a different primary key ends that comparison. And the enwiki
 // placement decision in step 3 is irreversible and is made against figures a wider row moves by the
