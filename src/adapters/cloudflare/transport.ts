@@ -8,7 +8,7 @@
 import type { Catalog } from "../../catalog/catalog.ts";
 import { Catalog as Compile } from "../../catalog/catalog.ts";
 import type { Lock } from "../../catalog/catalog.ts";
-import type { Mutation, Transport } from "../../client/transport.ts";
+import type { DatabaseIdentity, Mutation, Transport } from "../../client/transport.ts";
 import { chunkKey } from "../../directory/map.ts";
 import type { Route } from "../../directory/map.ts";
 import type { ExecReply, Reply, Routed } from "../../host/host.ts";
@@ -75,6 +75,22 @@ function build(env: Env): Transport {
 
     async aliases(): Promise<{ database: string | null; aliases: { alias: number; uri: string; state: string }[] }> {
       return call(directoryStub(env), "aliases");
+    },
+
+    async identity(): Promise<DatabaseIdentity> {
+      return call(directoryStub(env), "identity");
+    },
+
+    async pinOf(uri: string): Promise<{ pinned: string | null; state: string | null }> {
+      return call(directoryStub(env), "pinOf", uri);
+    },
+
+    async pin(uri: string, keyId: string): Promise<void> {
+      await call(directoryStub(env), "pin", uri, keyId);
+    },
+
+    async repudiate(uri: string): Promise<void> {
+      await call(directoryStub(env), "repudiate", uri);
     },
   };
 }

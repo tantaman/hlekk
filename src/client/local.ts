@@ -23,7 +23,7 @@ import type { Catalog } from "../catalog/catalog.ts";
 import type { Miss, Plan } from "../query/types.ts";
 import { Hlekk } from "./client.ts";
 import { applyTo } from "./transport.ts";
-import type { Mutation, Transport } from "./transport.ts";
+import type { DatabaseIdentity, Mutation, Transport } from "./transport.ts";
 
 /** Where published chunks live. A KV namespace in production. */
 export interface MapStore {
@@ -329,6 +329,22 @@ export class LocalCluster {
       async aliases(): Promise<{ database: string | null; aliases: { alias: number; uri: string; state: string }[] }> {
         cluster.calls.aliases++;
         return { database: cluster.directory.databaseUri() ?? null, aliases: cluster.directory.aliases() };
+      },
+      async identity(): Promise<DatabaseIdentity> {
+        const pair = await cluster.directory.identity(cluster.runtime.clock.now());
+        return { database: cluster.directory.databaseUri() ?? null, pair, keys: cluster.directory.publishedKeys() };
+      },
+      async pinOf(uri: string): Promise<{ pinned: string | null; state: string | null }> {
+        return {
+          pinned: cluster.directory.pinnedOf(uri) ?? null,
+          state: cluster.directory.stateOf(uri) ?? null,
+        };
+      },
+      async pin(uri: string, keyId: string): Promise<void> {
+        cluster.directory.pin(uri, keyId, cluster.runtime.clock.now());
+      },
+      async repudiate(uri: string): Promise<void> {
+        cluster.directory.repudiate(uri);
       },
       async indexLookup(host: number, vshard: string, idx: number, key: string): Promise<string | null> {
         const h = cluster.host(host);

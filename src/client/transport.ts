@@ -6,6 +6,17 @@ import type { Catalog } from "../catalog/catalog.ts";
 import type { AssocAddManyEdge, ExecReply, Host, OutboxOp, Reply, Routed } from "../host/host.ts";
 import type { Route } from "../directory/map.ts";
 import type { Fields, Id, Miss, Plan } from "../query/types.ts";
+import type { KeyPair, PublicKey } from "../protocol/identity.ts";
+
+/** What a database knows about its own identity. */
+export interface DatabaseIdentity {
+  /** Its canonical URI, or null when it was never told one — in which case it cannot sign, since a
+   *  signature names the caller and an unnamed caller is the anonymous one. */
+  database: string | null;
+  pair: KeyPair;
+  /** Everything it publishes, retired keys in their grace window included. */
+  keys: PublicKey[];
+}
 
 /** A mutation as the caller states it. The client fills in the epoch it routed with. */
 export type Mutation =
@@ -109,6 +120,21 @@ export interface Transport {
    * it to collapse a reference to this database back to a bare id.
    */
   aliases(): Promise<{ database: string | null; aliases: { alias: number; uri: string; state: string }[] }>;
+  /**
+   * This database's own signing identity: its URI, its current pair and the keys it publishes.
+   *
+   * The private half crosses this seam, once. A coordinator signs a request per foreign hop, and a
+   * round trip to the directory per signature would put the directory on the read path — which is
+   * the one thing the published map exists to keep it off. So the isolate reads the seed once and
+   * holds it, which is also what `docs/protocol.md` describes.
+   */
+  identity(): Promise<DatabaseIdentity>;
+  /** The pin and state this database holds for another, for trust on first use. */
+  pinOf(uri: string): Promise<{ pinned: string | null; state: string | null }>;
+  /** Records what a database proved about itself, interning it if it has no row yet. */
+  pin(uri: string, keyId: string): Promise<void>;
+  /** The database at this URI answered with a key its pin cannot reach. */
+  repudiate(uri: string): Promise<void>;
   /** Reads a global index entry from the host that holds it. */
   indexLookup(host: number, vshard: string, idx: number, key: string): Promise<Id | null>;
 }

@@ -125,6 +125,26 @@ export function unreliable(inner: Transport, runtime: Runtime, faults: Faults = 
       return inner.aliases();
     },
 
+    async identity() {
+      await hop("identity");
+      return inner.identity();
+    },
+
+    async pinOf(uri: string) {
+      await hop("pinOf");
+      return inner.pinOf(uri);
+    },
+
+    async pin(uri: string, keyId: string) {
+      await hop("pin");
+      return inner.pin(uri, keyId);
+    },
+
+    async repudiate(uri: string) {
+      await hop("repudiate");
+      return inner.repudiate(uri);
+    },
+
     async indexLookup(host: number, vshard: string, idx: number, key: string): Promise<Id | null> {
       await hop(`indexLookup on host ${host}`);
       return inner.indexLookup(host, vshard, idx, key);

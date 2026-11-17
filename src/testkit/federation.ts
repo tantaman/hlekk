@@ -19,7 +19,8 @@ import type { LocalOptions } from "../client/local.ts";
 import { handle } from "../protocol/http.ts";
 import type { Binding } from "../protocol/http.ts";
 import { foreignClient } from "../protocol/client.ts";
-import type { ForeignOptions, Omitted } from "../protocol/client.ts";
+import type { ForeignOptions, Omitted, Pins } from "../protocol/client.ts";
+import type { Caller, PublicKey } from "../protocol/identity.ts";
 import { surfaceOf } from "../protocol/surface.ts";
 import type { Projection } from "../catalog/projection.ts";
 import type { Policy } from "../query/serve.ts";
@@ -33,6 +34,8 @@ import type { Ref } from "../query/ref.ts";
 export interface MemberOptions extends Omit<LocalOptions, "uri"> {
   /** What this database is served under, and what an edge into it names. */
   uri: string;
+  /** The policy for one caller, and whether this database distinguishes it. See `Binding.policyFor`. */
+  policyFor?: (caller: Caller | null) => Promise<{ policy: Policy; remember?: boolean }>;
   /** The lock, or the chain of versions to apply in order — a database gets to version N by
    *  applying 1..N, and a test that hands in a v2 lock has to hand in the v1 it was planned over. */
   lock: Lock | Lock[];
@@ -63,6 +66,14 @@ export interface Federation {
 
 export interface FederationOptions {
   members: MemberOptions[];
+  /**
+   * Signs every request and pins every descriptor.
+   *
+   * Off by default, which is the deployed wiki's state in step 2: public data, no identity, and a
+   * caller that is the anonymous one. On, each member publishes its keys, signs as itself, verifies
+   * its callers against their own descriptors and pins what they prove.
+   */
+  identity?: boolean;
   /** Collects unreachable databases instead of failing a query. Off by default, which is the
    *  behaviour PLAN.md proposes: a failed hop fails the query. */
   omit?: boolean;
@@ -94,6 +105,8 @@ export async function federate(opts: FederationOptions): Promise<Federation> {
       source: cluster.client(),
       surface: surfaceOf(catalog, m.projection),
       policy: m.policy,
+      policyFor: m.policyFor,
+      keys: opts.identity === true ? (await cluster.directory.identity(0), cluster.directory.publishedKeys()) : undefined,
     };
     members.set(m.uri, { uri: m.uri, cluster, catalog, db: cluster.client(), binding, served });
   }
@@ -118,6 +131,20 @@ export async function federate(opts: FederationOptions): Promise<Federation> {
   };
 
   const fetchWith = opts.wrap ? opts.wrap(serve) : serve;
+
+  if (opts.identity === true) {
+    for (const m of members.values()) {
+      // How a responder learns a caller's keys: by reading the caller's own descriptor, at the
+      // caller's own URI. An outbound request made during an inbound one, which is what "a URI
+      // resolves to a key at a well-known path under it" costs — and the reason it needs no PKI.
+      m.binding.callerKeys = async (database: string) => {
+        const res = await fetchWith(database);
+        if (!res.ok) throw new Error(`${database} would not serve its descriptor: ${res.status}`);
+        return ((await res.json()) as { keys?: PublicKey[] }).keys ?? [];
+      };
+      m.binding.pins = pinsOf(m);
+    }
+  }
 
   // Rebuilt with foreign clients now that every member can be reached. `Hlekk.from` memoizes per
   // transport, so the client built above is the same object — which is why the factory is installed
@@ -146,6 +173,12 @@ function hlekkWithForeign(m: Member, call: typeof fetch, omitted: Omitted, opts:
       fetch: call,
       self: m.uri,
       omit: opts.omit ? omitted : undefined,
+      ...(opts.identity === true
+        ? {
+            identity: async () => ({ database: m.uri, pair: await m.cluster.directory.identity(0) }),
+            pins: pinsOf(m),
+          }
+        : {}),
       ...opts.foreign,
     });
   // `Hlekk.from` is memoized per transport and the factory is part of the client, so the pool entry
@@ -295,6 +328,13 @@ export async function replaySplit(
   }
   return { local, refs, where, types: kinds, outcomes };
 }
+
+/** The registry's pin columns, over one member's directory. */
+export const pinsOf = (m: Member): Pins => ({
+  pinOf: async (uri) => ({ pinned: m.cluster.directory.pinnedOf(uri) ?? null, state: m.cluster.directory.stateOf(uri) ?? null }),
+  pin: async (uri, keyId) => m.cluster.directory.pin(uri, keyId, 0),
+  repudiate: async (uri) => m.cluster.directory.repudiate(uri),
+});
 
 export interface SplitReplay {
   local: Id[];

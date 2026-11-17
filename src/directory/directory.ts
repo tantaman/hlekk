@@ -11,6 +11,8 @@ import { CURRENT_FORMAT, FormatError } from "../host/schema.ts";
 import type { StorageFormat } from "../host/schema.ts";
 import type { Sql } from "../host/sql.ts";
 import { canonicalDb } from "../query/ref.ts";
+import { ALG, generateKeyPair, signRotation } from "../protocol/identity.ts";
+import type { KeyPair, PublicKey } from "../protocol/identity.ts";
 import { SPAN, chunkBase, chunkOf, encodeChunk, runs } from "./map.ts";
 import type { Route } from "./map.ts";
 
@@ -68,7 +70,7 @@ export const DDL: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS foreign_dbs (
      alias  INTEGER PRIMARY KEY CHECK (alias > 0), -- 0 means local and is never allocated
      uri    TEXT    NOT NULL,                      -- the identifier, canonicalized before it lands
-     pinned BLOB,                                  -- what it proved about itself; NULL until reached
+     pinned TEXT,                                  -- the id of the key it proved; NULL until reached
      state  TEXT    NOT NULL,                      -- 'live'|'unreachable'|'repudiated'|'tombstoned'
      added  INTEGER NOT NULL,
      seen   INTEGER                                -- when the pin was last confirmed
@@ -76,6 +78,28 @@ export const DDL: readonly string[] = [
 
   // So that one foreign database interns exactly once, and an alias is permanently bound to its URI.
   `CREATE UNIQUE INDEX IF NOT EXISTS foreign_dbs_uri ON foreign_dbs (uri)`,
+
+  /*
+   * This database's own signing keys, newest last. The private half never leaves the deployment: a
+   * coordinator isolate reads it once and signs with it, and nothing else ever asks for it.
+   *
+   * Several rows rather than one, because rotation is the part that gets skipped and pinning without
+   * it is a foot-gun. A rotated key carries the previous key's signature over it, so a caller holding
+   * the old pin can walk forward without being told to trust the new key, and the previous key stays
+   * listed through a grace window so that a caller who has not looked recently still can.
+   *
+   * `retired` NULL marks the current key, of which there is exactly one.
+   */
+  `CREATE TABLE IF NOT EXISTS keys (
+     id        TEXT    PRIMARY KEY,   -- the digest of the public key, so the id is a fact about it
+     alg       TEXT    NOT NULL,
+     pub       TEXT    NOT NULL,      -- the raw public key, base64url
+     seed      TEXT,                  -- the private half; NULL once it is only published, not used
+     signed_by TEXT,                  -- the key this one replaces
+     signature TEXT,                  -- that key's signature over this one
+     created   INTEGER NOT NULL,
+     retired   INTEGER                -- when it stopped being current; NULL for the current key
+   )`,
 ];
 
 /** The number of vshards a new database is created with. A floor, not a budget: it is how many hosts
@@ -200,6 +224,120 @@ export class Directory {
     return this.sql.all<{ alias: number; uri: string; state: string }>(
       "SELECT alias, uri, state FROM foreign_dbs ORDER BY alias",
     );
+  }
+
+  // ---- identity
+
+  /**
+   * This database's current key pair, generating one the first time it is asked for.
+   *
+   * On first use rather than at creation, which amounts to the same thing for a database that is
+   * ever linked to and costs nothing for one that is not — and that laziness is the direction
+   * PLAN.md step 8 wants, where an empty database costs zero until its first write.
+   */
+  async identity(now = 0): Promise<KeyPair> {
+    const row = this.sql.all<{ id: string; pub: string; seed: string | null }>(
+      "SELECT id, pub, seed FROM keys WHERE retired IS NULL ORDER BY created DESC LIMIT 1",
+    )[0];
+    if (row?.seed != null) return { public: { id: row.id, alg: ALG, key: row.pub }, seed: row.seed };
+    const pair = await generateKeyPair();
+    this.#storeKey(pair, now, undefined);
+    return pair;
+  }
+
+  /** Every key this database publishes, oldest first. A retired one stays here through its grace
+   *  window, because a caller holding a pin on it needs it present to walk forward from. */
+  publishedKeys(): PublicKey[] {
+    return this.sql
+      .all<{ id: string; alg: string; pub: string; signed_by: string | null; signature: string | null; retired: number | null }>(
+        "SELECT id, alg, pub, signed_by, signature, retired FROM keys ORDER BY created, id",
+      )
+      .map((r) => ({
+        id: r.id,
+        alg: r.alg as typeof ALG,
+        key: r.pub,
+        ...(r.signed_by !== null && r.signature !== null ? { signedBy: { id: r.signed_by, signature: r.signature } } : {}),
+        ...(r.retired !== null ? { retired: r.retired } : {}),
+      }));
+  }
+
+  /** Rotates to a new key, signed by the one it replaces. The old key stays published and keeps its
+   *  private half until it is pruned, so a request already in flight still verifies. */
+  async rotateKey(now = 0): Promise<PublicKey> {
+    const current = await this.identity(now);
+    const next = await generateKeyPair();
+    const signedBy = await signRotation(current.seed, next.public);
+    this.sql.txn(() => {
+      this.sql.run("UPDATE keys SET retired = ? WHERE id = ?", now, current.public.id);
+      this.#storeKey(next, now, signedBy);
+    });
+    return { ...next.public, signedBy };
+  }
+
+  /** Drops a retired key's private half and then the key itself, once its grace window has passed.
+   *  Returns how many were dropped. A caller pinned on a pruned key is repudiated on next contact,
+   *  which is the cost of the window being finite and the reason it should not be short. */
+  pruneKeys(now: number, graceMs: number): number {
+    const cutoff = now - graceMs;
+    const gone = this.sql.all<{ id: string }>("SELECT id FROM keys WHERE retired IS NOT NULL AND retired < ?", cutoff);
+    for (const k of gone) this.sql.run("DELETE FROM keys WHERE id = ?", k.id);
+    return gone.length;
+  }
+
+  #storeKey(pair: KeyPair, now: number, signedBy: PublicKey["signedBy"]): void {
+    this.sql.run(
+      "INSERT OR REPLACE INTO keys (id, alg, pub, seed, signed_by, signature, created, retired)" +
+        " VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+      pair.public.id,
+      pair.public.alg,
+      pair.public.key,
+      pair.seed,
+      signedBy?.id ?? null,
+      signedBy?.signature ?? null,
+      now,
+    );
+  }
+
+  // ---- pins
+
+  /** The key id this database recorded for another, or undefined if it has never reached it. */
+  pinnedOf(uri: string): string | undefined {
+    const row = this.sql.all<{ pinned: string | null }>("SELECT pinned FROM foreign_dbs WHERE uri = ?", canonicalDb(uri))[0];
+    return row?.pinned ?? undefined;
+  }
+
+  stateOf(uri: string): string | undefined {
+    return this.sql.all<{ state: string }>("SELECT state FROM foreign_dbs WHERE uri = ?", canonicalDb(uri))[0]?.state;
+  }
+
+  /**
+   * Records what a database proved about itself, interning it if it has no row yet.
+   *
+   * The registry is symmetric: this database pins B's key when it interns B, and pins A's key when A
+   * first calls — one table, as `docs/protocol.md` says, with only the alias outbound-only. Pinning
+   * an inbound caller therefore spends an alias on it, which is a number this database may never
+   * write an edge under. That is the price of one table instead of two, and it is small: an integer,
+   * and a caller a policy distinguishes is one this database has a relationship with anyway.
+   */
+  pin(uri: string, keyId: string, now = 0): void {
+    const canonical = canonicalDb(uri);
+    this.sql.txn(() => {
+      if (this.aliasOf(canonical) === undefined) this.intern(canonical, now);
+      this.sql.run("UPDATE foreign_dbs SET pinned = ?, seen = ?, state = 'live' WHERE uri = ?", keyId, now, canonical);
+    });
+  }
+
+  /** The database at this URI answered with a key its pin cannot reach. Reads through the alias fail
+   *  from here on, rather than quietly returning a stranger's objects under an edge that meant
+   *  someone else. */
+  repudiate(uri: string): void {
+    this.sql.run("UPDATE foreign_dbs SET state = 'repudiated' WHERE uri = ?", canonicalDb(uri));
+  }
+
+  /** Only an operator un-repudiates, which is why this is a method and not a code path. It clears
+   *  the pin as well: whatever is at that URI now has to prove itself from scratch. */
+  unrepudiate(uri: string): void {
+    this.sql.run("UPDATE foreign_dbs SET state = 'live', pinned = NULL WHERE uri = ?", canonicalDb(uri));
   }
 
   // ---- routing

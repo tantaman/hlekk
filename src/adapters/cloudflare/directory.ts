@@ -264,6 +264,27 @@ export class HlekkDirectoryDO {
       /** Which storage format this database's hosts key `assocs` with. */
       storageFormat: () => this.#ready().directory.storageFormat(),
 
+      /** This database's signing identity, private half included — once, to one coordinator isolate,
+       *  which then signs without coming back here. See `Transport.identity`. */
+      identity: async () => {
+        const directory = this.#ready().directory;
+        const pair = await directory.identity(Date.now());
+        return { database: directory.databaseUri() ?? null, pair, keys: directory.publishedKeys() };
+      },
+
+      /** Rotates the signing key. An operator's call: the old key stays published through its grace
+       *  window, so a caller holding a pin on it can still walk forward. */
+      rotateKey: () => this.#ready().directory.rotateKey(Date.now()),
+
+      pinOf: (uri: string) => ({
+        pinned: this.#ready().directory.pinnedOf(uri) ?? null,
+        state: this.#ready().directory.stateOf(uri) ?? null,
+      }),
+      pin: (uri: string, keyId: string) => this.#ready().directory.pin(uri, keyId, Date.now()),
+      repudiate: (uri: string) => this.#ready().directory.repudiate(uri),
+      /** Only an operator un-repudiates. */
+      unrepudiate: (uri: string) => this.#ready().directory.unrepudiate(uri),
+
       grow: async () => {
         const opened = this.#ready().allocator.grow();
         await this.#flush();
