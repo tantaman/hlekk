@@ -1,0 +1,35 @@
+{
+  "name": "hlekk-example",
+  "main": "worker.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "HLEKK_HOSTS",
+        "class_name": "HlekkHostDO"
+      },
+      {
+        "name": "HLEKK_DIRECTORY",
+        "class_name": "HlekkDirectoryDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "HlekkHostDO",
+        "HlekkDirectoryDO"
+      ]
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "HLEKK_MAP"
+    }
+  ],
+  "vars": {
+    "HLEKK_DATABASE": "wiki-example",
+    "HLEKK_VSHARDS": "8"
+  }
+}

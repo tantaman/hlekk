@@ -52,3 +52,8 @@ Thumbs.db
 
 # wrangler dev's local Durable Object storage
 .wrangler/state/
+
+# Local example runtimes and cluster links
+.celld/
+.open-orange/
+.rivet/

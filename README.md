@@ -38,6 +38,8 @@ argument that settled it, and the ones still open are listed as open.
 
 ## Running one
 
+For local and hosted walkthroughs, see the [Cloudflare Durable Objects, Rivet, and celld deployment examples](examples/README.md).
+
 ```bash
 npm install
 node src/adapters/node/serve.ts --dir ./my-database --port 8080 --path /db
