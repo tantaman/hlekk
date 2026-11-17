@@ -37,6 +37,17 @@ export interface EdgeDecl {
   /** A field relationship: follows an id in the source payload. Nothing is stored, so it has no atype. */
   field?: string;
   unique?: boolean;
+  /**
+   * Targets MAY be in another database. Not that they are: one edge type holds both, which is the
+   * whole premise — `issues.issue_owner → core.user` starts fully local, and one day some users live
+   * in a shared identity database and some do not. The edge type should not change, and an
+   * application should not have to declare two of everything (`docs/global-ids.md`).
+   *
+   * It is a static signal for the planner, which has to know a hop can leave this database even
+   * though whether a given row does is only known at read time. Two refusals hang off it, both
+   * below, and both better as plan-time errors than as discoveries in the outbox.
+   */
+  foreign?: boolean;
 }
 
 /** The planned, canonical form. Reviewed with the domain files and applied verbatim by every database. */
@@ -97,6 +108,8 @@ export interface EdgeType {
   onDelete: OnDelete;
   field?: string;
   unique: boolean;
+  /** Whether a target may be in another database. See `EdgeDecl.foreign`. */
+  foreign: boolean;
 }
 
 /** An edge type that declares no onDelete drops its own edges and leaves the targets alone. Cascading
@@ -168,6 +181,7 @@ export class Catalog {
         onDelete: e.onDelete ?? DEFAULT_ON_DELETE,
         field: e.field,
         unique: e.unique ?? false,
+        foreign: e.foreign ?? false,
       };
       this.#edgesByName.set(name, t);
       if (t.atype !== undefined) this.#edgesByType.set(t.atype, t);
@@ -180,6 +194,26 @@ export class Catalog {
       }
       if (e.field !== undefined && !(e.field in this.#objectsByName.get(e.from)!.fields)) {
         throw new CatalogError(`${e.name} follows ${e.from}.${e.field}, which is not a field`);
+      }
+      if (e.foreign) {
+        // Both of these are a remote write wearing a local name, and `docs/protocol.md` makes the
+        // cross-database graph reads-only and one-sided. Refused when the lock is planned, because
+        // the alternative is discovering it as an outbox row that retries forever.
+        if (e.inverse !== undefined) {
+          throw new CatalogError(
+            `${e.name} permits foreign targets and names an inverse.` +
+              " Delivery routes through the host's own client, which is scoped to one database and never gives up," +
+              " so writing the other half would mean holding credentials to write into another database inside a" +
+              " path with no give-up. A target database that wants a backlink subscribes; it does not get written into.",
+          );
+        }
+        if (e.onDelete === "cascade") {
+          throw new CatalogError(
+            `${e.name} permits foreign targets and cascades on delete, which is a remote write.` +
+              " Foreign references are allowed to dangle, which the read path already tolerates:" +
+              " edges to missing objects are dropped at read time and a maintained count still counts them.",
+          );
+        }
       }
       if (e.inverse === undefined) continue;
       const back = this.#edgesByName.get(e.inverse);

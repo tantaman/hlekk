@@ -7,16 +7,47 @@ import { UNKNOWN, listKey } from "../query/types.ts";
 import type { Cursor, Edge, EdgePage, Fields, Id, Maybe, Obj, Store } from "../query/types.ts";
 import type { EdgeSegment, ReadSet } from "../query/stores.ts";
 import { fromKey, toKey, vshardOf } from "./ids.ts";
+import { formatOf } from "./schema.ts";
+import type { StorageFormat } from "./schema.ts";
 import type { Sql } from "./sql.ts";
 
 const OBJECT = "SELECT otype, version, data FROM objects WHERE id = ?";
-const PAGE_HEAD =
-  "SELECT id2, time, data FROM assocs WHERE id1 = ? AND atype = ? ORDER BY time DESC, id2 DESC LIMIT ?";
-// (time, id2) strictly below the cursor. Written out rather than as a row value so the index on
-// (id1, atype, time) is plainly the one that serves it.
-const PAGE_AFTER =
-  "SELECT id2, time, data FROM assocs WHERE id1 = ? AND atype = ? AND (time < ? OR (time = ? AND id2 < ?))" +
-  " ORDER BY time DESC, id2 DESC LIMIT ?";
+
+/**
+ * The page statements, one pair per storage format.
+ *
+ * Format 2's order is `(time, db, id2)` and not `(time, id2)`, and that is a reading rather than a
+ * preference: `scripts/edge-order.mjs` shows SQLite serving `(time, db, id2)` from `assocs_range`
+ * directly at the head and after a cursor, while `(time, id2)` on the same table needs a temporary
+ * b-tree for its last term. So a format 2 host cannot keep format 1's page query, and the tie-break
+ * moves with the key — at one `time`, five edges read back as `2:8 2:3 1:7 0:9 0:4`, foreign before
+ * local. `edgeOrder` in `query/types.ts` and the cursor codec in `schema/query.ts` have to agree
+ * with that or a tie-broken cursor lands in the wrong place.
+ *
+ * Format 1's text is byte for byte what it has always been, which is what keeps a loaded database
+ * answering exactly the statements it was loaded with.
+ *
+ * The cursor comparison is written out rather than as a row value so the index on
+ * `(id1, atype, time)` is plainly the one that serves it.
+ */
+const PAGE: Record<StorageFormat, { head: string; after: string }> = {
+  1: {
+    head: "SELECT id2, time, data FROM assocs WHERE id1 = ? AND atype = ? ORDER BY time DESC, id2 DESC LIMIT ?",
+    after:
+      "SELECT id2, time, data FROM assocs WHERE id1 = ? AND atype = ? AND (time < ? OR (time = ? AND id2 < ?))" +
+      " ORDER BY time DESC, id2 DESC LIMIT ?",
+  },
+  2: {
+    head:
+      "SELECT db, id2, time, data FROM assocs WHERE id1 = ? AND atype = ?" +
+      " ORDER BY time DESC, db DESC, id2 DESC LIMIT ?",
+    after:
+      "SELECT db, id2, time, data FROM assocs WHERE id1 = ? AND atype = ?" +
+      " AND (time < ? OR (time = ? AND (db < ? OR (db = ? AND id2 < ?))))" +
+      " ORDER BY time DESC, db DESC, id2 DESC LIMIT ?",
+  },
+};
+
 const COUNT = "SELECT n FROM assoc_counts WHERE id1 = ? AND atype = ?";
 
 interface ObjectRow {
@@ -25,6 +56,8 @@ interface ObjectRow {
   data: string;
 }
 interface AssocRow {
+  /** Absent on format 1, which has no column for it. */
+  db?: number;
   id2: Uint8Array;
   time: number;
   data: string | null;
@@ -48,6 +81,7 @@ export interface Refusal {
 export class SqlStore implements Store {
   readonly sql: Sql;
   readonly routed: Routed | null;
+  readonly format: StorageFormat;
   /** Vshards the caller routed to that this host no longer serves at that epoch. */
   readonly refused = new Map<string, Refusal>();
   #served: Map<bigint, { state: State; epoch: number }> | null = null;
@@ -55,9 +89,12 @@ export class SqlStore implements Store {
   readonly #lists: EdgeSegment[] = [];
   readonly #counts = new Map<string, number>();
 
-  constructor(sql: Sql, routed: Routed | null = null) {
+  constructor(sql: Sql, routed: Routed | null = null, format?: StorageFormat) {
     this.sql = sql;
     this.routed = routed;
+    // Detected when it is not passed, so a store built straight over a host's SQL reads the shape
+    // that is actually there rather than the one it hoped for.
+    this.format = format ?? formatOf(sql) ?? 1;
   }
 
   /** Which vshards this host holds, and in what state. Read once: a store serves one batch, which is
@@ -113,13 +150,27 @@ export class SqlStore implements Store {
   edges(id1: Id, atype: number, after: Cursor | null, n: number): Promise<Maybe<EdgePage>> {
     if (!this.owns(id1)) return Promise.resolve(UNKNOWN);
     // One row past the limit: it says only whether the list goes on.
+    const stmt = PAGE[this.format];
     const rows =
       after === null
-        ? this.sql.all<AssocRow>(PAGE_HEAD, toKey(id1), atype, n + 1)
-        : this.sql.all<AssocRow>(PAGE_AFTER, toKey(id1), atype, after.time, after.time, toKey(after.id2), n + 1);
+        ? this.sql.all<AssocRow>(stmt.head, toKey(id1), atype, n + 1)
+        : this.format === 2
+          ? this.sql.all<AssocRow>(
+              stmt.after,
+              toKey(id1),
+              atype,
+              after.time,
+              after.time,
+              after.db,
+              after.db,
+              toKey(after.id2),
+              n + 1,
+            )
+          : this.sql.all<AssocRow>(stmt.after, toKey(id1), atype, after.time, after.time, toKey(after.id2), n + 1);
     const all: Edge[] = rows.map((r) => ({
       id1,
       atype,
+      db: r.db ?? 0,
       id2: fromKey(r.id2),
       time: r.time,
       data: r.data === null ? null : (JSON.parse(r.data) as Fields),

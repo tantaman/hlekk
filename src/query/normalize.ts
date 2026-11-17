@@ -125,7 +125,7 @@ function continuation(
   const run = graph.lists.get(listKey(parent, source.atype));
   if (!run) return { cursor: null, more: false };
   const last = run.rows[Math.min(returned, run.rows.length) - 1];
-  const cursor = last ? encodeCursor(last.time, last.id2) : null;
+  const cursor = last ? encodeCursor(last.time, last.db, last.id2) : null;
   return { cursor, more: returned < run.rows.length || !run.complete };
 }
 

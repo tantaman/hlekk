@@ -12,11 +12,12 @@ const ATYPE = 1;
 const edges: Edge[] = [50, 40, 30, 20, 10].map((time) => ({
   id1: ID1,
   atype: ATYPE,
+  db: 0,
   id2: String(time),
   time,
   data: null,
 }));
-const at = (i: number): Cursor => ({ time: edges[i].time, id2: edges[i].id2 });
+const at = (i: number): Cursor => ({ time: edges[i].time, db: edges[i].db, id2: edges[i].id2 });
 const segment = (after: Cursor | null, rows: Edge[], complete: boolean): EdgeSegment => ({
   id1: ID1,
   atype: ATYPE,

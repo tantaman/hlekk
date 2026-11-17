@@ -217,7 +217,7 @@ describe("edges", () => {
     const first = known(await h.store().edges(issue, ISSUE_COMMENT, null, 2));
     assert.equal(first.complete, false); // a third row exists
     const last = first.rows[first.rows.length - 1];
-    const next = known(await h.store().edges(issue, ISSUE_COMMENT, { time: last.time, id2: last.id2 }, 2));
+    const next = known(await h.store().edges(issue, ISSUE_COMMENT, { time: last.time, db: last.db, id2: last.id2 }, 2));
     assert.deepEqual(next.rows.map((e) => e.id2), [comments[0]]);
     assert.equal(next.complete, true);
   });

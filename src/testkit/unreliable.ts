@@ -115,6 +115,16 @@ export function unreliable(inner: Transport, runtime: Runtime, faults: Faults = 
       return inner.indexVshardFor(key);
     },
 
+    async intern(uri: string): Promise<number> {
+      await hop(`intern ${uri}`);
+      return inner.intern(uri);
+    },
+
+    async aliases(): Promise<{ database: string | null; aliases: { alias: number; uri: string; state: string }[] }> {
+      await hop("aliases");
+      return inner.aliases();
+    },
+
     async indexLookup(host: number, vshard: string, idx: number, key: string): Promise<Id | null> {
       await hop(`indexLookup on host ${host}`);
       return inner.indexLookup(host, vshard, idx, key);

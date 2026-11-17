@@ -12,11 +12,11 @@ export type Mutation =
   | { kind: "create"; otype: number; data: Fields; with?: Id; vshard?: string }
   | { kind: "update"; id: Id; data: Fields; expect?: number }
   | { kind: "delete"; id: Id }
-  | { kind: "assocAdd"; atype: number; id1: Id; id2: Id; time?: number; data?: Fields | null }
+  | { kind: "assocAdd"; atype: number; id1: Id; db?: number; id2: Id; time?: number; data?: Fields | null }
   // Many adds, one transaction, one durable commit. Every edge must share a vshard, because the
   // batch is routed and fenced by the first of them; `Client.assocAddMany` is what groups them.
   | { kind: "assocAddMany"; edges: readonly AssocAddManyEdge[] }
-  | { kind: "assocRemove"; atype: number; id1: Id; id2: Id }
+  | { kind: "assocRemove"; atype: number; id1: Id; db?: number; id2: Id }
   | { kind: "apply"; op: OutboxOp }
   | { kind: "indexReserve"; vshard: string; idx: number; key: string; now: number; ttlMs: number }
   | { kind: "indexConfirm"; vshard: string; idx: number; key: string; id: Id }
@@ -62,11 +62,11 @@ export function applyTo(host: Host, m: Mutation, epoch: number): Reply<unknown> 
     case "delete":
       return host.delete({ id: m.id, epoch });
     case "assocAdd":
-      return host.assocAdd({ atype: m.atype, id1: m.id1, id2: m.id2, time: m.time, data: m.data, epoch });
+      return host.assocAdd({ atype: m.atype, id1: m.id1, db: m.db, id2: m.id2, time: m.time, data: m.data, epoch });
     case "assocAddMany":
       return host.assocAddMany({ edges: m.edges, epoch });
     case "assocRemove":
-      return host.assocRemove({ atype: m.atype, id1: m.id1, id2: m.id2, epoch });
+      return host.assocRemove({ atype: m.atype, id1: m.id1, db: m.db, id2: m.id2, epoch });
     case "apply":
       return host.apply(m.op);
     case "indexReserve":
@@ -93,6 +93,22 @@ export interface Transport {
   place(affinity?: string): Promise<string>;
   /** Which index vshard holds a value's entry. */
   indexVshardFor(key: string): Promise<string>;
+  /**
+   * The alias for a foreign database's URI, allocating one on first sight.
+   *
+   * On the write path, so a client turns a `Ref` into the number a host stores. Canonicalization and
+   * the never-repoint rule live in the directory; this is only the seam.
+   */
+  intern(uri: string): Promise<number>;
+  /**
+   * Every alias this database has allocated, and this database's own URI.
+   *
+   * One call rather than one per alias: the set is small, changes only when an edge into a new
+   * database is first written, and an isolate caches it for life — which is what makes a foreign hop
+   * cost no directory round trip at read time. The own URI rides along because the coordinator needs
+   * it to collapse a reference to this database back to a bare id.
+   */
+  aliases(): Promise<{ database: string | null; aliases: { alias: number; uri: string; state: string }[] }>;
   /** Reads a global index entry from the host that holds it. */
   indexLookup(host: number, vshard: string, idx: number, key: string): Promise<Id | null>;
 }

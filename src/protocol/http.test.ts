@@ -141,7 +141,7 @@ describe("the protocol over HTTP", () => {
     }
     const field = await post(binding, "/read", {
       ids: [issue],
-      hops: [{ edge: "issues.comment_author", after: encodeCursor(1, "5") }],
+      hops: [{ edge: "issues.comment_author", after: encodeCursor(1, 0, "5") }],
     });
     assert.equal(field.status, 400);
     assert.match((await field.json()).error, /has no list/);

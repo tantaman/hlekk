@@ -344,35 +344,68 @@ because qualification happens outside the integer rather than inside it. The who
 Guessability is addressed by none of this and should not be. Local IDs are already sequential, so an
 ID has never been a secret; the permission system above is what carries that.
 
-## What to do now
+## What was built
 
-One thing, and it is not the storage.
+Everything above except the global directory and the permission model, in the order
+[`../PLAN.md`](../PLAN.md) sets out. What landed differs from this document in three places, and each
+difference is worth recording rather than quietly editing over.
 
-**Fix the string form.** design.md's field relationships store IDs *inside JSON payloads* —
-`"authorId": { "id": "core.user" }` — and an edge with `field` follows one. If every payload ID is a
-bare decimal, those references are local-only permanently, and qualifying them later means rewriting
-payloads, which the move and snapshot path does not cover and no fence makes safe. So: decide now
-that an `Id` is a string that may be qualified by a database's URI, have `parseId` round-trip one,
-and have everything that compares IDs compare the qualified form. Not one stored byte changes. This
-is the only piece here where deferring is expensive.
+**The string form came first, and as its own function.** design.md's field relationships store IDs
+*inside JSON payloads* — `"authorId": { "id": "core.user" }` — and an edge with `field` follows one,
+so a bare-decimal payload ID is local-only permanently and qualifying it later means rewriting
+payloads, which the move and snapshot path does not cover and no fence makes safe. That is why it was
+the one piece where deferring was expensive, and it shipped before any storage changed, in
+`src/query/ref.ts`.
 
-Nothing needs reserving in `ids.ts` beside it. Qualification lives outside the integer, so a local
-ID's layout is untouched by all of this.
+This document asked for `parseId` itself to round-trip a qualified ID. It does not. `parseRef` is a
+separate function and `parseId` keeps refusing anything that is not a bare decimal, which is the same
+decision with the 8-byte guard left strict — also asked for above, under *the cheap form*. Strict is
+the half that catches mistakes: a qualified reference reaching `toKey` now throws instead of being
+truncated to a local ID that may well exist. What is NOT true is that "everything that compares IDs
+compares the qualified form"; comparison stayed on the local half, because the alias is what orders an
+edge list and the alias is a number (see *the comparator* below).
 
-**Not now:** the alias column, the registry, the global directory, the permission model. There is
-also a scheduling reason, not only a scope one. [`wikimedia-plan.md`](wikimedia-plan.md) step 3 is an irreversible enwiki placement
-decision resting on step 1's three-way reading, and a wider row changes every figure that decision is
-made against — 61.5 bytes/row, 163 GB, the host count, `HLEKK_VSHARDS`. Take the step 1 measurement
-on today's IDs, make the enwiki call, then decide this. The other order means choosing a permanent
-placement against numbers already invalidated.
+**A URI that is not canonical is refused, never repaired.** This document called canonicalization a
+known swamp and left it under *Open*. It is drained in one direction only: `canonicalDb` names the
+canonical spelling in the refusal and the caller sends that. Repairing silently would put two aliases
+in the registry for one database, which `foreign_dbs_uri` would not notice — which is the whole
+hazard, so the fix cannot be a repair.
+
+**The alias joined the sort key, which this document did not anticipate.** `db` sits in the primary
+key, and `scripts/edge-order.mjs` then shows SQLite serving a page ordered `(time, db, id2)` from
+`assocs_range` directly while `(time, id2)` on the same table needs a temporary b-tree for its last
+term. So *"the column leaves the index and the read exactly as they are"*, under *why one table and
+not two*, is wrong: the declaration is unchanged but the ORDER BY is not, and the tie-break moved.
+At one `time`, five edges read back as `2:8 2:3 1:7 0:9 0:4` — foreign before local. `edgeOrder` and
+the cursor codec both had to follow, which is why cursors are now `v2` and carry the alias (a `v1`
+cursor decodes as alias 0).
+
+That is also why there are **two storage formats and no in-place upgrade**. `ALTER TABLE ADD COLUMN`
+works, but the new order then sorts the whole list in a temporary b-tree, so an existing host cannot
+be given the new statements cheaply. Format 1 keeps today's SQL byte for byte, format 2 has `db` in
+the key, the directory records which in `meta` where absent means 1, and a host refuses to open when
+what it is told disagrees with the shape of its own `assocs`. A vshard move is the migration: a
+format 1 snapshot installs into a format 2 host with every alias 0, which is what this document's
+*nothing else in the host schema changes* was already describing without naming it as a migration
+path. It waits on the chunked snapshot design.md owes.
+
+The measured 1.019x holds against the shipped statements: `scripts/id-width.mjs` now imports them
+from `src/host/schema.ts` rather than restating them, so the reading is of the real shape.
+
+**Still not built:** the global directory above the per-database one, and the permission model. Both
+are named under *what none of this solves* and both are more than an ID question. The registry's
+`pinned` column is written by nothing yet; PLAN.md step 5 is where trust on first use becomes code.
 
 ## Open
 
-- [ ] Whether an alias is allocated in `catalog.lock.json` at plan time or by compare-and-set in the
-      directory at runtime. URI identity pushes hard toward runtime, since drawing an edge at a name
-      nobody has deployed against is the point of it — which makes the registry the first
-      schema-shaped state outside the lock, and gives up the git-conflict property that catches two
-      branches allocating one integer twice.
+- [x] Whether an alias is allocated in `catalog.lock.json` at plan time or by compare-and-set in the
+      directory at runtime. **Runtime**, in the directory, from a counter in `meta`. URI identity
+      pushed hard toward it, since drawing an edge at a name nobody has deployed against is the point
+      of it. The cost is as stated: the registry is the first schema-shaped state outside the lock,
+      and the git-conflict property that catches two branches allocating one integer twice does not
+      cover it. What stands in for that property is the never-repoint rule — an allocated alias
+      always means the same URI, so the worst a stale client can do is name an edge into a database
+      that is gone, which the read path already drops.
 - [ ] URI canonicalization. Scheme, host case, default port, trailing slash, percent-encoding,
       fragments: two spellings of one database become two aliases and the unique index does not
       notice. Load-bearing the moment the URI is the identifier, and the known cost of that choice.

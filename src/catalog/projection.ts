@@ -94,7 +94,20 @@ function hashOf(r: Omit<Resolved, "hash">): string {
     canonical({
       objects: Object.fromEntries(r.objects.map((o) => [o.type.name, { otype: o.type.otype, fields: o.fields, ref: o.ref }])),
       edges: Object.fromEntries(
-        r.edges.map((e) => [e.name, { from: e.from, to: e.to, atype: e.atype, inverse: e.inverse, field: e.field, unique: e.unique }]),
+        // `foreign` only when it is true, so adding the flag leaves every existing projection's hash
+        // alone — the hash is stamped into generated code, and `canonical` drops undefined.
+        r.edges.map((e) => [
+          e.name,
+          {
+            from: e.from,
+            to: e.to,
+            atype: e.atype,
+            inverse: e.inverse,
+            field: e.field,
+            unique: e.unique,
+            foreign: e.foreign ? true : undefined,
+          },
+        ]),
       ),
     }),
   );

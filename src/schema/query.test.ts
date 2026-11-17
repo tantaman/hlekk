@@ -431,8 +431,16 @@ describe("paging a related list", () => {
   });
 
   it("versions its cursors, so one encoded under another comparator is refused", () => {
-    const cursor = encodeCursor(50, "12345");
-    assert.deepEqual(decodeCursor(cursor), { time: 50, id2: "12345" });
+    const cursor = encodeCursor(50, 3, "12345");
+    assert.equal(cursor, "v2:50:3:12345");
+    assert.deepEqual(decodeCursor(cursor), { time: 50, db: 3, id2: "12345" });
     assert.throws(() => decodeCursor("v0:50:12345"), /cursor version v0/);
+    // A v1 cursor still decodes, as alias 0: on format 1 every alias is 0, and refusing every
+    // cursor already handed out would break a page in flight for no gain.
+    assert.deepEqual(decodeCursor("v1:50:12345"), { time: 50, db: 0, id2: "12345" });
+    // But a v1 cursor with a v2 body, or the other way round, is neither.
+    assert.throws(() => decodeCursor("v1:50:3:12345"), /not a cursor/);
+    assert.throws(() => decodeCursor("v2:50:12345"), /not a cursor/);
+    assert.throws(() => decodeCursor("v2:50:x:12345"), /not a database alias/);
   });
 });

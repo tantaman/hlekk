@@ -1,7 +1,9 @@
 // What putting the target's database in the edge key does to the order an edge list is read in.
 //
-// PLAN.md step 3 cites these readings. They decide two things: that a host on the new key cannot keep
-// today's page query, and that a host on the old key cannot be given the new one by adding a column.
+// PLAN.md step 3 cites these readings, and they decided two things that are now shipped: that a host
+// on the new key cannot keep format 1's page query, and that a host on the old key cannot be given
+// the new one by adding a column — which together is why there are two storage formats and no
+// in-place upgrade (src/host/schema.ts).
 //
 //   node scripts/edge-order.mjs
 //
@@ -23,7 +25,7 @@ const key = (n) => {
   return b;
 };
 
-// ---- the new key, as src/host/schema.foreign.ts declares it
+// ---- the new key, as src/host/schema.ts declares it for storage format 2
 
 db.exec(`CREATE TABLE assocs (
   id1 BLOB NOT NULL, atype INTEGER NOT NULL, db INTEGER NOT NULL DEFAULT 0, id2 BLOB NOT NULL,

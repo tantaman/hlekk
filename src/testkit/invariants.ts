@@ -136,9 +136,43 @@ export function check(c: LocalCluster, opts: Options = {}): Violation[] {
     }
   }
 
+  // ---- what a foreign edge may and may not be
+
+  // Only on format 2, which is the only format that has the column. On format 1 there is nothing to
+  // check, which is itself the property: a format 1 host cannot represent a foreign edge at all.
+  if (c.directory.storageFormat() === 2) {
+    const allocated = new Set(c.directory.aliases().map((a) => a.alias));
+    const catalog = c.directory.catalog();
+    for (const [index, host] of c.hosts) {
+      for (const r of host.sql.all<{ db: number; atype: number; n: number }>(
+        "SELECT db, atype, COUNT(*) AS n FROM assocs WHERE db <> 0 GROUP BY db, atype",
+      )) {
+        // An alias is never repointed and always means one URI, so a host can store one without
+        // validating it. What it cannot be is a number nothing ever allocated: that is a reference
+        // with no database behind it, which no read can even name.
+        if (!allocated.has(r.db)) {
+          say(
+            "every alias in assocs was allocated by the registry",
+            `host ${index} holds ${r.n} edges into database ${r.db}, which the registry does not know`,
+          );
+        }
+        const edge = catalog.edge(r.atype);
+        if (edge !== undefined && !edge.foreign) {
+          // The planner routes a foreign hop on the static flag, so a foreign row under a type that
+          // does not declare one is a row no read will route.
+          say(
+            "no foreign edge sits under an edge type that does not permit one",
+            `host ${index} holds ${r.n} edges of ${edge.name} into database ${r.db}`,
+          );
+        }
+      }
+    }
+  }
+
   // ---- queued work says where it is bound, and an index entry says what it holds
 
   for (const [index, host] of c.hosts) {
+    const catalog = c.directory.catalog();
     for (const r of host.sql.all<{ vshard: number; seq: number; target_vshard: number; op: string }>(
       "SELECT vshard, seq, target_vshard, op FROM outbox",
     )) {
@@ -147,6 +181,19 @@ export function check(c: LocalCluster, opts: Options = {}): Violation[] {
         say(
           "an outbox row is bound for the vshard its op names",
           `host ${index} row ${r.vshard}/${r.seq} is bound for ${r.target_vshard} and its op targets ${opTarget(op)}`,
+        );
+      }
+      // Every id in an outbox op is local, and this is the checkable form of that: an op's ids are
+      // bare decimals either way, so a foreign one is indistinguishable by inspection — but it could
+      // only have arrived through an edge type that permits a foreign target, and an op routes by
+      // `vshardOf` on an id it carries. The catalog refuses `inverse` and `onDelete: cascade` on such
+      // a type, so no op of one should exist at all.
+      const atype = op.kind === "delete" ? undefined : op.atype;
+      const edge = atype === undefined ? undefined : catalog.edge(atype);
+      if (edge?.foreign) {
+        say(
+          "no outbox row belongs to an edge type that permits a foreign target",
+          `host ${index} row ${r.vshard}/${r.seq} is a ${op.kind} of ${edge.name}, whose targets may be in another database`,
         );
       }
     }
@@ -183,11 +230,18 @@ export function check(c: LocalCluster, opts: Options = {}): Violation[] {
         for (const r of host.sql.all<{ id: Uint8Array }>("SELECT id FROM objects WHERE id BETWEEN ? AND ?", lo, hi)) {
           alive.add(fromKey(r.id));
         }
-        for (const r of host.sql.all<{ id1: Uint8Array; atype: number; id2: Uint8Array; time: number; data: string | null }>(
-          "SELECT id1, atype, id2, time, data FROM assocs WHERE id1 BETWEEN ? AND ?",
+        for (const r of host.sql.all<{ db?: number; id1: Uint8Array; atype: number; id2: Uint8Array; time: number; data: string | null }>(
+          c.directory.storageFormat() === 2
+            ? "SELECT db, id1, atype, id2, time, data FROM assocs WHERE id1 BETWEEN ? AND ?"
+            : "SELECT id1, atype, id2, time, data FROM assocs WHERE id1 BETWEEN ? AND ?",
           lo,
           hi,
         )) {
+          // Foreign rows are left out. Symmetry is about a pair, and the catalog refuses an inverse
+          // on an edge type that permits a foreign target, so a foreign row can never be half of
+          // one — while keying it by its id alone would collide with a local edge to the same number
+          // in this database, which is exactly the collision format 2 exists to prevent.
+          if ((r.db ?? 0) !== 0) continue;
           const k = listKey(fromKey(r.id1), r.atype);
           const held = all.get(k) ?? all.set(k, new Map()).get(k)!;
           held.set(fromKey(r.id2), `${r.time}/${r.data ?? "null"}`);

@@ -7,7 +7,7 @@
 // window, a node's relationships), so a remote store can batch them and a slow branch doesn't hold up
 // the rest.
 
-import { UNKNOWN } from "./types.ts";
+import { UNKNOWN, localId } from "./types.ts";
 import type { Cond, Cursor, End, Fields, Id, Json, Maybe, Miss, Node, Obj, Plan, Row, Store, Stream, Unknown } from "./types.ts";
 
 export const DEFAULT_LIMIT = 50;
@@ -153,7 +153,7 @@ export class EdgeHop implements Op {
         p.miss({ kind: "edges", id1, atype: this.atype, frame: this.frame, after, n });
         return "short";
       }
-      const ids = page.rows.map((e) => e.id2);
+      const ids = page.rows.map(localId);
       const targets = ids.map((id) => p.background(p.store.object(id, this.frame)));
       for (let i = 0; i < ids.length; i++) {
         const o = await targets[i];

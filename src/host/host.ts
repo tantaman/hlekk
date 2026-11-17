@@ -5,6 +5,7 @@
 // its own vshards row and refuses the write if it no longer owns that vshard, having written nothing.
 
 import { Catalog } from "../catalog/catalog.ts";
+import type { FieldSpec } from "../catalog/catalog.ts";
 import { systemClock } from "../runtime/runtime.ts";
 import type { Clock } from "../runtime/runtime.ts";
 import { hostExec } from "../query/driver.ts";
@@ -12,7 +13,9 @@ import type { HostReply } from "../query/driver.ts";
 import { missOwner } from "../query/types.ts";
 import type { Fields, Id, Miss, Plan } from "../query/types.ts";
 import { MAX_SEQ, fromKey, makeId, toKey, vshardOf, vshardRange } from "./ids.ts";
-import { MAX_PAYLOAD, migrate } from "./schema.ts";
+import { parseRef } from "../query/ref.ts";
+import { CURRENT_FORMAT, FormatError, MAX_PAYLOAD, ddl, formatOf, migrate } from "./schema.ts";
+import type { StorageFormat } from "./schema.ts";
 import type { Param, Sql } from "./sql.ts";
 import { SqlStore } from "./store.ts";
 import type { Refusal, Routed, State } from "./store.ts";
@@ -146,6 +149,10 @@ export interface DeleteOp extends RoutedAt {
 export interface AssocAddOp extends RoutedAt {
   atype: number;
   id1: Id;
+  /** The target's database, as this database's interned alias. 0, the default, is local; anything
+   *  else is a foreign edge and needs a format 2 host and an edge type that permits one. The client
+   *  interns the URI and sends the number — a host stores an alias and never resolves one. */
+  db?: number;
   id2: Id;
   time?: number;
   data?: Fields | null;
@@ -156,6 +163,7 @@ export interface AssocAddOp extends RoutedAt {
 export interface AssocAddManyEdge {
   atype: number;
   id1: Id;
+  db?: number;
   id2: Id;
   time?: number;
   data?: Fields | null;
@@ -168,6 +176,7 @@ export interface AssocAddManyOp extends RoutedAt {
 export interface AssocRemoveOp extends RoutedAt {
   atype: number;
   id1: Id;
+  db?: number;
   id2: Id;
 }
 
@@ -177,8 +186,30 @@ export type OutboxOp =
   | { kind: "remove"; atype: number; id1: Id; id2: Id }
   | { kind: "delete"; id: Id };
 
-/** The vshard an op is bound for. */
+/**
+ * The vshard an op is bound for.
+ *
+ * `vshardOf` must never see a foreign target: an alias plus a local id is a 128-bit reference, and
+ * routing by its low half would send the op to whichever of THIS database's vshards happens to share
+ * those bits — a write landing on an unrelated object rather than failing. The catalog's refusals
+ * keep foreign targets out of the two places that take one (an inverse and a cascade both need an
+ * edge type that permits neither), so this is the assumption written down as code at the sites that
+ * rest on it, rather than left as a comment that a later change can quietly break.
+ */
 export const opTarget = (op: OutboxOp): bigint => vshardOf(op.kind === "delete" ? op.id : op.id1);
+
+/** Throws unless the alias is local. Called wherever an edge's target is about to be treated as one
+ *  of this database's ids. */
+export function localTarget(db: number, id: Id): Id {
+  if (db !== 0) {
+    throw new FormatError(
+      `${id} is in database ${db}, and this is a local id's place: a foreign reference cannot be routed,` +
+        " cascaded to or given an inverse. The catalog refuses `inverse` and `onDelete: cascade` on a foreign" +
+        " edge type so that this is unreachable; reaching it means that rule was bypassed.",
+    );
+  }
+  return id;
+}
 
 export interface OutboxRow {
   vshard: number;
@@ -195,7 +226,7 @@ export interface Snapshot {
   epoch: number;
   nextSeq: number;
   objects: { id: Id; otype: number; version: number; data: string }[];
-  assocs: { id1: Id; atype: number; id2: Id; time: number; data: string | null }[];
+  assocs: { id1: Id; atype: number; db: number; id2: Id; time: number; data: string | null }[];
   counts: { id1: Id; atype: number; n: number }[];
   outbox: { seq: number; target: number; op: string }[];
   index: { idx: number; key: string; id: Id | null; state: string; at: number }[];
@@ -240,18 +271,66 @@ export class Host {
   readonly sql: Sql;
   readonly clock: Clock;
   #catalog: Catalog;
+  #format: StorageFormat;
   /** Requests per vshard since the controller last looked. */
   readonly #requests = new Map<string, number>();
 
-  private constructor(sql: Sql, catalog: Catalog, clock: Clock) {
+  private constructor(sql: Sql, catalog: Catalog, clock: Clock, format: StorageFormat) {
     this.sql = sql;
     this.#catalog = catalog;
     this.clock = clock;
+    this.#format = format;
   }
 
-  static open(sql: Sql, catalog: Catalog = Catalog.empty(), clock: Clock = systemClock): Host {
-    migrate(sql);
-    return new Host(sql, catalog, clock);
+  /**
+   * Opens a host, at the storage format it is told or the one it already holds.
+   *
+   * Told a format, it refuses when that disagrees with the shape of its own `assocs` — see
+   * `schema.ts` for why silence there is the failure worth preventing. Told none, it keeps whatever
+   * it is, and a host with no `assocs` at all defaults to format 1. That default is deliberately the
+   * OLD format: a host is told its format when it is first adopted, and until it has been, the
+   * conservative shape is the one that refuses a foreign edge outright rather than the one that
+   * accepts one the directory may not know about.
+   */
+  static open(
+    sql: Sql,
+    catalog: Catalog = Catalog.empty(),
+    clock: Clock = systemClock,
+    format?: StorageFormat,
+  ): Host {
+    const held = format ?? formatOf(sql) ?? 1;
+    migrate(sql, held);
+    return new Host(sql, catalog, clock, held);
+  }
+
+  /** Which storage format this host's `assocs` is in. */
+  format(): StorageFormat {
+    return this.#format;
+  }
+
+  /**
+   * Tells a host its storage format, which is what a new one is told when it is first adopted.
+   *
+   * It will reshape `assocs` only while the table is empty, because the two formats key it
+   * differently and there is no in-place upgrade: a row written under one key cannot be reinterpreted
+   * under the other, and the order a page is read in would change underneath any cursor already
+   * handed out. A host holding edges is therefore refused, and a vshard move is its migration.
+   */
+  setFormat(format: StorageFormat): void {
+    if (this.#format === format) return;
+    const rows = this.sql.all<{ n: number }>("SELECT COUNT(*) AS n FROM assocs LIMIT 1")[0]?.n ?? 0;
+    if (rows > 0) {
+      throw new FormatError(
+        `this host holds ${rows} edges in storage format ${this.#format} and cannot be reshaped to format ${format}.` +
+          " A vshard move is the migration: a format 1 snapshot installs into a format 2 host with every alias 0.",
+      );
+    }
+    this.sql.txn(() => {
+      this.sql.run("DROP INDEX IF EXISTS assocs_range");
+      this.sql.run("DROP TABLE IF EXISTS assocs");
+      for (const stmt of ddl(format)) this.sql.run(stmt);
+    });
+    this.#format = format;
   }
 
   catalog(): Catalog {
@@ -296,7 +375,7 @@ export class Host {
 
   /** A fresh store, which serves one batch and records what it read. */
   store(routed: Routed | null = null): SqlStore {
-    return new SqlStore(this.sql, routed);
+    return new SqlStore(this.sql, routed, this.#format);
   }
 
   /** Runs each task over local data, prefetching below every row it is asked for. A vshard the caller
@@ -327,6 +406,7 @@ export class Host {
       const seq = BigInt(row.next_seq);
       if (seq > MAX_SEQ) throw new Error(`vshard ${vshard} has no sequence left`);
       const id = makeId(vshard, seq);
+      this.#checkRefs(op.otype, op.data);
       this.sql.run("INSERT INTO objects (id, otype, version, data) VALUES (?, ?, 1, ?)", toKey(id), op.otype, payload(op.data));
       this.sql.run("UPDATE vshards SET next_seq = next_seq + 1 WHERE vshard = ?", Number(vshard));
       return id;
@@ -337,12 +417,18 @@ export class Host {
   update(op: UpdateOp): Reply<number> {
     return this.#write(() => {
       this.#claim(vshardOf(op.id), op.epoch);
-      const before = this.sql.all<{ version: number }>("SELECT version FROM objects WHERE id = ?", toKey(op.id))[0];
+      const before = this.sql.all<{ otype: number; version: number }>(
+        "SELECT otype, version FROM objects WHERE id = ?",
+        toKey(op.id),
+      )[0];
       if (!before) throw new Error(`no such object: ${op.id}`);
       // Checked in the same transaction as the write, so nothing can land between them.
       if (op.expect !== undefined && before.version !== op.expect) {
         throw new Conflict(op.id, op.expect, before.version);
       }
+      // The otype comes off the row rather than from the caller, which is why this check lives here
+      // and not in the client: an update names an id and an id does not carry its type.
+      this.#checkRefs(before.otype, op.data);
       this.sql.run("UPDATE objects SET data = ?, version = version + 1 WHERE id = ?", payload(op.data), toKey(op.id));
       return before.version + 1;
     });
@@ -361,14 +447,17 @@ export class Host {
   assocAdd(op: AssocAddOp): Reply<void> {
     const time = op.time ?? this.clock.now();
     const data = op.data ?? null;
+    const db = op.db ?? 0;
     return this.#write(() => {
       this.#own(op.atype);
       this.#claim(vshardOf(op.id1), op.epoch);
-      this.#putEdge(op.atype, op.id1, op.id2, time, data);
+      this.#putEdge(op.atype, op.id1, db, op.id2, time, data);
       const inverse = this.#catalog.inverseOf(op.atype);
-      // The inverse runs the other way, so it lives on id2's vshard.
+      // The inverse runs the other way, so it lives on id2's vshard. `localTarget` is the audit: an
+      // edge type with an inverse cannot be foreign, so this is unreachable rather than handled.
       if (inverse !== undefined) {
-        this.#dispatch(vshardOf(op.id1), { kind: "add", atype: inverse, id1: op.id2, id2: op.id1, time, data });
+        const target = localTarget(db, op.id2);
+        this.#dispatch(vshardOf(op.id1), { kind: "add", atype: inverse, id1: target, id2: op.id1, time, data });
       }
     });
   }
@@ -407,10 +496,11 @@ export class Host {
         }
         const time = e.time ?? this.clock.now();
         const data = e.data ?? null;
-        this.#putEdge(e.atype, e.id1, e.id2, time, data);
+        const db = e.db ?? 0;
+        this.#putEdge(e.atype, e.id1, db, e.id2, time, data);
         const inverse = this.#catalog.inverseOf(e.atype);
         if (inverse !== undefined) {
-          this.#dispatch(vshard, { kind: "add", atype: inverse, id1: e.id2, id2: e.id1, time, data });
+          this.#dispatch(vshard, { kind: "add", atype: inverse, id1: localTarget(db, e.id2), id2: e.id1, time, data });
         }
       }
       return op.edges.length;
@@ -421,10 +511,11 @@ export class Host {
     return this.#write(() => {
       this.#own(op.atype);
       this.#claim(vshardOf(op.id1), op.epoch);
-      this.#dropEdge(op.atype, op.id1, op.id2);
+      this.#dropEdge(op.atype, op.id1, op.db ?? 0, op.id2);
       const inverse = this.#catalog.inverseOf(op.atype);
       if (inverse !== undefined) {
-        this.#dispatch(vshardOf(op.id1), { kind: "remove", atype: inverse, id1: op.id2, id2: op.id1 });
+        const target = localTarget(op.db ?? 0, op.id2);
+        this.#dispatch(vshardOf(op.id1), { kind: "remove", atype: inverse, id1: target, id2: op.id1 });
       }
     });
   }
@@ -435,8 +526,10 @@ export class Host {
     return this.#write(() => {
       const vshard = opTarget(op);
       this.#row(vshard); // must still be ours, at whatever epoch
-      if (op.kind === "add") this.#putEdge(op.atype, op.id1, op.id2, op.time, op.data);
-      else if (op.kind === "remove") this.#dropEdge(op.atype, op.id1, op.id2);
+      // An outbox op is always local: it is an inverse or a cascade, and the catalog refuses both on
+      // an edge type that permits a foreign target, so alias 0 is not a default but the only value.
+      if (op.kind === "add") this.#putEdge(op.atype, op.id1, 0, op.id2, op.time, op.data);
+      else if (op.kind === "remove") this.#dropEdge(op.atype, op.id1, 0, op.id2);
       else this.#erase(op.id, new Set());
     });
   }
@@ -551,13 +644,18 @@ export class Host {
           hi,
         )
         .map((r) => ({ ...r, id: fromKey(r.id) })),
+      // Format 1 has no `db` column, so its rows snapshot as alias 0 — which is what makes a format 1
+      // snapshot installable into a format 2 host, and so makes a vshard move the migration between
+      // the two (`docs/global-ids.md`).
       assocs: this.sql
-        .all<{ id1: Uint8Array; atype: number; id2: Uint8Array; time: number; data: string | null }>(
-          "SELECT id1, atype, id2, time, data FROM assocs WHERE id1 BETWEEN ? AND ?",
+        .all<{ id1: Uint8Array; atype: number; db?: number; id2: Uint8Array; time: number; data: string | null }>(
+          this.#format === 2
+            ? "SELECT id1, atype, db, id2, time, data FROM assocs WHERE id1 BETWEEN ? AND ?"
+            : "SELECT id1, atype, id2, time, data FROM assocs WHERE id1 BETWEEN ? AND ?",
           lo,
           hi,
         )
-        .map((r) => ({ ...r, id1: fromKey(r.id1), id2: fromKey(r.id2) })),
+        .map((r) => ({ ...r, db: r.db ?? 0, id1: fromKey(r.id1), id2: fromKey(r.id2) })),
       counts: this.sql
         .all<{ id1: Uint8Array; atype: number; n: number }>(
           "SELECT id1, atype, n FROM assoc_counts WHERE id1 BETWEEN ? AND ?",
@@ -591,14 +689,36 @@ export class Host {
         this.sql.run("INSERT OR REPLACE INTO objects (id, otype, version, data) VALUES (?, ?, ?, ?)", toKey(o.id), o.otype, o.version, o.data);
       }
       for (const a of snap.assocs) {
-        this.sql.run(
-          "INSERT OR REPLACE INTO assocs (id1, atype, id2, time, data) VALUES (?, ?, ?, ?, ?)",
-          toKey(a.id1),
-          a.atype,
-          toKey(a.id2),
-          a.time,
-          a.data,
-        );
+        // The one direction that cannot work: a format 2 snapshot holding a foreign edge installed
+        // into a format 1 host would drop the alias and leave an edge into this database instead of
+        // the one it named. Refused rather than narrowed.
+        if (this.#format === 2) {
+          this.sql.run(
+            "INSERT OR REPLACE INTO assocs (id1, atype, db, id2, time, data) VALUES (?, ?, ?, ?, ?, ?)",
+            toKey(a.id1),
+            a.atype,
+            a.db,
+            toKey(a.id2),
+            a.time,
+            a.data,
+          );
+        } else {
+          if (a.db !== 0) {
+            throw new FormatError(
+              `the snapshot of vshard ${snap.vshard} holds an edge into database ${a.db}, and this host is storage` +
+                " format 1, which has no column for it. The alias would be dropped and the edge would read back as" +
+                " one into this database.",
+            );
+          }
+          this.sql.run(
+            "INSERT OR REPLACE INTO assocs (id1, atype, id2, time, data) VALUES (?, ?, ?, ?, ?)",
+            toKey(a.id1),
+            a.atype,
+            toKey(a.id2),
+            a.time,
+            a.data,
+          );
+        }
       }
       for (const c of snap.counts) {
         this.sql.run("INSERT OR REPLACE INTO assoc_counts (id1, atype, n) VALUES (?, ?, ?)", toKey(c.id1), c.atype, c.n);
@@ -813,11 +933,20 @@ export class Host {
     const types = this.#catalog.edgesFrom(row.otype);
 
     // Every restrict is checked before anything is written, so a held-back delete leaves no trace.
+    // The alias comes with the target: an inverse withdrawal and a cascade both route by it, and
+    // `localTarget` below is what makes reaching one with a foreign target a loud failure rather
+    // than a write landing on an unrelated local object.
     const lists = types.map((e) => ({
       edge: e,
       targets: this.sql
-        .all<{ id2: Uint8Array }>("SELECT id2 FROM assocs WHERE id1 = ? AND atype = ?", key, e.atype!)
-        .map((r) => fromKeyOf(r.id2)),
+        .all<{ db?: number; id2: Uint8Array }>(
+          this.#format === 2
+            ? "SELECT db, id2 FROM assocs WHERE id1 = ? AND atype = ?"
+            : "SELECT id2 FROM assocs WHERE id1 = ? AND atype = ?",
+          key,
+          e.atype!,
+        )
+        .map((r) => ({ db: r.db ?? 0, id: fromKeyOf(r.id2) })),
     }));
     for (const { edge, targets } of lists) {
       if (edge.onDelete === "restrict" && targets.length > 0) throw new Restricted(id, edge.name);
@@ -825,10 +954,13 @@ export class Host {
 
     for (const { edge, targets } of lists) {
       const inverse = this.#catalog.inverseOf(edge.atype!);
-      for (const t of targets) {
+      for (const { db, id: target } of targets) {
         // Withdraw the inverse this object's edge put on the other side.
-        if (inverse !== undefined) this.#dispatch(source, { kind: "remove", atype: inverse, id1: t, id2: id });
+        if (inverse !== undefined) {
+          this.#dispatch(source, { kind: "remove", atype: inverse, id1: localTarget(db, target), id2: id });
+        }
         if (edge.onDelete !== "cascade") continue;
+        const t = localTarget(db, target);
         if (vshardOf(t) === source) this.#erase(t, seen);
         // `seen` travels with it: another vshard on this host is another key range in the same
         // database, so the cascade runs inline, and a cycle through it has nothing else to stop it.
@@ -855,8 +987,8 @@ export class Host {
   #dispatch(source: bigint, op: OutboxOp, seen?: Set<Id>): void {
     const target = opTarget(op);
     if (this.#state(target) === "owned" && !this.#waiting(source, target)) {
-      if (op.kind === "add") this.#putEdge(op.atype, op.id1, op.id2, op.time, op.data);
-      else if (op.kind === "remove") this.#dropEdge(op.atype, op.id1, op.id2);
+      if (op.kind === "add") this.#putEdge(op.atype, op.id1, 0, op.id2, op.time, op.data);
+      else if (op.kind === "remove") this.#dropEdge(op.atype, op.id1, 0, op.id2);
       else this.#erase(op.id, seen ?? new Set());
       return;
     }
@@ -882,32 +1014,118 @@ export class Host {
     );
   }
 
-  #putEdge(atype: number, id1: Id, id2: Id, time: number, data: Fields | null): void {
+  /** Refuses an alias this host cannot hold, or one under an edge type that does not permit a
+   *  foreign target. Both before anything is written, so a refused edge leaves no trace.
+   *
+   *  The second check is the catalog's rule enforced where the row lands. A host cannot resolve an
+   *  alias — it stores the number and never looks it up — but it does know whether the edge type was
+   *  declared foreign, and an alias under one that was not is an edge nothing can read back
+   *  correctly: step 4's coordinator routes a foreign hop on the static flag. */
+  #checkAlias(atype: number, db: number): void {
+    if (db === 0) return;
+    if (this.#format !== 2) {
+      throw new FormatError(
+        `an edge into database ${db} needs storage format 2, and this host is format ${this.#format}.` +
+          " Format 1 has no column for the target's database, so the alias would be dropped and the edge would" +
+          " read back as one into this database.",
+      );
+    }
+    const edge = this.#catalog.edge(atype);
+    if (edge !== undefined && !edge.foreign) {
+      throw new FormatError(`${edge.name} does not permit a foreign target, so it cannot hold an edge into database ${db}`);
+    }
+  }
+
+  #putEdge(atype: number, id1: Id, db: number, id2: Id, time: number, data: Fields | null): void {
+    this.#checkAlias(atype, db);
     const k1 = toKey(id1);
     const k2 = toKey(id2);
-    const existed = this.#hasEdge(k1, atype, k2);
-    this.sql.run(
-      "INSERT INTO assocs (id1, atype, id2, time, data) VALUES (?, ?, ?, ?, ?)" +
-        " ON CONFLICT (id1, atype, id2) DO UPDATE SET time = excluded.time, data = excluded.data",
-      k1,
-      atype,
-      k2,
-      time,
-      data === null ? null : JSON.stringify(data),
-    );
+    const existed = this.#hasEdge(k1, atype, db, k2);
+    const json = data === null ? null : JSON.stringify(data);
+    if (this.#format === 2) {
+      this.sql.run(
+        "INSERT INTO assocs (id1, atype, db, id2, time, data) VALUES (?, ?, ?, ?, ?, ?)" +
+          " ON CONFLICT (id1, atype, db, id2) DO UPDATE SET time = excluded.time, data = excluded.data",
+        k1,
+        atype,
+        db,
+        k2,
+        time,
+        json,
+      );
+    } else {
+      // Format 1's statement, byte for byte what it has always been. A host that was loaded on this
+      // format issues exactly the SQL it was loaded with.
+      this.sql.run(
+        "INSERT INTO assocs (id1, atype, id2, time, data) VALUES (?, ?, ?, ?, ?)" +
+          " ON CONFLICT (id1, atype, id2) DO UPDATE SET time = excluded.time, data = excluded.data",
+        k1,
+        atype,
+        k2,
+        time,
+        json,
+      );
+    }
     if (!existed) this.#bump(k1, atype, 1);
   }
 
-  #dropEdge(atype: number, id1: Id, id2: Id): void {
+  #dropEdge(atype: number, id1: Id, db: number, id2: Id): void {
+    this.#checkAlias(atype, db);
     const k1 = toKey(id1);
     const k2 = toKey(id2);
-    if (!this.#hasEdge(k1, atype, k2)) return;
-    this.sql.run("DELETE FROM assocs WHERE id1 = ? AND atype = ? AND id2 = ?", k1, atype, k2);
+    if (!this.#hasEdge(k1, atype, db, k2)) return;
+    if (this.#format === 2) {
+      this.sql.run("DELETE FROM assocs WHERE id1 = ? AND atype = ? AND db = ? AND id2 = ?", k1, atype, db, k2);
+    } else {
+      this.sql.run("DELETE FROM assocs WHERE id1 = ? AND atype = ? AND id2 = ?", k1, atype, k2);
+    }
     this.#bump(k1, atype, -1);
   }
 
-  #hasEdge(k1: Uint8Array, atype: number, k2: Uint8Array): boolean {
-    return this.sql.all("SELECT 1 AS one FROM assocs WHERE id1 = ? AND atype = ? AND id2 = ?", k1, atype, k2).length > 0;
+  #hasEdge(k1: Uint8Array, atype: number, db: number, k2: Uint8Array): boolean {
+    return this.#format === 2
+      ? this.sql.all("SELECT 1 AS one FROM assocs WHERE id1 = ? AND atype = ? AND db = ? AND id2 = ?", k1, atype, db, k2)
+          .length > 0
+      : this.sql.all("SELECT 1 AS one FROM assocs WHERE id1 = ? AND atype = ? AND id2 = ?", k1, atype, k2).length > 0;
+  }
+
+  /**
+   * Validates every payload field the catalog declares as an id.
+   *
+   * Field relationships hold ids INSIDE the JSON payload, which is why `query/ref.ts` exists at all,
+   * and it is the other place a qualified reference is accepted. Two things are checked:
+   *
+   * - That the value is a reference at all. A payload is opaque to storage, so a malformed id in one
+   *   is found later by whatever tries to follow it, as a read that throws or an object that is
+   *   quietly absent. Checking it on the way in turns that into a refused write.
+   * - That a qualified one sits under a field relationship declared `foreign`, where one follows the
+   *   field. The flag is the planner's static signal that a hop can leave this database, and a
+   *   qualified reference under a type that does not declare one is a reference no read will route.
+   *
+   * A qualified reference in an id field that NOTHING follows is left alone: the catalog says the
+   * field holds an id, nothing traverses it, and refusing it would be refusing a value no part of
+   * this engine will ever read.
+   */
+  #checkRefs(otype: number, data: Fields): void {
+    const type = this.#catalog.object(otype);
+    if (type === undefined) return; // an otype this host's catalog does not know; nothing to check against
+    for (const [field, spec] of Object.entries(type.fields)) {
+      if (!isIdField(spec)) continue;
+      const value = data[field];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== "string") {
+        throw new TypeError(`${type.name}.${field} is an id, but the payload holds a ${typeof value}`);
+      }
+      const { db } = parseRef(value); // throws, naming the canonical spelling where there is one
+      if (db === null) continue;
+      const follows = this.#catalog.edgeTypes().find((e) => e.from === type.name && e.field === field);
+      if (follows !== undefined && !follows.foreign) {
+        throw new TypeError(
+          `${type.name}.${field} holds ${value}, which is in another database, and ${follows.name} follows that field` +
+            ' without permitting a foreign target. Declare that edge type with `"foreign": true`.',
+        );
+      }
+    }
   }
 
   /** Counts are maintained in the same transaction as the edge write. An add may need the row created;
@@ -933,6 +1151,13 @@ function payload(data: Fields): string {
     if (bytes > MAX_PAYLOAD) throw new RangeError(`payload is ${bytes} bytes, over the ${MAX_PAYLOAD} cap`);
   }
   return json;
+}
+
+/** Whether a field spec declares an id, through however many `optional` wrappers. */
+function isIdField(spec: FieldSpec): boolean {
+  if (typeof spec !== "object") return false;
+  if ("id" in spec) return true;
+  return "optional" in spec ? isIdField(spec.optional) : false;
 }
 
 function fromKeyOf(b: Uint8Array): Id {

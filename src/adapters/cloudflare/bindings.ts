@@ -69,6 +69,17 @@ export interface Env {
   HLEKK_MAP: Kv;
   /** Scopes DO names, so one namespace can hold many databases. */
   HLEKK_DATABASE?: string;
+  /**
+   * The canonical URI this database is linked to by, for the cross-database protocol.
+   *
+   * Configuration and not a request, because the URI is the database's identity: to everyone holding
+   * an edge into it, a database that answers at another name is another database. Recorded in the
+   * directory the first time it opens, and refused if it later disagrees. Absent is the state every
+   * database deployed before the protocol existed is in — it can still be read over the protocol,
+   * since answering is about its own objects, but it cannot tell a reference to itself from a
+   * reference to a stranger, so it does not collapse one.
+   */
+  HLEKK_DATABASE_URI?: string;
   /** Lowers the placement controller's byte threshold, so a demo can reach a rebalance without
    *  writing gigabytes. */
   HLEKK_SHED_BYTES?: string;

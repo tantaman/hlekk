@@ -12,6 +12,13 @@
 
 import { DatabaseSync } from "node:sqlite";
 
+import { ddl } from "../src/host/schema.ts";
+
+/** The two shipped formats' own `assocs` statements, so the two rows that describe real storage are
+ *  measured against the text a host actually issues rather than against a copy of it. The rest of
+ *  the table below is hypothetical by nature and stays hand-written. */
+const assocsOf = (format) => ddl(format).filter((stmt) => /\bassocs\b/.test(stmt) && !/assoc_counts/.test(stmt));
+
 const PAGES = 12_000;
 const DEG = 65;
 // A fixed stride, so every run builds the same graph. Coprime with PAGES, so targets spread.
@@ -39,25 +46,18 @@ function key(width, vshard, seq, prefix = 0x0102030405060708n) {
 }
 
 const CONFIGS = {
-  // Today's schema, the control.
-  "today": {
+  // Storage format 1, the control. The host's own statements.
+  "format 1": {
     width: 8,
-    ddl: [
-      `CREATE TABLE assocs (id1 BLOB NOT NULL, atype INTEGER NOT NULL, id2 BLOB NOT NULL,
-        time INTEGER NOT NULL, data TEXT, PRIMARY KEY (id1, atype, id2)) WITHOUT ROWID`,
-      `CREATE INDEX assocs_range ON assocs (id1, atype, time)`,
-    ],
+    ddl: assocsOf(1),
     ins: `INSERT OR REPLACE INTO assocs (id1, atype, id2, time, data) VALUES (?, 1, ?, ?, NULL)`,
   },
-  // An interned alias, inside the key because two databases' id2 would otherwise collide on it.
-  "alias in the key": {
+  // Storage format 2: an interned alias, inside the key because two databases' id2 would otherwise
+  // collide on it. Also the host's own statements, which is what makes this a reading of the shipped
+  // shape rather than of the proposal it started as.
+  "format 2 (alias in the key)": {
     width: 8,
-    ddl: [
-      `CREATE TABLE assocs (id1 BLOB NOT NULL, atype INTEGER NOT NULL, db INTEGER NOT NULL DEFAULT 0,
-        id2 BLOB NOT NULL, time INTEGER NOT NULL, data TEXT,
-        PRIMARY KEY (id1, atype, db, id2)) WITHOUT ROWID`,
-      `CREATE INDEX assocs_range ON assocs (id1, atype, time)`,
-    ],
+    ddl: assocsOf(2),
     ins: `INSERT OR REPLACE INTO assocs (id1, atype, db, id2, time, data) VALUES (?, 1, 0, ?, ?, NULL)`,
   },
   // Foreign edges in their own table, which stays empty here: this reading is what the option costs
@@ -152,7 +152,7 @@ const f = (n) => n.toLocaleString();
 
 console.log(`${f(PAGES)} objects, ${f(base.edges)} local edges, no foreign edges written.`);
 console.log(`Projection columns assume docs/wikimedia-plan.md's enwiki figures: 35M pages, 2.6B edges.\n`);
-console.log("| where the reference lives | total bytes | bytes/edge-row | vs today | enwiki |");
+console.log("| where the reference lives | total bytes | bytes/edge-row | vs format 1 | enwiki |");
 console.log("| --- | --- | --- | --- | --- |");
 for (const r of out) {
   const gb = (35e6 * (r.objects / PAGES) + 2.6e9 * (r.assocs / r.edges)) / 1e9;
