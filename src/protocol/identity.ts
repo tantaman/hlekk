@@ -201,12 +201,17 @@ export async function reachable(keys: readonly PublicKey[], pinned: string): Pro
 /** Checks that a key's own id is the digest of its key, and that every rotation link verifies. A
  *  descriptor that fails this is malformed rather than untrusted, and is refused either way. */
 export async function wellFormed(keys: readonly PublicKey[]): Promise<boolean> {
+  if (!Array.isArray(keys) || keys.some((key) => !key || typeof key !== "object")) return false;
   const byId = new Map(keys.map((k) => [k.id, k]));
+  if (byId.size !== keys.length) return false;
   for (const k of keys) {
     if (k.alg !== ALG) return false;
-    if (unb64url(k.key).byteLength !== 32) return false;
+    if (typeof k.key !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(k.key) || b64url(unb64url(k.key)) !== k.key) return false;
     if ((await keyIdOf(k.key)) !== k.id) return false;
+    if (k.retired !== undefined && !Number.isSafeInteger(k.retired)) return false;
     if (k.signedBy === undefined) continue;
+    if (!k.signedBy || typeof k.signedBy.id !== "string" || typeof k.signedBy.signature !== "string" ||
+        !/^[A-Za-z0-9_-]{43}$/.test(k.signedBy.id) || !/^[A-Za-z0-9_-]{86}$/.test(k.signedBy.signature)) return false;
     const by = byId.get(k.signedBy.id);
     // A link to a key the descriptor does not list cannot be checked, so it is not a link. The key
     // is still usable on its own; it just cannot be walked to from a pin on its predecessor.
@@ -218,8 +223,8 @@ export async function wellFormed(keys: readonly PublicKey[]): Promise<boolean> {
 // ---- the request signature
 
 /** `Content-Digest`, as RFC 9530 spells it: one algorithm, as a byte-sequence member. */
-export const contentDigest = async (body: string): Promise<string> =>
-  `sha-256=:${btoa(String.fromCharCode(...(await sha256(utf8(body)))))}:`;
+export const contentDigest = async (body: string | Uint8Array): Promise<string> =>
+  `sha-256=:${btoa(String.fromCharCode(...(await sha256(typeof body === "string" ? utf8(body) : body))))}:`;
 
 export interface SignedHeaders {
   [name: string]: string;
@@ -229,7 +234,7 @@ export interface SignOptions {
   method: string;
   /** The absolute URI the request is sent to, which is what a signature over `@target-uri` covers. */
   url: string;
-  body: string;
+  body: string | Uint8Array;
   /** The calling database's canonical URI. */
   caller: string;
   seed: string;
@@ -277,7 +282,7 @@ export interface Caller {
 export interface VerifyOptions {
   method: string;
   url: string;
-  body: string;
+  body: string | Uint8Array;
   headers: { get(name: string): string | null };
   /** Seconds since the epoch, as the responder sees it. */
   now: number;
@@ -327,6 +332,7 @@ export async function verifyRequest(opts: VerifyOptions): Promise<Caller | null>
   if (sent !== digest) throw new SignatureRefused("content-digest does not match the body");
 
   const keys = await opts.keysOf(database);
+  if (!(await wellFormed(keys))) throw new SignatureRefused("the caller published malformed keys");
   const key = keys.find((k) => k.id === parsed.keyId);
   if (key === undefined) throw new SignatureRefused(`${database} publishes no key ${parsed.keyId}`);
   if (key.alg !== ALG) throw new SignatureRefused(`key ${key.id} is ${key.alg}, and this profile is ${ALG}`);

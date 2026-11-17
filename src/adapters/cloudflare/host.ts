@@ -100,11 +100,13 @@ export class HlekkHostDO {
          *  key `assocs` differently and a vshard move is the migration between them. */
         adopt: (entries: { vshard: string; epoch: number }[], format?: StorageFormat) => {
           if (format !== undefined) {
-            this.#sql.run(
-              "INSERT INTO do_meta (k, v) VALUES ('format', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v",
-              String(format),
-            );
-            host.setFormat(format);
+            this.#sql.txn(() => {
+              this.#sql.run(
+                "INSERT INTO do_meta (k, v) VALUES ('format', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v",
+                String(format),
+              );
+              host.setFormat(format);
+            });
           }
           for (const e of entries) if (!host.holds(BigInt(e.vshard))) host.adopt(e.vshard, e.epoch);
           return host.vshards().length;

@@ -141,7 +141,7 @@ describe("the wiki Worker's entry module", () => {
 
 describe("the wiki Worker's routes", () => {
   /** What a visitor may reach. Everything else the Worker serves has to be an operator path. */
-  const PUBLIC = ["/", "/wiki", "/cluster", "/health", "/lookup", "/page", "/relation", "/schema", "/price", "/query", "/counts"];
+  const PUBLIC = ["/", "/og.png", "/wiki", "/cluster", "/health", "/lookup", "/page", "/relation", "/schema", "/price", "/query", "/counts"];
 
   /** Prefixes a visitor may reach, by the constant the Worker mounts them under. */
   const PUBLIC_PREFIXES = ["PROTOCOL_PREFIX"];

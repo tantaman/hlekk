@@ -397,9 +397,10 @@ path. It waits on the chunked snapshot design.md owes.
 The measured 1.019x holds against the shipped statements: `scripts/id-width.mjs` now imports them
 from `src/host/schema.ts` rather than restating them, so the reading is of the real shape.
 
-**The pin is written.** `foreign_dbs.pinned` holds the id of the key a database proved on first
-contact, and a later key that the pin cannot reach through rotation signatures moves the row to
-`repudiated` — which is this document's *a pin is what keeps substitution loud*, as code. What is
+**The pin is written.** `foreign_dbs.pinned` holds the id of the key the TLS origin advertised
+on first contact. A later key without a valid rotation chain moves the row to `repudiated`.
+A replacement operator can copy the old descriptor. Version 1 authenticates read responses
+through TLS. What is
 still absent is `unreachable`: a timeout is held in the asking isolate, because writing that state
 from every isolate that sees one would put the directory on the read path.
 

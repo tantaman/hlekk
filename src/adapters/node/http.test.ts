@@ -37,6 +37,15 @@ describe("the protocol over node:http", () => {
     }
   });
 
+  it("serves a public identity from a different local mount", async () => {
+    const { binding } = await served({ database: "https://public.example/catalog" });
+    const node = await listen(binding, { path: "/internal" });
+    open.push(node);
+    const descriptor = await (await fetch(node.origin + "/internal")).json();
+    assert.equal(descriptor.database, binding.database);
+    assert.equal(descriptor.routes.read, binding.database + "/read");
+  });
+
   it("answers a read a client can decode", async () => {
     const { node, issue, comments } = await start();
     const res = await fetch(`${node.database}/read`, {

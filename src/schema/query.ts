@@ -4,10 +4,13 @@
 // It compiles to a Plan, which is what hosts and the coordinator run. Each `related` level becomes one
 // frame, addressed by index, so a frontier task can carry its frame and a host can cache the plan.
 
+import { parseRef } from "../query/ref.ts";
+import { targetOf } from "../query/types.ts";
+import type { KnownRun } from "../query/stores.ts";
 import { parseId } from "../host/ids.ts";
 import { DEFAULT_LIMIT } from "../query/ops.ts";
 import type { Stats } from "../query/driver.ts";
-import type { Cond, CmpOp, Id, Json, Plan, Source } from "../query/types.ts";
+import type { Cond, CmpOp, Cursor, Id, Json, Plan, Source } from "../query/types.ts";
 import type { EdgeType, FieldMap, FieldRel, IsSingle, ObjectType, Relation, RowOf, TargetOf } from "./define.ts";
 
 // Structural, so this module imports no value from define.ts and the two do not form a cycle: a
@@ -29,7 +32,7 @@ interface Node {
   source: Source;
   where?: Pred;
   limit?: number;
-  after?: { time: number; db: number; id2: Id; token?: string };
+  after?: Cursor;
   children: Child[];
   counts: { alias: string; atype: number }[];
 }
@@ -81,8 +84,17 @@ export const encodeToken = (token: string): string =>
 /** Strict, because a cursor now arrives from an untrusted caller as well as from an answer this
  *  process minted: `Hop.after` is a continuation token a stranger may submit, and a malformed one
  *  that decoded to `NaN` would reach a SQL parameter rather than a refusal. */
-export function decodeCursor(cursor: string): { time: number; db: number; id2: Id; token?: string } {
+export function decodeCursor(cursor: string): Cursor {
   const parts = cursor.split(":");
+  if (parts[0] === "p1") {
+    if (parts.length !== 4) throw new TypeError("invalid foreign page cursor");
+    const limit = Number(parts[1]);
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError("invalid foreign page size");
+    const target = decodeURIComponent(parts[2]!);
+    parseRef(target);
+    const start = parts[3] ? decodeCursor(TOKEN_VERSION + ":" + parts[3]) : { time: 0, db: 0, id2: "0" };
+    return { ...start, resume: { target, limit } };
+  }
   if (parts[0] === TOKEN_VERSION) {
     if (parts.length !== 2 || !/^[A-Za-z0-9_-]{1,4096}$/.test(parts[1]!)) {
       throw new TypeError(`not a continuation token: ${JSON.stringify(cursor)}`);
@@ -262,7 +274,11 @@ export interface Runner {
 /** The part of the gathered graph a cursor needs. `db` rides along because it is part of the sort
  *  key on storage format 2, so a cursor minted without it lands in the wrong place at a tie. */
 export interface ListSource {
-  lists: ReadonlyMap<string, { rows: { time: number; db: number; id2: Id }[]; complete: boolean }>;
+  lists: ReadonlyMap<string, {
+    rows: { time: number; db: number; id2: Id; target?: Id }[];
+    complete: boolean;
+    pages?: KnownRun["pages"];
+  }>;
 }
 
 function resolve(pred: Pred, emit: (n: Node) => number): Cond {
@@ -289,30 +305,46 @@ function reshape(row: Json, node: Node, graph: ListSource): Json {
       out[c.alias] = list;
       continue;
     }
-    out[c.alias] = { items: list, ...edgeOf(out.id as Id, c.node, list, graph) } as unknown as Json;
+    out[c.alias] = { items: list, ...pageEnd(out.id as Id, c.node.source, c.node.after, list.at(-1), graph) } as unknown as Json;
   }
   return out;
 }
 
 /** A page's cursor and whether the list goes on. Only the graph knows: the rows handed back are the
  *  ones that passed a filter and fit a limit, which says nothing about what is left. */
-function edgeOf(
-  parent: Id,
-  node: Node,
-  items: Json[],
-  graph: ListSource,
+export function pageEnd(
+  parent: Id, source: Source, after: Cursor | undefined, last: Json | undefined, graph: ListSource,
 ): { cursor: string | null; more: boolean } {
-  if (node.source.kind !== "edge") return { cursor: null, more: false };
-  const list = graph.lists.get(`${parent}:${node.source.atype}`);
-  if (list === undefined) return { cursor: null, more: false };
-  // From the graph's own row rather than from the row handed back, because a cursor carries the
-  // target's database alias and that is storage order, not something an application holds. It is
-  // also what `normalize.ts` does, and the two have to mint the same cursor for the same page.
-  const row = list.rows[Math.min(items.length, list.rows.length) - 1];
-  const cursor = row ? encodeCursor(row.time, row.db, row.id2) : null;
-  // More when the list held rows beyond the ones returned, or was never read to its end.
-  const more = items.length < list.rows.length || !list.complete;
-  return { cursor, more };
+  const end = { cursor: null, more: false };
+  if (source.kind !== "edge" || !last || typeof last !== "object" || Array.isArray(last)) return end;
+  const list = graph.lists.get(`${parent}:${source.atype}`);
+  if (!list) return end;
+  if (list.pages) {
+    let start = after?.token ?? null;
+    const seen = new Set<string | null>();
+    while (!seen.has(start)) {
+      seen.add(start);
+      const page = list.pages.get(start);
+      if (!page) break;
+      const index = page.rows.findIndex(edge => targetOf(edge) === last.id);
+      if (index >= 0) {
+        if (index + 1 < page.rows.length) {
+          // A filter or smaller application limit stopped inside this page. Replay
+          // from its original token and resume immediately after the delivered edge.
+          const token = start === null ? "" : encodeToken(start).slice(TOKEN_VERSION.length + 1);
+          const target = encodeURIComponent(targetOf(page.rows[index]!));
+          return { cursor: `p1:${page.requested ?? page.rows.length}:${target}:${token}`, more: true };
+        }
+        return page.next === undefined ? end : { cursor: encodeToken(page.next), more: !page.complete };
+      }
+      if (!page.next) break;
+      start = page.next;
+    }
+    return end;
+  }
+  const index = list.rows.findIndex(edge => (edge.target ?? edge.id2) === last.id);
+  const row = list.rows[index];
+  return row ? { cursor: encodeCursor(row.time, row.db, row.id2), more: index + 1 < list.rows.length || !list.complete } : end;
 }
 
 /** Starts a query from ids the caller already holds. Every query starts from an object and follows

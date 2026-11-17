@@ -9,9 +9,9 @@
 // It is a serializer, not a mechanism: the coordinator already gathers exactly this, and `materialize`
 // throws it away on the way out.
 
-import { encodeCursor, encodeToken } from "../schema/query.ts";
+import { pageEnd } from "../schema/query.ts";
 import type { Cache } from "./stores.ts";
-import { RESERVED_KEYS, listKey } from "./types.ts";
+import { RESERVED_KEYS } from "./types.ts";
 import type { Fields, Id, Json, Plan } from "./types.ts";
 
 export interface ObjectEntry {
@@ -46,8 +46,8 @@ const RESERVED = RESERVED_KEYS;
 
 /** Turns a nested answer and the graph it was read from into the normalized form. Takes the driver's
  *  rows, before the builder reshapes them. */
-export function normalize(plan: Plan, rootIds: readonly Id[], rows: readonly Json[], graph: Cache): QueryResult {
-  const out: QueryResult = { roots: [...rootIds], objects: {}, lists: {}, counts: {}, shape: {} };
+export function normalize(plan: Plan, _rootIds: readonly Id[], rows: readonly Json[], graph: Cache): QueryResult {
+  const out: QueryResult = { roots: [], objects: {}, lists: {}, counts: {}, shape: {} };
 
   for (const [index, frame] of plan.frames.entries()) {
     const aliases: Record<string, number> = {};
@@ -64,7 +64,8 @@ export function normalize(plan: Plan, rootIds: readonly Id[], rows: readonly Jso
     // The payload comes from the graph, which holds it once and knows its type and version. Rebuilding
     // it from the row would mean guessing which keys were aliases.
     const held = graph.objects.get(id);
-    if (held && !(id in out.objects)) {
+    if (!held) return id;
+    if (!(id in out.objects)) {
       out.objects[id] = { otype: held.otype, version: held.version, data: held.data };
     }
 
@@ -83,7 +84,7 @@ export function normalize(plan: Plan, rootIds: readonly Id[], rows: readonly Jso
         if (edge) sawEdge = true;
         edges.push(edge);
       }
-      const entry: ListEntry = { ids, ...continuation(id, child.frame, ids.length, plan, graph) };
+      const entry: ListEntry = { ids, ...pageEnd(id, plan.frames[child.frame].source, plan.frames[child.frame].after, items.at(-1), graph) };
       if (sawEdge) entry.edges = edges;
       out.lists[`${child.frame}:${id}`] = entry;
     }
@@ -97,7 +98,10 @@ export function normalize(plan: Plan, rootIds: readonly Id[], rows: readonly Jso
     return id;
   };
 
-  for (const row of rows) visit(row, 0);
+  for (const row of rows) {
+    const id = visit(row, 0);
+    if (id !== null) out.roots.push(id);
+  }
   return out;
 }
 
@@ -109,29 +113,6 @@ function edgeOf(item: Json): { time: number; data: Fields | null } | null {
   if (typeof time !== "number") return null;
   const data = (edge as Record<string, Json>).data;
   return { time, data: data === null || data === undefined ? null : (data as Fields) };
-}
-
-/** Where a list can be continued from, and whether it goes on. Only the graph knows: the ids handed
- *  back are the ones that passed a filter and fit a limit. */
-function continuation(
-  parent: Id,
-  frame: number,
-  returned: number,
-  plan: Plan,
-  graph: Cache,
-): { cursor: string | null; more: boolean } {
-  const source = plan.frames[frame].source;
-  if (source.kind !== "edge") return { cursor: null, more: false };
-  const run = graph.lists.get(listKey(parent, source.atype));
-  if (!run) return { cursor: null, more: false };
-  // A list another database holds continues from the token it handed back, wrapped so an application
-  // can hold it and give it straight back. What such a token should MEAN to an application — whose
-  // clock its `time` is, whether it survives the responder's own rotation of them — is open in
-  // PLAN.md; what is settled is that the responder owns it and this side does not invent one.
-  if (run.next !== undefined) return { cursor: encodeToken(run.next), more: true };
-  const last = run.rows[Math.min(returned, run.rows.length) - 1];
-  const cursor = last ? encodeCursor(last.time, last.db, last.id2) : null;
-  return { cursor, more: returned < run.rows.length || !run.complete };
 }
 
 /** Keys the way the maps above are keyed, so a consumer does not have to build the strings by hand. */

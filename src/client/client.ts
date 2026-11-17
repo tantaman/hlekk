@@ -312,12 +312,6 @@ export class Hlekk {
     const wrapped = new Map<string, HostClient>();
     const wrap = (database: string, client: HostClient): HostClient => ({
       exec: async (plan, tasks) => {
-        if (this.clock.now() > until) {
-          throw new BudgetSpent("deadline", `${budget.deadlineMs} ms for foreign hops, and ${database} was still to ask`);
-        }
-        if (requests <= 0) {
-          throw new BudgetSpent("requests", `${budget.requests} requests to other databases, and ${database} was still to ask`);
-        }
         if (!reached.has(database) && reached.size >= budget.databases) {
           throw new BudgetSpent(
             "databases",
@@ -325,8 +319,26 @@ export class Hlekk {
           );
         }
         reached.add(database);
-        requests--;
-        return client.exec(plan, tasks);
+        const remaining = until - this.clock.now();
+        const expired = () => new BudgetSpent("deadline", `${budget.deadlineMs} ms for foreign hops to ${database}`);
+        if (remaining <= 0) throw expired();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(expired()), remaining);
+        const spend = () => {
+          if (this.clock.now() >= until || controller.signal.aborted) throw expired();
+          if (requests <= 0) throw new BudgetSpent("requests", `${budget.requests} requests to other databases`);
+          requests--;
+          return controller.signal;
+        };
+        try {
+          if (!client.metersRequests) spend();
+          const timedOut = new Promise<never>((_, reject) => {
+            controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
+          });
+          return await Promise.race([client.exec(plan, tasks, spend), timedOut]);
+        } finally {
+          clearTimeout(timer);
+        }
       },
     });
     return (database, client) => {

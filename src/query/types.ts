@@ -96,6 +96,8 @@ export interface Cursor {
    * removed at the boundary.
    */
   token?: string;
+  /** Resume within a responder page when a local filter or limit stopped early. */
+  resume?: { target: Ref; limit: number };
 }
 
 /** Whether a continuation is a token the database holding the list handed back. */
@@ -257,6 +259,7 @@ export function missKey(m: Miss): string {
   // a local object can have the same low half, and one key for both would drop one of them.
   if (m.kind === "object") return m.db ? `o:${m.db}:${m.id}` : `o:${m.id}`;
   if (m.kind === "count") return `c:${listKey(m.id1, m.atype)}`;
+  if (m.after?.resume) return `e:${listKey(m.id1, m.atype)}:resume:${JSON.stringify(m.after)}`;
   if (m.after?.token !== undefined) return `e:${listKey(m.id1, m.atype)}:t:${m.after.token}`;
   return `e:${listKey(m.id1, m.atype)}:${m.after ? `${m.after.time}:${m.after.db}:${m.after.id2}` : "head"}`;
 }

@@ -168,6 +168,8 @@ export class EdgeHop implements Op {
     if (!req.parent) return "done";
     const id1 = req.parent.obj.id;
     let after = req.after ?? this.from;
+    const seenTokens = new Set<string>();
+    if (after?.token) seenTokens.add(after.token);
     for (let n = req.want ?? DEFAULT_LIMIT; ; n = Math.min(MAX_PAGE, n * 2)) {
       const page = await p.store.edges(id1, this.atype, after, n, this.frame);
       if (page === UNKNOWN) {
@@ -196,7 +198,13 @@ export class EdgeHop implements Op {
         }
         if (o !== null) yield node({ obj: o, edge: e }); // an edge to a deleted object is dropped
       }
-      if (page.complete || page.rows.length === 0) return "done";
+      if (page.complete) return "done";
+      if (page.next !== undefined) {
+        if (seenTokens.has(page.next)) throw new Error("a foreign page repeated its continuation");
+        seenTokens.add(page.next);
+      } else if (!page.rows.length) {
+        throw new Error("an incomplete edge page has no continuation");
+      }
       // The responder's own token where it gave one, and this database's sort key otherwise. A
       // foreign list cannot be continued from the last row the caller can see: the rows between it
       // and the next page are the ones the policy removed.

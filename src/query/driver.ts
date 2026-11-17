@@ -1,5 +1,6 @@
 // The coordinator's two drivers, rounds and async, and a host's handler for one batch of tasks.
 
+import { isQualified } from "./ref.ts";
 import { Pass, drain, materialize } from "./ops.ts";
 import type { Foreign } from "./ops.ts";
 import { Cache, CacheStore } from "./stores.ts";
@@ -14,7 +15,9 @@ export interface HostReply {
 
 /** In production, an RPC to a host DO. */
 export interface HostClient {
-  exec(plan: Plan, tasks: Miss[]): Promise<HostReply>;
+  /** HTTP clients charge each exchange. Other transports charge once per exec. */
+  metersRequests?: boolean;
+  exec(plan: Plan, tasks: Miss[], spend?: () => AbortSignal): Promise<HostReply>;
 }
 
 /** A store over one host's own data, which also records what it read. */
@@ -112,6 +115,7 @@ export async function runRounds(
     const replies = await Promise.all([...byHost].map(([h, ts]) => h.exec(plan, ts)));
     for (const r of replies) cache.merge(r.reads);
     tasks = replies.flatMap((r) => r.misses);
+    if (foreign === "reference") tasks = tasks.filter((t) => !isQualified(missOwner(t)));
   }
 }
 

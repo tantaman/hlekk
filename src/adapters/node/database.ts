@@ -26,13 +26,14 @@ import type { HostClient } from "../../query/driver.ts";
 import { nodeSql } from "../../host/sql.node.ts";
 import type { StorageFormat } from "../../host/schema.ts";
 import { Deliverer } from "../../host/outbox.ts";
-import { foreignClient } from "../../protocol/client.ts";
-import type { ForeignOptions } from "../../protocol/client.ts";
+import { discover, foreignClient } from "../../protocol/client.ts";
+import type { ForeignOptions, Pins } from "../../protocol/client.ts";
 import { ResponseCache } from "../../protocol/client.ts";
 import { surfaceOf } from "../../protocol/surface.ts";
 import type { Binding } from "../../protocol/http.ts";
 import type { Projection } from "../../catalog/projection.ts";
 import type { Policy } from "../../query/serve.ts";
+import type { ListenBinding } from "./http.ts";
 import { privateAddressGuard } from "./guard.ts";
 
 export interface OpenOptions {
@@ -64,7 +65,7 @@ export interface NodeHlekk {
   db: Hlekk;
   catalog: Catalog;
   /** What to hand `protocol/http.ts` or `adapters/node/http.ts`. */
-  binding: Binding;
+  binding: Binding & ListenBinding;
   /** Drains the outbox until nothing is left to deliver. No alarm here, so somebody has to ask. */
   deliver(): Promise<number>;
   close(): void;
@@ -126,6 +127,14 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
   const identity = opts.identity ?? true;
   const own = () => cluster.directory.databaseUri() ?? undefined;
 
+  const pins: Pins = {
+    pinOf: async (uri) => ({
+      pinned: cluster.directory.pinnedOf(uri) ?? null,
+      state: cluster.directory.stateOf(uri) ?? null,
+    }),
+    pin: async (uri, keyId) => cluster.directory.pin(uri, keyId, Date.now()),
+    repudiate: async (uri) => cluster.directory.repudiate(uri),
+  };
   const openForeign = (database: string): HostClient =>
     foreignClient(database, {
       catalog,
@@ -133,34 +142,32 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
       cache,
       agree: true,
       self: own(),
-      ...(identity
-        ? {
-            identity: async () => ({ database: own() ?? null, pair: await cluster.directory.identity(Date.now()) }),
-            pins: {
-              pinOf: async (uri) => ({
-                pinned: cluster.directory.pinnedOf(uri) ?? null,
-                state: cluster.directory.stateOf(uri) ?? null,
-              }),
-              pin: async (uri, keyId) => cluster.directory.pin(uri, keyId, Date.now()),
-              repudiate: async (uri) => cluster.directory.repudiate(uri),
-            },
-          }
-        : {}),
+      identity: identity ? async () => ({ database: own() ?? null, pair: await cluster.directory.identity(Date.now()) }) : undefined,
+      pins: identity ? pins : undefined,
       ...opts.foreign,
     });
 
   Hlekk.forget(cluster.transport);
   const db = Hlekk.from(cluster.transport, cluster.runtime.clock, openForeign);
 
-  const binding: Binding = {
+  if (identity) await cluster.directory.identity(Date.now());
+  const binding: Binding & ListenBinding = {
     // Filled in by whoever listens, which is the only party that knows the port. `adapters/node/http.ts`
     // does it.
-    database: own() ?? "https://localhost",
+    get database() { return own() ?? "https://localhost"; },
+    bindUri(socketUri, configured) {
+      const uri = configured ?? own() ?? socketUri;
+      cluster.directory.setDatabaseUri(uri);
+      return uri;
+    },
     catalog,
     source: db,
     surface: surfaceOf(catalog, opts.projection),
     policy: opts.policy,
-    keys: identity ? await keys(cluster) : undefined,
+    publishedKeys: identity ? () => cluster.directory.publishedKeys() : undefined,
+    get keys() { return identity ? cluster.directory.publishedKeys() : undefined; },
+    pins: identity ? pins : undefined,
+    callerKeys: identity ? async (uri) => (await discover(uri, { guard, ...opts.foreign })).keys : undefined,
   };
 
   return {
@@ -173,9 +180,4 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
       for (const sql of opened.values()) sql.close();
     },
   };
-}
-
-async function keys(cluster: LocalCluster): Promise<Binding["keys"]> {
-  await cluster.directory.identity(Date.now());
-  return cluster.directory.publishedKeys();
 }

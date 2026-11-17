@@ -114,7 +114,7 @@ export function canonicalDb(uri: string): string {
   if (url.hash !== "") throw new RefError(`a database URI carries no fragment: ${JSON.stringify(uri)}`);
 
   const path = canonicalPath(url.pathname, uri);
-  if (!CANONICAL_PATH.test(path)) {
+  if (uri.includes("^") || !CANONICAL_PATH.test(path)) {
     throw new RefError(`a database URI's path holds a character that must be escaped: ${JSON.stringify(uri)}`);
   }
 

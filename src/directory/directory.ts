@@ -237,7 +237,19 @@ export class Directory {
    * is the one piece of per-database state that is expensive to generate and pointless to have
    * before anything asks for it.
    */
-  async identity(now = 0): Promise<KeyPair> {
+  #keyWork: Promise<void> = Promise.resolve();
+
+  #serializeKeys<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.#keyWork.then(work);
+    this.#keyWork = result.then(() => {}, () => {});
+    return result;
+  }
+
+  identity(now = 0): Promise<KeyPair> {
+    return this.#serializeKeys(() => this.#identity(now));
+  }
+
+  async #identity(now: number): Promise<KeyPair> {
     const row = this.sql.all<{ id: string; pub: string; seed: string | null }>(
       "SELECT id, pub, seed FROM keys WHERE retired IS NULL ORDER BY created DESC LIMIT 1",
     )[0];
@@ -265,8 +277,12 @@ export class Directory {
 
   /** Rotates to a new key, signed by the one it replaces. The old key stays published and keeps its
    *  private half until it is pruned, so a request already in flight still verifies. */
-  async rotateKey(now = 0): Promise<PublicKey> {
-    const current = await this.identity(now);
+  rotateKey(now = 0): Promise<PublicKey> {
+    return this.#serializeKeys(() => this.#rotateKey(now));
+  }
+
+  async #rotateKey(now: number): Promise<PublicKey> {
+    const current = await this.#identity(now);
     const next = await generateKeyPair();
     const signedBy = await signRotation(current.seed, next.public);
     this.sql.txn(() => {

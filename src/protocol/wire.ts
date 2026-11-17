@@ -153,11 +153,13 @@ export function decodeRead(body: unknown, catalog: Catalog): Decoded {
 
   const lists: QueryResult["lists"] = {};
   for (const [key, raw] of Object.entries(object(root.lists, "lists"))) {
+    validateParent(key, "lists");
     lists[key] = list(raw, `lists.${JSON.stringify(key)}`);
   }
 
   const counts: QueryResult["counts"] = {};
   for (const [key, raw] of Object.entries(object(root.counts, "counts"))) {
+    validateParent(key, "counts");
     const at = `counts.${JSON.stringify(key)}`;
     const byAlias: Record<string, number> = {};
     for (const [alias, n] of Object.entries(object(raw, at))) byAlias[alias] = integer(n, `${at}.${alias}`);
@@ -191,6 +193,19 @@ export function decodePrice(body: unknown, at = "body"): Cost {
 }
 
 // ---- the validators. Narrow, named, and throwing rather than coercing.
+
+function validateParent(key: string, at: string): void {
+  const parts = /^(0|[1-9][0-9]*):([0-9]+)$/.exec(key);
+  if (parts) {
+    try {
+      parseId(parts[2]!);
+      return;
+    } catch {
+      throw new WireError(at, "invalid parent id");
+    }
+  }
+  throw new WireError(at, "expected a frame and bare parent id");
+}
 
 function object(v: unknown, at: string): Record<string, unknown> {
   if (v === null || typeof v !== "object" || Array.isArray(v)) throw new WireError(at, "expected an object");
@@ -259,6 +274,7 @@ function list(v: unknown, at: string): ListEntry {
     cursor: entry.cursor === null || entry.cursor === undefined ? null : string(entry.cursor, `${at}.cursor`),
     more: boolean(entry.more, `${at}.more`),
   };
+  if (out.more && !out.cursor) throw new WireError(at, "an incomplete list needs a continuation");
   if (entry.edges !== undefined) {
     if (!Array.isArray(entry.edges)) throw new WireError(`${at}.edges`, "expected an array");
     // Positional against `ids`: the edge that reached each one. A length that disagrees would pair

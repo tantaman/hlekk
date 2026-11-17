@@ -26,6 +26,14 @@ export interface ListenOptions {
    *  URI cannot be spelled until the port is known. */
   port?: number;
   host?: string;
+  /** Canonical public identity, including its public path. */
+  database?: string;
+}
+
+export interface ListenBinding extends Omit<Binding, "database"> {
+  database?: string;
+  /** A file-backed database records its development URI when the port becomes known. */
+  bindUri?: (socketUri: string, configured?: string) => string;
 }
 
 export interface NodeDatabase {
@@ -41,14 +49,14 @@ export interface NodeDatabase {
 /**
  * Serves one database, and resolves once it is listening.
  *
- * `database` is filled in from the socket rather than configured, because a database URI is an
- * origin and a path and the origin is not known until the port is. A deployment behind a name passes
- * that name as `path`'s origin instead — see `Binding.prefix` for serving a public URI from a
- * different mount.
+ * Supply a public URI on the binding or in the options for a deployment behind a
+ * proxy. Without one, a loopback server derives its identity after the port is known.
  */
-export function listen(parts: Omit<Binding, "database">, opts: ListenOptions = {}): Promise<NodeDatabase> {
+export function listen(parts: ListenBinding, opts: ListenOptions = {}): Promise<NodeDatabase> {
   const host = opts.host ?? "127.0.0.1";
-  const path = opts.path ?? "";
+  const identity = opts.database ?? parts.database;
+  const publicUri = identity === undefined ? undefined : canonicalDb(identity);
+  const path = opts.path ?? parts.prefix ?? (publicUri ? new URL(publicUri).pathname.replace(/\/$/, "") : "");
   const maxBody = parts.maxBody ?? MAX_BODY;
 
   // Resolved on `listening`, so the binding the handler sees is the one the descriptor advertises.
@@ -64,8 +72,16 @@ export function listen(parts: Omit<Binding, "database">, opts: ListenOptions = {
       const address = server.address() as AddressInfo;
       // A loopback host is the one place `canonicalDb` allows http, for exactly this.
       const origin = `http://${address.address.includes(":") ? `[${address.address}]` : address.address}:${address.port}`;
-      const database = canonicalDb(`${origin}${path}`);
-      binding = { ...parts, database };
+      let database: string;
+      try {
+        const socketUri = origin + path;
+        database = parts.bindUri?.(socketUri, opts.database) ?? publicUri ?? canonicalDb(socketUri);
+      } catch (error) {
+        server.close();
+        fail(error);
+        return;
+      }
+      binding = { ...parts, database, prefix: path };
       done({ origin, database, binding, close: () => close(server) });
     });
   });

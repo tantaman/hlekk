@@ -209,6 +209,16 @@ describe("the request signature", () => {
     );
   });
 
+  it("checks the identifier against the published key bytes before accepting it", async () => {
+    const pair = await keyPairFrom(SEED);
+    const wrong = (await generateKeyPair()).public.id;
+    const h = await signed({ keyId: wrong });
+    await assert.rejects(verifyRequest({
+      method: "POST", url: TARGET, body: BODY, headers: headersOf(h), now: CREATED,
+      keysOf: async () => [{ ...pair.public, id: wrong }],
+    }), /malformed keys/);
+  });
+
   it("refuses a key the caller does not publish", async () => {
     const h = await signed();
     await assert.rejects(
