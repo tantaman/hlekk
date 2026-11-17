@@ -29,7 +29,7 @@ interface Node {
   source: Source;
   where?: Pred;
   limit?: number;
-  after?: { time: number; id2: Id };
+  after?: { time: number; db: number; id2: Id };
   children: Child[];
   counts: { alias: string; atype: number }[];
 }
@@ -52,23 +52,36 @@ export interface Page<T> {
   more: boolean;
 }
 
-/** Edges are ordered by (time, id2); id2 is the tie-break, so a cursor is exact. The version prefix
- *  is here because the comparator can change and an old cursor must not be read under a new one. */
-export const CURSOR_VERSION = "v1";
+/** Edges are ordered by `(time, db, id2)`; the last two are the tie-break, so a cursor is exact. The
+ *  version prefix is here because the comparator can change and an old cursor must not be read under
+ *  a new one — which is exactly what happened: `db` joining the key moved the tie-break, so this is
+ *  `v2` and carries the alias.
+ *
+ *  A `v1` cursor still decodes, as alias 0. Cursors are handed to callers and held across requests,
+ *  so refusing every one already out there would break a page in flight for no gain: on format 1
+ *  every alias IS 0, and on format 2 a `v1` cursor can only have come from a list with no foreign
+ *  edge in it before this point. */
+export const CURSOR_VERSION = "v2";
 
-export const encodeCursor = (time: number, id2: Id): string => `${CURSOR_VERSION}:${time}:${id2}`;
+export const encodeCursor = (time: number, db: number, id2: Id): string => `${CURSOR_VERSION}:${time}:${db}:${id2}`;
 
 /** Strict, because a cursor now arrives from an untrusted caller as well as from an answer this
  *  process minted: `Hop.after` is a continuation token a stranger may submit, and a malformed one
  *  that decoded to `NaN` would reach a SQL parameter rather than a refusal. */
-export function decodeCursor(cursor: string): { time: number; id2: Id } {
+export function decodeCursor(cursor: string): { time: number; db: number; id2: Id } {
   const parts = cursor.split(":");
-  if (parts[0] !== CURSOR_VERSION) throw new TypeError(`cursor version ${parts[0]}, expected ${CURSOR_VERSION}`);
-  if (parts.length !== 3) throw new TypeError(`not a cursor: ${JSON.stringify(cursor)}`);
+  const legacy = parts[0] === "v1";
+  if (!legacy && parts[0] !== CURSOR_VERSION) {
+    throw new TypeError(`cursor version ${parts[0]}, expected ${CURSOR_VERSION}`);
+  }
+  if (parts.length !== (legacy ? 3 : 4)) throw new TypeError(`not a cursor: ${JSON.stringify(cursor)}`);
   const time = Number(parts[1]);
   if (!Number.isSafeInteger(time)) throw new TypeError(`not a cursor time: ${JSON.stringify(parts[1])}`);
-  parseId(parts[2]); // the 8-byte guard: a cursor's id2 is a local id, never a qualified reference
-  return { time, id2: parts[2] };
+  const db = legacy ? 0 : Number(parts[2]);
+  if (!Number.isSafeInteger(db) || db < 0) throw new TypeError(`not a database alias: ${JSON.stringify(parts[2])}`);
+  const id2 = parts[legacy ? 2 : 3]!;
+  parseId(id2); // the 8-byte guard: a cursor's id2 is a local id, never a qualified reference
+  return { time, db, id2 };
 }
 
 const clone = (n: Node): Node => ({ ...n, children: [...n.children], counts: [...n.counts] });
@@ -145,9 +158,8 @@ export class Query<F extends FieldMap, Shape> {
 
   /** Resumes a related list after a cursor. */
   after(cursor: string): Query<F, Shape> {
-    const { time, id2 } = decodeCursor(cursor);
     const node = clone(this.node);
-    node.after = { time, id2 };
+    node.after = decodeCursor(cursor);
     return new Query(node, this.#roots);
   }
 
@@ -226,9 +238,10 @@ export interface Runner {
   answer(plan: Plan, rootIds: Id[], opts?: RunOptions): Promise<{ rows: Json[]; graph: ListSource }>;
 }
 
-/** The part of the gathered graph a cursor needs. */
+/** The part of the gathered graph a cursor needs. `db` rides along because it is part of the sort
+ *  key on storage format 2, so a cursor minted without it lands in the wrong place at a tie. */
 export interface ListSource {
-  lists: ReadonlyMap<string, { rows: { time: number; id2: Id }[]; complete: boolean }>;
+  lists: ReadonlyMap<string, { rows: { time: number; db: number; id2: Id }[]; complete: boolean }>;
 }
 
 function resolve(pred: Pred, emit: (n: Node) => number): Cond {
@@ -268,16 +281,16 @@ function edgeOf(
   items: Json[],
   graph: ListSource,
 ): { cursor: string | null; more: boolean } {
-  const last = items[items.length - 1];
-  const edge = last && typeof last === "object" && !Array.isArray(last) ? last.$edge : undefined;
-  const cursor =
-    edge && typeof edge === "object" && !Array.isArray(edge) && typeof edge.time === "number"
-      ? encodeCursor(edge.time, (last as Record<string, Json>).id as Id)
-      : null;
-  if (node.source.kind !== "edge") return { cursor, more: false };
+  if (node.source.kind !== "edge") return { cursor: null, more: false };
   const list = graph.lists.get(`${parent}:${node.source.atype}`);
+  if (list === undefined) return { cursor: null, more: false };
+  // From the graph's own row rather than from the row handed back, because a cursor carries the
+  // target's database alias and that is storage order, not something an application holds. It is
+  // also what `normalize.ts` does, and the two have to mint the same cursor for the same page.
+  const row = list.rows[Math.min(items.length, list.rows.length) - 1];
+  const cursor = row ? encodeCursor(row.time, row.db, row.id2) : null;
   // More when the list held rows beyond the ones returned, or was never read to its end.
-  const more = list === undefined ? false : items.length < list.rows.length || !list.complete;
+  const more = items.length < list.rows.length || !list.complete;
   return { cursor, more };
 }
 

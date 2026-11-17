@@ -15,6 +15,7 @@ import type { Mutation } from "../../client/transport.ts";
 import { Deliverer } from "../../host/outbox.ts";
 import { Host } from "../../host/host.ts";
 import type { Snapshot } from "../../host/host.ts";
+import type { StorageFormat } from "../../host/schema.ts";
 import { vshardRange } from "../../host/ids.ts";
 import { doSql } from "../../host/sql.ts";
 import type { Sql } from "../../host/sql.ts";
@@ -44,7 +45,13 @@ export class HlekkHostDO {
     this.#sql = doSql(ctx.storage);
   }
 
-  /** The host, opened against whatever catalog this DO was last told about. */
+  /** The host, opened against whatever catalog and storage format this DO was last told about.
+   *
+   *  Told a format, `Host.open` refuses when it disagrees with the shape of this object's own
+   *  `assocs` — which is the whole point of recording it: `CREATE TABLE IF NOT EXISTS` is silent
+   *  about a table that already exists in another shape, and a host meaning something else by the
+   *  edge key would answer reads and accept writes until a page came back in the wrong order. Told
+   *  none, which is every host deployed before this code, it keeps the format it already holds. */
   #open(): Host {
     if (!this.#host) {
       // On first use, not in the constructor: a Durable Object may not touch its storage while it is
@@ -52,9 +59,15 @@ export class HlekkHostDO {
       this.#sql.run(META_DDL);
       const row = this.#sql.all<{ v: string }>("SELECT v FROM do_meta WHERE k = 'lock'")[0];
       const catalog = row ? Catalog.compile(JSON.parse(row.v) as Lock) : Catalog.empty();
-      this.#host = Host.open(this.#sql, catalog);
+      this.#host = Host.open(this.#sql, catalog, undefined, this.#format());
     }
     return this.#host;
+  }
+
+  /** The storage format the directory told this host, or undefined until it has been told one. */
+  #format(): StorageFormat | undefined {
+    const row = this.#sql.all<{ v: string }>("SELECT v FROM do_meta WHERE k = 'format'")[0];
+    return row?.v === "2" ? 2 : row?.v === "1" ? 1 : undefined;
   }
 
   /** One client for the life of the DO, so the shard-map chunks it reads for delivery are reused
@@ -79,8 +92,20 @@ export class HlekkHostDO {
           return { version: lock.version };
         },
 
-        /** A batch, not one call per vshard: a new database opens its first 64 at once. */
-        adopt: (entries: { vshard: string; epoch: number }[]) => {
+        /** A batch, not one call per vshard: a new database opens its first 64 at once.
+         *
+         *  `format` is what this host is told by the directory, which is the authority on it, and
+         *  this is the first call a new host ever receives. An empty host is reshaped to it, which
+         *  loses nothing; one already holding edges in the other format is refused, because the two
+         *  key `assocs` differently and a vshard move is the migration between them. */
+        adopt: (entries: { vshard: string; epoch: number }[], format?: StorageFormat) => {
+          if (format !== undefined) {
+            this.#sql.run(
+              "INSERT INTO do_meta (k, v) VALUES ('format', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v",
+              String(format),
+            );
+            host.setFormat(format);
+          }
           for (const e of entries) if (!host.holds(BigInt(e.vshard))) host.adopt(e.vshard, e.epoch);
           return host.vshards().length;
         },

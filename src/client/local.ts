@@ -16,6 +16,7 @@ import { Host } from "../host/host.ts";
 import { Deliverer } from "../host/outbox.ts";
 import type { ExecReply, Reply, Routed, Snapshot } from "../host/host.ts";
 import { nodeSql } from "../host/sql.node.ts";
+import type { StorageFormat } from "../host/schema.ts";
 import { systemRuntime } from "../runtime/runtime.ts";
 import type { Runtime } from "../runtime/runtime.ts";
 import type { Catalog } from "../catalog/catalog.ts";
@@ -51,11 +52,32 @@ export class MemoryMapStore implements MapStore {
 export interface LocalOptions {
   database?: string;
   batch?: number;
+  /** The canonical URI this database is linked to by, for a test with two of them. */
+  uri?: string;
+  /** The storage format this database is created with. Defaults to what a new database gets, which
+   *  is 2; the suite also runs under 1 so that nothing silently depends on the new key. */
+  format?: StorageFormat;
   /** Time and chance. Pass a deterministic one and the whole cluster replays from a seed. */
   runtime?: Runtime;
   /** A vshard's soft byte cap, lowered in tests so growth and rebalancing are reachable. */
   cap?: number;
   thresholds?: Thresholds;
+}
+
+/**
+ * The storage format the whole suite runs under, from the environment.
+ *
+ * `npm test` runs on the default, which is what a new database gets; `npm run test:format1` runs the
+ * same files on the old key. Both have to pass, and that is the strongest thing the suite says about
+ * format 2: with no foreign edge written it has to answer everything format 1 answers — the
+ * differential oracle, the reference model, the invariants and the simulation included. A test that
+ * is specifically about one format passes `format` and ignores this.
+ */
+function envFormat(): StorageFormat | undefined {
+  const set = typeof process === "undefined" ? undefined : process.env?.HLEKK_STORAGE_FORMAT;
+  if (set === undefined || set === "") return undefined;
+  if (set !== "1" && set !== "2") throw new RangeError(`HLEKK_STORAGE_FORMAT must be 1 or 2, got ${JSON.stringify(set)}`);
+  return set === "1" ? 1 : 2;
 }
 
 /** A database running in this process. */
@@ -65,7 +87,7 @@ export class LocalCluster {
   readonly hosts = new Map<number, Host>();
   readonly transport: Transport;
   /** Host requests served, so a test can assert what a query cost. */
-  readonly calls = { exec: 0, write: 0, resolve: 0 };
+  readonly calls = { exec: 0, write: 0, resolve: 0, aliases: 0 };
   readonly database: string;
 
   readonly mover: Mover;
@@ -79,7 +101,12 @@ export class LocalCluster {
   constructor(opts: LocalOptions = {}) {
     this.runtime = opts.runtime ?? systemRuntime;
     this.database = opts.database ?? "db";
-    this.directory = Directory.open(nodeSql(), { database: this.database, batch: opts.batch });
+    this.directory = Directory.open(nodeSql(), {
+      database: this.database,
+      batch: opts.batch,
+      uri: opts.uri,
+      format: opts.format ?? envFormat(),
+    });
     for (const h of this.directory.hostIndexes()) this.host(h);
     this.adoptAll();
     this.transport = this.#transport();
@@ -167,7 +194,9 @@ export class LocalCluster {
   host(index: number): Host {
     let host = this.hosts.get(index);
     if (!host) {
-      this.hosts.set(index, (host = Host.open(nodeSql(), this.directory.catalog(), this.runtime.clock)));
+      // Told its format rather than left to guess, which is what the directory recording it is for.
+      const format = this.directory.storageFormat();
+      this.hosts.set(index, (host = Host.open(nodeSql(), this.directory.catalog(), this.runtime.clock, format)));
       this.directory.addHost(index);
     }
     return host;
@@ -293,6 +322,13 @@ export class LocalCluster {
       },
       async indexVshardFor(key: string): Promise<string> {
         return cluster.directory.indexVshardFor(key).toString();
+      },
+      async intern(uri: string): Promise<number> {
+        return cluster.directory.intern(uri, cluster.runtime.clock.now());
+      },
+      async aliases(): Promise<{ database: string | null; aliases: { alias: number; uri: string; state: string }[] }> {
+        cluster.calls.aliases++;
+        return { database: cluster.directory.databaseUri() ?? null, aliases: cluster.directory.aliases() };
       },
       async indexLookup(host: number, vshard: string, idx: number, key: string): Promise<string | null> {
         const h = cluster.host(host);

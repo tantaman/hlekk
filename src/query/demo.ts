@@ -12,7 +12,7 @@ const [ISSUE, COMMENT, LABEL, USER] = [1, 2, 3, 4]; // otypes
 const [ISSUE_COMMENT, ISSUE_LABEL, ISSUE_OWNER] = [1, 2, 3]; // atypes
 
 const obj = (id: Id, otype: number, data: Obj["data"]): Obj => ({ id, otype, version: 1, data });
-const edge = (id1: Id, atype: number, id2: Id, time: number): Edge => ({ id1, atype, id2, time, data: null });
+const edge = (id1: Id, atype: number, id2: Id, time: number): Edge => ({ id1, atype, db: 0, id2, time, data: null });
 
 // Oldest first. Alice wrote two of the eight, so the filter passes one row in four.
 const comments: [Id, string, Id][] = [

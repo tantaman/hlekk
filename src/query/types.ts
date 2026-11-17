@@ -14,6 +14,9 @@ export interface Obj {
 export interface Edge {
   id1: Id;
   atype: number;
+  /** The target's database, as this database's own interned alias: 0 is local. Always 0 on storage
+   *  format 1, which has no column for it. See `host/schema.ts`. */
+  db: number;
   id2: Id;
   time: number;
   data: Fields | null;
@@ -56,9 +59,18 @@ export const UNKNOWN: unique symbol = Symbol("unknown");
 export type Unknown = typeof UNKNOWN;
 export type Maybe<T> = T | Unknown;
 
-/** Edge lists are ordered newest first, (time desc, id2 desc). id2 breaks ties, so cursors are exact. */
+/** Edge lists are ordered newest first, `(time desc, db desc, id2 desc)`. The last two break ties, so
+ *  cursors are exact.
+ *
+ *  `db` is in the sort key because it is in the primary key: `scripts/edge-order.mjs` shows that on
+ *  format 2 an order of `(time, id2)` needs a temporary b-tree for its last term, while
+ *  `(time, db, id2)` is served by `assocs_range` directly, at the head and after a cursor. So the
+ *  tie-break is not a choice — at one `time`, five edges read back as `2:8 2:3 1:7 0:9 0:4`, foreign
+ *  before local, and this comparator has to agree with that or a tie-broken cursor lands in the
+ *  wrong place. See `cmpId` for the same hazard one level down. */
 export interface Cursor {
   time: number;
+  db: number;
   id2: Id;
 }
 
@@ -72,10 +84,44 @@ export function cmpId(a: Id, b: Id): number {
 
 export function edgeOrder(a: Cursor, b: Cursor): number {
   if (a.time !== b.time) return b.time - a.time;
+  if (a.db !== b.db) return b.db - a.db;
   return -cmpId(a.id2, b.id2);
 }
 
 export const listKey = (id1: Id, atype: number) => `${id1}:${atype}`;
+
+/** A read that reached an edge into another database. Step 4 follows these; until then the only safe
+ *  thing to do is say so. */
+export class ForeignEdge extends Error {
+  readonly db: number;
+  readonly id2: Id;
+  constructor(e: Edge) {
+    super(
+      `${e.id1} has an edge of type ${e.atype} into database ${e.db} (id ${e.id2}), and following one is not built yet.`,
+    );
+    this.name = "ForeignEdge";
+    this.db = e.db;
+    this.id2 = e.id2;
+  }
+}
+
+/**
+ * An edge's target as one of this database's ids, throwing on a foreign one.
+ *
+ * The two alternatives are both worse than a throw, which is why this is not a filter. Dropping a
+ * foreign edge would read as a dangling reference, so a database that holds the reference and a
+ * database that does not would answer identically — and the whole point of storing it is that the
+ * reference exists. Loading it by number would return whichever LOCAL object happens to share those
+ * 47 bits, which is an answer about the wrong object with nothing to mark it as one.
+ *
+ * Step 4 replaces this: a host sends a foreign row back as a miss carrying the alias, and the
+ * coordinator resolves the alias to a URI and asks that database. Every call site here is a site
+ * that step touches.
+ */
+export function localId(e: Edge): Id {
+  if (e.db !== 0) throw new ForeignEdge(e);
+  return e.id2;
+}
 
 /** One read of an edge list: up to n edges after a cursor. complete: no edges follow them. */
 export interface EdgePage {
@@ -129,7 +175,7 @@ export type Miss =
 export function missKey(m: Miss): string {
   if (m.kind === "object") return `o:${m.id}`;
   if (m.kind === "count") return `c:${listKey(m.id1, m.atype)}`;
-  return `e:${listKey(m.id1, m.atype)}:${m.after ? `${m.after.time}:${m.after.id2}` : "head"}`;
+  return `e:${listKey(m.id1, m.atype)}:${m.after ? `${m.after.time}:${m.after.db}:${m.after.id2}` : "head"}`;
 }
 
 /** The id whose vshard holds the data, so its host is the one to ask. */

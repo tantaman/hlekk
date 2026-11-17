@@ -6,6 +6,7 @@
 
 import { Hlekk } from "../client/client.ts";
 import { vshardOf } from "../host/ids.ts";
+import { isQualified } from "../query/ref.ts";
 import type { Id, Json } from "../query/types.ts";
 import { databaseOf, directoryStub } from "../adapters/cloudflare/bindings.ts";
 import type { Env } from "../adapters/cloudflare/bindings.ts";
@@ -124,14 +125,20 @@ export default {
   },
 };
 
-/** Every id in an answer, so the demo can say which hosts it was assembled from. */
+/** Every id in an answer, so the demo can say which hosts it was assembled from.
+ *
+ * A qualified reference is skipped. An id in an answer may be `<database URI>#<id>` once a hop
+ * leaves this database, and `vshardOf` on one would either throw inside `parseId` or — worse, if the
+ * guard were ever loosened — report one of THIS database's vshards for an object it does not hold.
+ * There is no host here to attribute a foreign object to, which is the honest answer. */
 function idsIn(value: Json): Id[] {
   if (Array.isArray(value)) return value.flatMap(idsIn);
   if (value === null || typeof value !== "object") return [];
   const out: Id[] = [];
   for (const [k, v] of Object.entries(value)) {
-    if (k === "id" && typeof v === "string") out.push(v);
-    else out.push(...idsIn(v));
+    if (k === "id" && typeof v === "string") {
+      if (!isQualified(v)) out.push(v);
+    } else out.push(...idsIn(v));
   }
   return out;
 }

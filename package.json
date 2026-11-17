@@ -14,7 +14,9 @@
     "wiki:deploy": "wrangler deploy --config wrangler.wiki.jsonc",
     "og": "node scripts/make-og.mjs",
     "conformance": "node scripts/conformance.mjs",
-    "conformance:node": "node scripts/conformance-node.mjs"
+    "conformance:node": "node scripts/conformance-node.mjs",
+    "test:format1": "HLEKK_STORAGE_FORMAT=1 node --test \"src/**/*.test.ts\"",
+    "test:formats": "npm test && npm run test:format1"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

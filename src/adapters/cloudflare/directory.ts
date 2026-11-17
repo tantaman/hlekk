@@ -67,6 +67,10 @@ export class HlekkDirectoryDO {
       const directory = Directory.open(doSql(this.#ctx.storage), {
         database: databaseOf(this.#env),
         batch: vshardsOf(this.#env),
+        // The URI is the database's identity to everyone holding an edge into it, so it comes from
+        // configuration and not from a request. Absent, this database has no name it can be linked
+        // to by, which is the state every database deployed before the protocol existed is in.
+        uri: this.#env.HLEKK_DATABASE_URI,
       });
       const mover = new Mover(directory, this.#moveHosts());
       const allocator = new Allocator(directory, {
@@ -87,11 +91,15 @@ export class HlekkDirectoryDO {
   #moveHosts(): MoveHosts {
     const env = this.#env;
     const lock = () => this.#lock();
+    const format = () => this.#ready().directory.storageFormat();
     return {
       ensure: async (host: number) => {
         // A host a move creates has never seen the lock, and a host without one applies no onDelete
-        // and maintains no inverse. It is given one before it is given any rows.
+        // and maintains no inverse. It is given one before it is given any rows, and its storage
+        // format with it — a target that built format 1 tables would drop the aliases a format 2
+        // snapshot carries.
         await call(hostStub(env, host), "setCatalog", lock());
+        await call(hostStub(env, host), "adopt", [], format());
       },
       fence: async (host, vshard) => {
         await call(hostStub(env, host), "fence", vshard);
@@ -132,7 +140,10 @@ export class HlekkDirectoryDO {
 
   async #adopt(host: number, entries: { vshard: string; epoch: number }[]): Promise<void> {
     await call(hostStub(this.#env, host), "setCatalog", this.#lock());
-    await call(hostStub(this.#env, host), "adopt", entries);
+    // The format rides with the adoption, which is the first thing a new host is ever told. It is
+    // the directory that records which format this database is, so this is the one path by which a
+    // host learns it rather than inferring it from the shape it happens to have built.
+    await call(hostStub(this.#env, host), "adopt", entries, this.#ready().directory.storageFormat());
   }
 
   /** Publishes the map. Once per rebalance, not once per move: a chunk rewritten per move is rate
@@ -238,6 +249,20 @@ export class HlekkDirectoryDO {
       },
 
       indexVshardFor: (key: string) => this.#ready().directory.indexVshardFor(key).toString(),
+
+      /** Allocates the alias for a foreign database's URI, or returns the one it already has. */
+      intern: (uri: string) => this.#ready().directory.intern(uri, Date.now()),
+
+      /** Every alias, and this database's own URI. One call because a client caches the whole set
+       *  for the life of its isolate: an alias binding is permanent, so there is nothing to
+       *  invalidate, and that is what keeps a foreign hop off the directory's path at read time. */
+      aliases: () => ({
+        database: this.#ready().directory.databaseUri() ?? null,
+        aliases: this.#ready().directory.aliases(),
+      }),
+
+      /** Which storage format this database's hosts key `assocs` with. */
+      storageFormat: () => this.#ready().directory.storageFormat(),
 
       grow: async () => {
         const opened = this.#ready().allocator.grow();

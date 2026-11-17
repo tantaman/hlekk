@@ -22,6 +22,8 @@ import type { FieldMap } from "../schema/define.ts";
 import type { Fields } from "../query/types.ts";
 import { systemClock } from "../runtime/runtime.ts";
 import type { Clock } from "../runtime/runtime.ts";
+import { parseRef } from "../query/ref.ts";
+import type { Ref } from "../query/ref.ts";
 import { Routes } from "./routes.ts";
 import { anchorOf } from "./transport.ts";
 import type { Mutation, Transport } from "./transport.ts";
@@ -73,11 +75,23 @@ export interface QueryOptions {
   stats?: Stats;
 }
 
+/** This database's own URI and the aliases it has allocated, read once per isolate. */
+interface Registry {
+  database: string | null;
+  byUri: Map<string, number>;
+  byAlias: Map<number, string>;
+}
+
 export class Hlekk {
   readonly routes: Routes;
   readonly clock: Clock;
   readonly #transport: Transport;
   readonly #clients = new Map<number, HostClient>();
+  /** Cached for the life of the isolate. An alias binding is permanent — an alias is never
+   *  repointed — so there is nothing here that can go stale; only new aliases can appear, and a
+   *  write that needs one interns it and adds it. That permanence is what makes a foreign hop cost
+   *  no directory round trip at read time. */
+  #registry: Promise<Registry> | null = null;
 
   private constructor(transport: Transport, clock: Clock) {
     this.#transport = transport;
@@ -96,6 +110,51 @@ export class Hlekk {
 
   catalog(): Promise<Catalog> {
     return this.#transport.catalog();
+  }
+
+  /** The alias registry, read once. */
+  async registry(): Promise<Registry> {
+    if (!this.#registry) {
+      this.#registry = this.#transport.aliases().then((got) => ({
+        database: got.database,
+        byUri: new Map(got.aliases.map((a) => [a.uri, a.alias])),
+        byAlias: new Map(got.aliases.map((a) => [a.alias, a.uri])),
+      }));
+    }
+    return this.#registry;
+  }
+
+  /**
+   * Turns a reference into the alias a host stores, and refuses what cannot be stored.
+   *
+   * Four things happen here and nowhere else, which is the point of having one seam for it:
+   *
+   * 1. A reference to THIS database collapses to a bare id. An edge into yourself is a local edge,
+   *    and letting it through as an alias would make the same object reachable under two keys.
+   * 2. The edge type has to permit a foreign target. The catalog's flag is the planner's static
+   *    signal, and a foreign row under a type that does not declare one is a row no read can route.
+   * 3. The URI is interned, through the directory, which canonicalizes it and never repoints an
+   *    alias.
+   * 4. The alias joins the isolate's cache, so the next edge into the same database costs nothing.
+   */
+  async #aliasFor(atype: number, target: Ref): Promise<{ db: number; id: Id }> {
+    const { db, id } = parseRef(target);
+    if (db === null) return { db: 0, id };
+    const registry = await this.registry();
+    if (registry.database !== null && db === registry.database) return { db: 0, id };
+    const edge = (await this.catalog()).edge(atype);
+    if (edge !== undefined && !edge.foreign) {
+      throw new TypeError(
+        `${edge.name} does not permit a foreign target, so it cannot point at ${target}.` +
+          ' Declare the edge type with `"foreign": true`, which also forbids an inverse and a cascade on it.',
+      );
+    }
+    const held = registry.byUri.get(db);
+    if (held !== undefined) return { db: held, id };
+    const alias = await this.#transport.intern(db);
+    registry.byUri.set(db, alias);
+    registry.byAlias.set(alias, db);
+    return { db: alias, id };
   }
 
   // ---- reads
@@ -281,8 +340,11 @@ export class Hlekk {
     return this.write<void>({ kind: "delete", id });
   }
 
-  assocAdd(atype: number, id1: Id, id2: Id, time?: number, data?: Record<string, Json> | null): Promise<void> {
-    return this.write<void>({ kind: "assocAdd", atype, id1, id2, time, data });
+  /** Adds an edge. The target is a `Ref`: a bare id for an object in this database, or
+   *  `<database URI>#<id>` for one in another. */
+  async assocAdd(atype: number, id1: Id, id2: Ref, time?: number, data?: Record<string, Json> | null): Promise<void> {
+    const to = await this.#aliasFor(atype, id2);
+    return this.write<void>({ kind: "assocAdd", atype, id1, db: to.db, id2: to.id, time, data });
   }
 
   /** Adds many edges, grouped so that each group is one transaction on one host.
@@ -303,11 +365,19 @@ export class Hlekk {
    *  failure is reported per group, and the error names how many groups had already landed, because
    *  a batch spanning vshards is not one unit even though each group is. */
   async assocAddMany(
-    edges: readonly { atype: number; id1: Id; id2: Id; time?: number; data?: Fields | null }[],
+    edges: readonly { atype: number; id1: Id; id2: Ref; time?: number; data?: Fields | null }[],
   ): Promise<number> {
     if (edges.length === 0) return 0;
-    const groups = new Map<bigint, typeof edges[number][]>();
-    for (const e of edges) {
+    // Resolved before grouping, so a batch holding a foreign target is refused before any of it is
+    // written rather than partway through.
+    const resolved = await Promise.all(
+      edges.map(async (e) => {
+        const to = await this.#aliasFor(e.atype, e.id2);
+        return { atype: e.atype, id1: e.id1, db: to.db, id2: to.id, time: e.time, data: e.data };
+      }),
+    );
+    const groups = new Map<bigint, typeof resolved[number][]>();
+    for (const e of resolved) {
       const v = vshardOf(e.id1);
       const g = groups.get(v);
       if (g) g.push(e);
@@ -328,8 +398,9 @@ export class Hlekk {
     return written;
   }
 
-  assocRemove(atype: number, id1: Id, id2: Id): Promise<void> {
-    return this.write<void>({ kind: "assocRemove", atype, id1, id2 });
+  async assocRemove(atype: number, id1: Id, id2: Ref): Promise<void> {
+    const to = await this.#aliasFor(atype, id2);
+    return this.write<void>({ kind: "assocRemove", atype, id1, db: to.db, id2: to.id });
   }
 
   // ---- global unique index

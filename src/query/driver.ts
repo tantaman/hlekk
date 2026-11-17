@@ -3,7 +3,7 @@
 import { Pass, drain, materialize } from "./ops.ts";
 import { Cache, CacheStore } from "./stores.ts";
 import type { ReadSet } from "./stores.ts";
-import { UNKNOWN, missKey, missOwner } from "./types.ts";
+import { UNKNOWN, localId, missKey, missOwner } from "./types.ts";
 import type { Cursor, EdgePage, Id, Json, Maybe, Miss, Obj, Plan, Store } from "./types.ts";
 
 export interface HostReply {
@@ -41,7 +41,7 @@ async function runTask(p: Pass, store: LocalStore, t: Miss): Promise<void> {
   // target doesn't stop the prefetch below the others. The coordinator judges membership.
   const page = await store.edges(t.id1, t.atype, t.after, t.n, t.frame);
   if (page === UNKNOWN) return;
-  await Promise.all(page.rows.map((e) => drain(p.rowOp(t.frame).fetch(p, { ids: [e.id2] }))));
+  await Promise.all(page.rows.map((e) => drain(p.rowOp(t.frame).fetch(p, { ids: [localId(e)] }))));
 }
 
 export const MAX_ROUNDS = 16;

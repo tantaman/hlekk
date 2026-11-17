@@ -68,5 +68,13 @@ function build(env: Env): Transport {
     async indexLookup(host: number, vshard: string, idx: number, key: string): Promise<Id | null> {
       return call<Id | null>(hostStub(env, host), "indexLookup", vshard, idx, key);
     },
+
+    async intern(uri: string): Promise<number> {
+      return call<number>(directoryStub(env), "intern", uri);
+    },
+
+    async aliases(): Promise<{ database: string | null; aliases: { alias: number; uri: string; state: string }[] }> {
+      return call(directoryStub(env), "aliases");
+    },
   };
 }
