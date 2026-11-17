@@ -77,7 +77,7 @@ export interface Served {
 /** What `serve` needs from a database. One method, so the protocol layer is testable without an
  *  engine and the engine needs to know nothing about the protocol. `Hlekk` satisfies it. */
 export interface ReadSource {
-  normalized(plan: Plan, rootIds: Id[]): Promise<QueryResult>;
+  normalized(plan: Plan, rootIds: Id[], opts?: { foreign?: "reference" }): Promise<QueryResult>;
 }
 
 /**
@@ -329,7 +329,11 @@ export async function serve(req: ReadRequest, opts: ServeOptions): Promise<Serve
   const cost = price(req, opts);
 
   const plan = planOf(req, catalog);
-  const result = await source.normalized(plan, [...req.ids]);
+  // A database answering a read never follows a reference out of itself. It would be fetching from
+  // a third party on the caller's behalf, under its own identity, with the caller unable to tell
+  // whose answer it got — the deputy `docs/protocol.md` rules out. So the reference is listed and
+  // nothing is loaded, and the caller asks that database itself.
+  const result = await source.normalized(plan, [...req.ids], { foreign: "reference" });
   const effective: Policy =
     exposes === undefined
       ? policy

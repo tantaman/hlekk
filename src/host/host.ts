@@ -4,8 +4,7 @@
 // any outbox row go together or not at all. A caller routes with an epoch; the host compares it with
 // its own vshards row and refuses the write if it no longer owns that vshard, having written nothing.
 
-import { Catalog } from "../catalog/catalog.ts";
-import type { FieldSpec } from "../catalog/catalog.ts";
+import { Catalog, isIdSpec } from "../catalog/catalog.ts";
 import { systemClock } from "../runtime/runtime.ts";
 import type { Clock } from "../runtime/runtime.ts";
 import { hostExec } from "../query/driver.ts";
@@ -1110,7 +1109,7 @@ export class Host {
     const type = this.#catalog.object(otype);
     if (type === undefined) return; // an otype this host's catalog does not know; nothing to check against
     for (const [field, spec] of Object.entries(type.fields)) {
-      if (!isIdField(spec)) continue;
+      if (!isIdSpec(spec)) continue;
       const value = data[field];
       if (value === undefined || value === null) continue;
       if (typeof value !== "string") {
@@ -1151,13 +1150,6 @@ function payload(data: Fields): string {
     if (bytes > MAX_PAYLOAD) throw new RangeError(`payload is ${bytes} bytes, over the ${MAX_PAYLOAD} cap`);
   }
   return json;
-}
-
-/** Whether a field spec declares an id, through however many `optional` wrappers. */
-function isIdField(spec: FieldSpec): boolean {
-  if (typeof spec !== "object") return false;
-  if ("id" in spec) return true;
-  return "optional" in spec ? isIdField(spec.optional) : false;
 }
 
 function fromKeyOf(b: Uint8Array): Id {

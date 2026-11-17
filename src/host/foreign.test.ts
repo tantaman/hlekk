@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import { Catalog, CatalogError, plan as planLock } from "../catalog/catalog.ts";
 import { LocalCluster } from "../client/local.ts";
 import { assertSound } from "../testkit/invariants.ts";
-import { ForeignEdge } from "../query/types.ts";
+import { ForeignEdge, targetOf } from "../query/types.ts";
 import { decodeCursor } from "../schema/query.ts";
 import { FormatError } from "./schema.ts";
 import { Host } from "./host.ts";
@@ -149,22 +149,33 @@ describe("an edge into another database", () => {
     assert.deepEqual(c.directory.aliases(), []);
   });
 
-  it("is a reference the read path refuses to guess at", async () => {
+  it("is a reference the read path will not guess at", async () => {
     const { c, db, note } = await database();
     await db.assocAdd(ABOUT, note, `${OTHER}#5`, 10);
-    // Dropping it would read as a dangling reference, and loading it by number would return
-    // whichever local object shares those bits. Until step 4 follows it, the only honest answer is
-    // to say so.
+    // Dropping it would read as a dangling reference, and loading it by its low half would return
+    // whichever local object shares those bits. So a read that reaches one asks the database that
+    // holds it — and with no client for that database, says exactly that rather than answering.
     const plan = {
       frames: [
         { source: { kind: "ids" as const }, children: [{ alias: "about", frame: 1 }], counts: [] },
         { source: { kind: "edge" as const, atype: ABOUT }, children: [], counts: [] },
       ],
     };
-    await assert.rejects(db.query(plan, [note]), ForeignEdge);
+    await assert.rejects(db.query(plan, [note]), /no foreign client was configured/);
     // A count over the same list is unaffected: it is one maintained row and needs no target.
     const host = c.host(c.holderOf(7n)!);
     assert.equal(await host.store().count(note, ABOUT), 1);
+  });
+
+  it("fails loudly if the seam that resolves the alias is skipped", () => {
+    // The hazard `targetOf` exists for: a foreign row whose URI was never filled in must not be
+    // read as a local id, because one may well exist under that number.
+    assert.throws(() => targetOf({ id1: "1", atype: 1, db: 3, id2: "5", time: 0, data: null }), ForeignEdge);
+    assert.equal(targetOf({ id1: "1", atype: 1, db: 0, id2: "5", time: 0, data: null }), "5");
+    assert.equal(
+      targetOf({ id1: "1", atype: 1, db: 3, id2: "5", target: `${OTHER}#5`, time: 0, data: null }),
+      `${OTHER}#5`,
+    );
   });
 });
 

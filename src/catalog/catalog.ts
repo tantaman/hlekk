@@ -116,6 +116,21 @@ export interface EdgeType {
  *  by default would make an unrelated team's edge able to delete your objects. */
 export const DEFAULT_ON_DELETE: OnDelete = "detach";
 
+/** Whether a field spec declares an id, through however many `optional` wrappers.
+ *
+ *  Three places need this and would otherwise each decide it for themselves: the host checks a
+ *  payload's references on the way in, the foreign client makes them absolute on the way back, and
+ *  the request guard types a filter's value. */
+export function isIdSpec(spec: FieldSpec): boolean {
+  if (typeof spec !== "object") return false;
+  if ("id" in spec) return true;
+  return "optional" in spec ? isIdSpec(spec.optional) : false;
+}
+
+/** The fields of a type that hold ids. */
+export const idFieldsOf = (fields: Record<string, FieldSpec>): string[] =>
+  Object.entries(fields).filter(([, spec]) => isIdSpec(spec)).map(([name]) => name);
+
 export class CatalogError extends Error {
   constructor(message: string) {
     super(message);

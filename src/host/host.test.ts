@@ -361,7 +361,11 @@ describe("the same query over one host and two", () => {
     const root2 = build([issues], users);
     const byVshard = (id: Id) => (vshardOf(id) === 1n ? client(issues) : client(users));
 
-    const go = async (driver: typeof runRounds, root: Id, route: (id: Id) => HostClient): Promise<Run> => {
+    const go = async (
+      driver: (plan: Plan, roots: Id[], route: (id: Id) => HostClient, stats: Stats) => Promise<{ rows: Json[] }>,
+      root: Id,
+      route: (id: Id) => HostClient,
+    ): Promise<Run> => {
       const stats: Stats = { rounds: 0, requests: 0 };
       return { out: (await driver(plan, [root], route, stats)).rows, stats };
     };
