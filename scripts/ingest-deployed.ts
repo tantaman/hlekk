@@ -1,6 +1,9 @@
 // The same low-scale Wikimedia ingest as `ingest-local.ts`, against a real Cloudflare deployment.
 //
-//   npm run ingest:deployed -- --base https://hlekk-wiki.tantaman.workers.dev --pages 10000
+//   HLEKK_ADMIN_TOKEN=... npm run ingest:deployed -- --base https://hlekk-wiki.tantaman.workers.dev --pages 10000
+//
+// The token is the one set on that Worker with `wrangler secret put HLEKK_ADMIN_TOKEN`; the ingest
+// and layout routes this drives are closed without it.
 //
 // WHY BOTH. `ingest-local.ts` stands the whole cluster up in one process over real SQLite, so
 // everything above the transport is the code a deployment runs — which is why it could establish
@@ -24,6 +27,7 @@
 import { selectSubset } from "./wiki-subset.ts";
 import type { Rec } from "./wiki-subset.ts";
 import { vshardOf } from "../src/host/ids.ts";
+import { operatorHeaders, operatorRefusal } from "../src/worker/guard.ts";
 import { categoryPages, linkedFrom, pageCategories, pageLinks } from "../src/worker/wiki.ts";
 
 const args = new Map<string, string>();
@@ -87,20 +91,30 @@ const n = (x: number) => x.toLocaleString();
 /** One request, retried on a network error or a 5xx. The far side is on the public internet and a
  *  pilot is thousands of requests long, so a transient failure is expected rather than exceptional;
  *  both passes are idempotent, which is what makes retrying safe rather than double-counting. */
+/** The deployment's operator token, for the routes this writes and measures through. */
+const ADMIN_TOKEN = process.env.HLEKK_ADMIN_TOKEN;
+/** An operator route that refused this process outright. Never retried. */
+class Closed extends Error {}
+
 async function hit<T>(path: string, body?: unknown, tries = 4): Promise<T> {
   let last: Error | null = null;
   for (let attempt = 1; attempt <= tries; attempt++) {
     try {
       const res = await fetch(`${BASE}${path}`, {
         method: body === undefined ? "GET" : "POST",
-        ...(body === undefined
-          ? {}
-          : { body: JSON.stringify(body), headers: { "content-type": "application/json" } }),
+        headers: {
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+          ...operatorHeaders(path, ADMIN_TOKEN),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
       const text = await res.text();
+      const closed = operatorRefusal(path, res.status, ADMIN_TOKEN);
+      if (closed !== null) throw new Closed(`${path}: ${res.status}. ${closed}`);
       if (!res.ok) throw new Error(`${res.status} ${text.slice(0, 300)}`);
       return JSON.parse(text) as T;
     } catch (e) {
+      if (e instanceof Closed) throw e;
       last = e instanceof Error ? e : new Error(String(e));
       if (attempt === tries) break;
       await new Promise((r) => setTimeout(r, 250 * 2 ** (attempt - 1)));

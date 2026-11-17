@@ -26,6 +26,8 @@ import { databaseOf, directoryStub, hostStub } from "../adapters/cloudflare/bind
 import type { Env } from "../adapters/cloudflare/bindings.ts";
 import { call } from "../adapters/cloudflare/rpc.ts";
 import { cloudflareTransport } from "../adapters/cloudflare/transport.ts";
+import { isOperatorPath, refuseOperator } from "./guard.ts";
+import { ROSTER_TTL_MS, narrowRoster, rosterOf } from "./roster.ts";
 import { WIKI_UI } from "./wiki-ui.ts";
 import { QueryRefused, build as buildQuery, check as checkQuery, parseQuery, schemaView, unparse } from "./wiki-query.ts";
 import type { QuerySpec } from "./wiki-query.ts";
@@ -44,6 +46,11 @@ import {
 
 export { HlekkHostDO } from "../adapters/cloudflare/host.ts";
 export { HlekkDirectoryDO } from "../adapters/cloudflare/directory.ts";
+
+/** What the roster is held under. One deployment is one database, so one slot per isolate is the
+ *  whole of it — and a module-level object is that without assuming anything about whether the
+ *  runtime hands every request the same `env`. */
+const THIS_DEPLOYMENT = {};
 
 const json = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -124,6 +131,21 @@ type EdgeIn = [string, Id, Id, number];
  * The wiki demo's own bindings, on top of what the database layer needs.
  */
 interface WikiEnv extends Env {
+  /**
+   * The bearer token that opens `/admin/*` and `/ingest/*`, and the only thing that does.
+   *
+   * A SECRET, NOT A VAR. Set it with `wrangler secret put HLEKK_ADMIN_TOKEN --config <this config>`,
+   * never under `vars`, where it would be committed and readable in the dashboard. Absent — which is
+   * the state every committed config deploys to — those paths refuse everything, so a deployment
+   * nobody is operating carries no working way to change it. See `guard.ts` for why this is a token
+   * where `HLEKK_WIPE` and `HLEKK_R2PROBE` are arming flags, and why those two still apply on top.
+   *
+   * Each deployment holds its own. A forwarded request carries the caller's header to the other
+   * deployment, which checks it against its own token, so `?placement=b` on an operator path works
+   * only where the two were deliberately given the same one.
+   */
+  HLEKK_ADMIN_TOKEN?: string;
+
   /**
    * A second deployment of this same Worker, holding the same wiki under a placement that buys no
    * locality. `?placement=b` is forwarded to it; absent the binding, that parameter is an error
@@ -265,8 +287,16 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Before anything else, and before any binding is touched: this deployment holds one database,
-    // and the other placement is somewhere else entirely.
+    // Before anything else, the forward included. A refused request touches no binding and reaches
+    // no other deployment — a forward is a way in as much as a route is, and the deployment behind
+    // it may be running code older than this check.
+    if (isOperatorPath(path)) {
+      const refused = await refuseOperator(request, env.HLEKK_ADMIN_TOKEN);
+      if (refused !== null) return refused;
+    }
+
+    // Then, and still before any binding is touched: this deployment holds one database, and the
+    // other placement is somewhere else entirely.
     const alt = altTarget(url);
     if (alt !== null) {
       const to = alt.which === "b" ? env.HLEKK_ALT : env.HLEKK_ALT2;
@@ -299,6 +329,17 @@ export default {
       if (path === "/" || path === "/wiki") {
         return new Response(WIKI_UI, {
           headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" },
+        });
+      }
+
+      /** The host roster the page draws its grid from. What `/admin/where` used to be asked for by
+       *  every visitor — see `rosterOf` for what that cost and what this returns instead. */
+      if (path === "/cluster") {
+        const roster = await rosterOf(THIS_DEPLOYMENT, Date.now(), async () =>
+          narrowRoster(await call<Parameters<typeof narrowRoster>[0]>(directory, "where")),
+        );
+        return new Response(JSON.stringify(roster), {
+          headers: { "content-type": "application/json", "cache-control": `public, max-age=${ROSTER_TTL_MS / 1000}` },
         });
       }
 

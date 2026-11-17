@@ -1,6 +1,10 @@
 // Loading a whole wiki into a deployed hlekk cluster, as a stream.
 //
-//   node scripts/load-wiki.ts --base https://hlekk-wiki.tantaman.workers.dev
+//   HLEKK_ADMIN_TOKEN=... node scripts/load-wiki.ts --base https://hlekk-wiki.tantaman.workers.dev
+//
+// The token is the one set on that Worker with `wrangler secret put HLEKK_ADMIN_TOKEN`. A load writes
+// through `/ingest/*` and reads the layout through `/admin/*`, and both are closed without it. It is
+// read from the environment and never from a flag, which would put it in the process list.
 //
 // WHY THIS EXISTS, given `ingest-deployed.ts`. That script proves a deployment at low scale in
 // minutes and is kept for exactly that, but it cannot load a wiki, and the three reasons are all in
@@ -52,6 +56,7 @@ import { records } from "./import-enwiki.mjs";
 import { RESERVATION_TTL_MS } from "../src/client/client.ts";
 import { makeId, vshardOf } from "../src/host/ids.ts";
 import type { Id } from "../src/query/types.ts";
+import { operatorHeaders, operatorRefusal } from "../src/worker/guard.ts";
 
 /** A record as the importer emits it. `more` marks a continuation: the same page, more edges. */
 interface Rec {
@@ -217,6 +222,11 @@ const check = (name: string, ok: boolean, detail?: string) => {
 };
 const asError = (e: unknown): Error => (e instanceof Error ? e : new Error(String(e)));
 
+/** The deployment's operator token, for the routes a load writes and measures through. */
+const ADMIN_TOKEN = process.env.HLEKK_ADMIN_TOKEN;
+/** An operator route that refused this process outright. Never retried. */
+class Closed extends Error {}
+
 // ---- talking to the deployment
 
 /** One request, retried on a network error or a 5xx, with a deadline. The far side is on the public
@@ -231,14 +241,21 @@ async function hit<T>(path: string, body?: unknown, tries = 5): Promise<T> {
       const res = await fetch(`${BASE}${at(path)}`, {
         method: body === undefined ? "GET" : "POST",
         signal: AbortSignal.timeout(180_000),
-        ...(body === undefined
-          ? {}
-          : { body: JSON.stringify(body), headers: { "content-type": "application/json" } }),
+        headers: {
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+          ...operatorHeaders(path, ADMIN_TOKEN),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
       const text = await res.text();
+      // Not a transient failure, so not one to retry: five attempts at a closed route are five
+      // refusals and a backoff, and a load that starts that way should say why at once.
+      const closed = operatorRefusal(path, res.status, ADMIN_TOKEN);
+      if (closed !== null) throw new Closed(`${path}: ${res.status}. ${closed}`);
       if (!res.ok) throw new Error(`${res.status} ${text.slice(0, 300)}`);
       return JSON.parse(text) as T;
     } catch (e) {
+      if (e instanceof Closed) throw e;
       last = asError(e);
       if (attempt === tries) break;
       await new Promise((r) => setTimeout(r, 250 * 2 ** (attempt - 1)));
