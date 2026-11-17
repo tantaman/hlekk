@@ -14,7 +14,7 @@ import { parseId } from "../host/ids.ts";
 import { decodeCursor } from "../schema/query.ts";
 import { normalize } from "./normalize.ts";
 import type { ListEntry, QueryResult } from "./normalize.ts";
-import { DEFAULT_HOP_LIMIT, DEFAULT_LIMITS, REQUEST_MEMBERS, Refused, check, countEdge } from "./request.ts";
+import { DEFAULT_HOP_LIMIT, DEFAULT_LIMITS, REQUEST_MEMBERS, Refused, check, checkAliases, countEdge } from "./request.ts";
 import type { Cmp, Cost, CountSpec, Hop, Limits, Request, Vocabulary } from "./request.ts";
 import type { Cond, Frame, Id, Plan, Source } from "./types.ts";
 
@@ -113,7 +113,7 @@ export function vocabularyOf(catalog: Catalog, exposed?: Iterable<string>): Voca
     edge(name) {
       if (!visible(name)) return undefined;
       const e = catalog.edgeNamed(name);
-      return e === undefined ? undefined : { to: e.to, counted: e.atype !== undefined };
+      return e === undefined ? undefined : { from: e.from, to: e.to, counted: e.atype !== undefined };
     },
     edges() {
       return catalog.edgeTypes().map((e) => e.name).filter(visible);
@@ -354,6 +354,9 @@ export function price(req: ReadRequest, opts: ServeOptions): Cost {
       throw new Refused("ids", `ids[${i}] is not an id: ${(e as Error).message}`);
     }
   }
+  // The names the answer will carry, against the aliasing this protocol uses. Separate from `check`,
+  // which is shared with callers that derive their names differently.
+  checkAliases(req);
   return check(req, vocabulary, limits, ids.length);
 }
 

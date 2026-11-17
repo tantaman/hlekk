@@ -43,6 +43,7 @@ import {
   OPS,
   Refused as QueryRefused,
   check as checkRequest,
+  checkAliases,
   countEdge,
   describe,
 } from "../query/request.ts";
@@ -324,7 +325,7 @@ export function schemaView(): SchemaView {
  *  The two agree here, because every relation in this schema is page-to-page — and the core's rule is
  *  the one that is right in general. */
 const VOCAB: Vocabulary = {
-  edge: (name) => (EDGES[name] === undefined ? undefined : { to: EDGES[name]!.to.name }),
+  edge: (name) => (EDGES[name] === undefined ? undefined : { from: EDGES[name]!.from.name, to: EDGES[name]!.to.name }),
   edges: () => Object.keys(EDGES),
   fields: (type) => LOCK.objects[type]?.fields,
 };
@@ -345,6 +346,9 @@ export function check(spec: QuerySpec): Cost {
   if (!Number.isInteger(from.ns) || from.ns < 0 || from.ns > 5000) {
     throw new QueryRefused("from.ns", `namespace must be an integer in 0..5000, got ${String(from.ns)}`);
   }
+  // Against THIS builder's aliasing, which strips the namespace prefix a hop's edge carries — so a
+  // count and a hop over one edge do not collide here, where over the protocol they would.
+  checkAliases(spec, { hop: hopAlias, count: countAlias });
   return checkRequest(spec, VOCAB, LIMITS);
 }
 
@@ -369,9 +373,15 @@ export function build(spec: QuerySpec, rootId: string): Query<FieldMap, unknown>
   return q;
 }
 
+/** The name a hop's result appears under here: the namespace prefix comes off, so a query reads
+ *  `page_links` rather than `wiki.page_links`. One function, because `check` has to be able to tell
+ *  what this builder is about to name things. */
+export const hopAlias = (hop: Hop): string =>
+  hop.as !== undefined && hop.as.length > 0 ? hop.as : hop.edge.replace(/^wiki\./, "");
+
 function addHop(q: Query<FieldMap, unknown>, hop: Hop): Query<FieldMap, unknown> {
   const edge = EDGES[hop.edge]!;
-  const alias = hop.as && hop.as.length > 0 ? hop.as : hop.edge.replace(/^wiki\./, "");
+  const alias = hopAlias(hop);
   return q.related(alias, edge, (child) => {
     let c = child.limit(hop.limit ?? DEFAULT_HOP_LIMIT) as unknown as Query<FieldMap, unknown>;
     for (const w of hop.where ?? []) c = c.where(w.field, w.op, w.value as never);

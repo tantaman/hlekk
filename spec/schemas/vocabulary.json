@@ -85,6 +85,10 @@
           "counted": {
             "description": "False for a field relationship, which follows an id in a payload and stores nothing \u2014 so it can be traversed but has no maintained counter to read.",
             "type": "boolean"
+          },
+          "foreign": {
+            "description": "Whether a target may be in another database. Optional, and absent means no: a vocabulary written before this member existed is still a conforming one. Where it is present, a caller can tell before it spends a request that the hop may leave this database \u2014 another round trip, and another database's policy behind it.",
+            "type": "boolean"
           }
         },
         "required": [

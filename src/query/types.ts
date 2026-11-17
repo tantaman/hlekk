@@ -120,6 +120,23 @@ export function edgeOrder(a: Cursor, b: Cursor): number {
 
 export const listKey = (id1: Id, atype: number) => `${id1}:${atype}`;
 
+/**
+ * Keys a row carries beside its payload, and so keys nothing else may use.
+ *
+ * A result is `{...payload, id, $version, $edge, ...relationships, ...counts}` in that order, so a
+ * name reused later in that list silently wins. `id` is the worst of them: the normalized form reads
+ * `row.id` to key every object, list and count, so a relationship called `id` does not shadow a
+ * field — it collapses the structure of the whole answer.
+ *
+ * The catalog refuses a FIELD with one of these names for that reason. A relationship's or a count's
+ * name is the caller's to choose, which is why `request.ts` has to refuse it there too.
+ */
+export const RESERVED_KEYS: ReadonlySet<string> = new Set(["id", "$version", "$edge"]);
+
+/** Whether a name a caller chose would shadow one of those. Anything `$`-prefixed is reserved
+ *  wholesale, so a later key can be added without it becoming a silent collision. */
+export const isReservedKey = (name: string): boolean => RESERVED_KEYS.has(name) || name.startsWith("$");
+
 /** A read that reached an edge into another database. Step 4 follows these; until then the only safe
  *  thing to do is say so. */
 export class ForeignEdge extends Error {

@@ -124,6 +124,17 @@ check(
   "every edge's endpoints are types it also states",
   edges.every(([, e]) => e.from in (vocabulary?.types ?? {}) && e.to in (vocabulary?.types ?? {})),
 );
+// What makes the vocabulary enough to walk a database nobody described: the edges off an object are
+// the ones whose `from` is its type, and the answer says what that type is.
+check(
+  "every edge states where it starts, so a caller can tell which may hang off a type",
+  edges.length > 0 && edges.every(([, e]) => typeof e.from === "string" && e.from.length > 0),
+);
+check(
+  "and whether a hop may leave this database, before a request is spent on it",
+  edges.every(([, e]) => e.foreign === undefined || typeof e.foreign === "boolean"),
+  edges.some(([, e]) => e.foreign !== undefined) ? "stated" : "not stated, which is allowed",
+);
 check(
   "and the whole vocabulary validates against spec/schemas/vocabulary.json",
   vocabulary !== null && invalid("vocabulary.json", vocabulary).length === 0,
@@ -132,6 +143,32 @@ check(
 
 const countable = edges.find(([, e]) => e.counted)?.[0];
 const uncounted = edges.find(([, e]) => !e.counted)?.[0];
+
+/**
+ * A chain of hops where each starts where the one above it lands, up to `want` long.
+ *
+ * Built from the vocabulary rather than guessed, because a responder refuses a hop that does not
+ * start where its parent lands — which is what lets a caller tell an empty list from a meaningless
+ * traversal. A chain can only be as long as the type graph allows, so a schema with no cycle in it
+ * caps this and the checks that need a longer one say they were skipped.
+ */
+function chain(want, limit) {
+  const first = edges[0];
+  if (first === undefined) return null;
+  const out = [{ edge: first[0], limit }];
+  let at = first[1].to;
+  for (let i = 1; i < want; i++) {
+    const next = edges.find(([, e]) => e.from === at);
+    if (next === undefined) break;
+    out.push({ edge: next[0], limit });
+    at = next[1].to;
+  }
+  // Nested, innermost last, which is the shape a request carries.
+  return out.reduceRight((inner, hop) => (inner === null ? hop : { ...hop, hops: [inner] }), null);
+}
+
+/** How many hops a chain of this depth actually got. */
+const depthOf = (hop) => (hop === null ? 0 : 1 + depthOf(hop.hops?.[0] ?? null));
 
 // An id that need not exist. A cost is arithmetic over the request, and a refusal happens before any
 // read, so nothing below depends on what this database holds.
@@ -202,25 +239,57 @@ if (uncounted) {
   check("an uncounted edge is exposed, so the count refusal can be checked", true, "skipped: none exposed");
 }
 
-if (countable) {
-  // Nested to the stated depth at the stated limit, which is the product this guard exists for: the
-  // answer is exponential in depth while storage reads stay flat, so nothing about the I/O would
-  // reveal it.
-  let hop = { edge: countable, limit: limits.maxLimit ?? 100 };
-  for (let i = 1; i < (limits.maxDepth ?? 4); i++) hop = { edge: countable, limit: limits.maxLimit ?? 100, hops: [hop] };
-  refused("an over-budget request is refused", await send("read", { ids: [SOME_ID], hops: [hop] }), "query");
-
-  // And refused by the price route too, on the same arithmetic.
-  refused("and refused when priced, not only when read", await send("price", { ids: [SOME_ID], hops: [hop] }), "query");
-
+// A hop that does not start where its parent lands can only ever return nothing, and a caller that
+// built its tree from the vocabulary must be able to tell that from a true empty list.
+const mismatch = edges.find(([, a]) => edges.some(([, b]) => b.from !== a.to));
+if (mismatch !== undefined) {
+  const under = edges.find(([, b]) => b.from !== mismatch[1].to);
   refused(
-    "a hop deeper than the stated maximum is refused",
-    await send("read", {
-      ids: [SOME_ID],
-      hops: [deeper(countable, (limits.maxDepth ?? 4) + 1)],
-    }),
+    "a hop that does not start where its parent lands is refused",
+    await send("read", { ids: [SOME_ID], hops: [{ edge: mismatch[0], hops: [{ edge: under[0] }] }] }),
+    "hops[0].hops[0]",
   );
+} else {
+  check("every edge starts where every other lands, so the mismatch cannot be built", true, "skipped");
+}
 
+// The product this guard exists for: the answer is exponential in depth while storage reads stay
+// flat, so nothing about the I/O would reveal it. Built from a valid chain and widened by the entry,
+// because the entry's width is part of the price.
+const wide = Array.from({ length: limits.maxIds ?? 100 }, () => SOME_ID);
+const budget = chain(2, limits.maxLimit ?? 100);
+if (depthOf(budget) >= 2) {
+  refused("an over-budget request is refused", await send("read", { ids: wide, hops: [budget] }), "query");
+  // And refused by the price route too, on the same arithmetic.
+  refused("and refused when priced, not only when read", await send("price", { ids: wide, hops: [budget] }), "query");
+} else {
+  check("a two-hop chain exists, so an over-budget request can be built", false, "the schema has no chain of two");
+}
+
+const tooDeep = chain((limits.maxDepth ?? 4) + 1, 1);
+if (depthOf(tooDeep) > (limits.maxDepth ?? 4)) {
+  refused("a hop deeper than the stated maximum is refused", await send("read", { ids: [SOME_ID], hops: [tooDeep] }));
+} else {
+  check(
+    "a chain longer than the stated depth exists, so the depth refusal can be checked",
+    true,
+    `skipped: the type graph caps a valid chain at ${depthOf(tooDeep)}`,
+  );
+}
+
+if (countable) {
+  // A count and a hop over one edge default to the same name, which is the first thing a caller
+  // working from the vocabulary reaches for. Letting the later one win returns an empty list beside
+  // a count saying it is not empty.
+  refused(
+    "a count and a hop that would land under one name are refused",
+    await send("read", { ids: [SOME_ID], counts: [countable], hops: [{ edge: countable, limit: 2 }] }),
+  );
+  refused(
+    "and so is a name the row already carries, which `id` would collapse",
+    await send("read", { ids: [SOME_ID], hops: [{ as: "id", edge: countable, limit: 2 }] }),
+    "hops[0]",
+  );
   refused(
     "a limit over the stated maximum is refused",
     await send("read", { ids: [SOME_ID], hops: [{ edge: countable, limit: (limits.maxLimit ?? 100) + 1 }] }),
@@ -243,12 +312,6 @@ const getRead = await fetch(`${uri}/read`).then((r) => r.status, () => 0);
 check("GET on a POST route is 405", getRead === 405, `status ${getRead}`);
 const unknown = await fetch(`${uri}/no-such-route`).then((r) => r.status, () => 0);
 check("an unknown route is 404", unknown === 404, `status ${unknown}`);
-
-function deeper(edge, depth) {
-  let hop = { edge, limit: 1 };
-  for (let i = 1; i < depth; i++) hop = { edge, limit: 1, hops: [hop] };
-  return hop;
-}
 
 // ---- what only a fixture can show
 //

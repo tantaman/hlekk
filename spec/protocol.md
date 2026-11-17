@@ -134,6 +134,25 @@ its own declaration of the same names, and **SHOULD** decline a type it cannot r
 example one for which it declares a required field the responder does not expose. A caller **MUST
 NOT** guess at a field an answer does not carry.
 
+### 4.3 Discovery
+
+The vocabulary is enough to read a database nobody described, from one id.
+
+Every edge states the type it starts at and the type it lands on, so the edges a caller may hang
+under an object are the ones whose `from` is that object's type — and the object's type is in the
+answer (§5.4). `counted` says whether a count may be asked for; `foreign`, where a responder states
+it, says the hop may leave this database. A responder **MUST** state `from`, `to` and `counted` for
+every edge it exposes, and **SHOULD** state `foreign`.
+
+A responder **MUST** refuse a hop whose edge does not start at the type its parent hop lands on
+(§5.1), so a caller that builds its tree this way is told when it is wrong instead of being handed an
+empty list it cannot interpret.
+
+There is **no entry point but ids** (§5.3). A responder **MUST NOT** offer a way to enumerate the
+objects of a type: it would be an unbounded scan, and it would disclose the shape of a graph a policy
+may be hiding. Discovery therefore starts from a reference the caller already holds, and goes
+anywhere from there.
+
 ## 5. Reading
 
 ### 5.1 A request is a tree
@@ -144,6 +163,30 @@ request that names a frame by index, and **MUST NOT** accept one that can expres
 A responder **MUST** refuse a request carrying a member this specification does not define, at the
 request, at a hop, at a filter or at a count. Ignoring one would leave a caller unable to tell
 whether what it sent took effect.
+
+A responder **MUST** refuse a hop whose edge does not start at the type its parent hop lands on. Such
+a hop can only ever return nothing, and a caller cannot tell that nothing from a true empty list — so
+answering it is answering a question the caller did not ask.
+
+A hop directly under the request's `ids` **cannot** be checked this way and **MUST NOT** be refused
+on these grounds: the entry is ids, an id does not carry its type, and `ids` may hold objects of more
+than one type. A responder **MUST NOT** read storage in order to find out, because a request is
+priced and refused before any I/O (§5.2).
+
+### 5.1.1 The names a caller chooses
+
+A hop's result appears under its `as`, or under its edge's name where it gives none. A count's
+appears under its `as`, or under the edge name it was written as.
+
+Within one level of a request, every such name **MUST** be distinct, counting hops and counts
+together, and a responder **MUST** refuse a request where two collide. A responder **MUST** also
+refuse a name of `id`, or one beginning with `$`: a row carries `id`, `$version` and `$edge` beside
+its payload, and `id` in particular is what the normalized form keys every object, list and count by.
+
+> Why this is a refusal and not a precedence rule: a count and a hop over one edge default to the
+> same name, and naming them that way is the first thing a caller working from the vocabulary does.
+> Letting the later one win returns an empty list beside a count saying it is not empty — which is
+> the shape that makes a wrong answer look like a right one.
 
 ### 5.2 A request is priced before it runs
 

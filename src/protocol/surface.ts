@@ -22,17 +22,28 @@ import { resolve } from "../catalog/projection.ts";
 import type { Projection, Resolved } from "../catalog/projection.ts";
 import type { Catalog, FieldSpec } from "../catalog/catalog.ts";
 
-/** The document `GET {db}/vocabulary` returns: every exposed type with its fields, and every edge a
- *  request may traverse. A caller compares this with its own declaration of the same names, which is
- *  the type agreement `docs/protocol.md` asks for — a globally unique name says nothing about
- *  whether the reader knows the shape behind it. */
+/**
+ * The document `GET {db}/vocabulary` returns: every exposed type with its fields, and every edge a
+ * request may traverse.
+ *
+ * Two things a caller does with it. It compares the fields with its own declaration of the same
+ * names, which is the type agreement `docs/protocol.md` asks for — a globally unique name says
+ * nothing about whether the reader knows the shape behind it. And it works out what it may ask
+ * next: the edges off an object are the ones whose `from` is that object's type, which the answer
+ * states. That is enough to walk a database nobody told it about, from one id.
+ *
+ * `foreign` is there for the same reason, one step ahead of the read: an edge that permits a target
+ * in another database is a hop that may leave this one, with another round trip and another
+ * database's policy behind it. A caller discovers that anyway when a reference comes back with no
+ * object behind it — this lets it decide before spending the request, which is what a budget is for.
+ */
 export interface VocabularyDoc {
   v: number;
   /** The responder's catalog version. Not a compatibility token: see `Resolved.hash`. */
   catalog: number;
   projection?: { name: string; hash: string };
   types: Record<string, { fields: Record<string, { type: string; optional: boolean }> }>;
-  edges: Record<string, { from: string; to: string; counted: boolean }>;
+  edges: Record<string, { from: string; to: string; counted: boolean; foreign: boolean }>;
 }
 
 export interface Surface {
@@ -61,7 +72,7 @@ function wholeCatalog(catalog: Catalog): Surface {
   const vocabulary: Vocabulary = {
     edge(name) {
       const e = catalog.edgeNamed(name);
-      return e === undefined ? undefined : { to: e.to, counted: e.atype !== undefined };
+      return e === undefined ? undefined : { from: e.from, to: e.to, counted: e.atype !== undefined };
     },
     edges: () => catalog.edgeTypes().map((e) => e.name),
     fields: (name) => catalog.objectNamed(name)?.fields,
@@ -76,7 +87,9 @@ function wholeCatalog(catalog: Catalog): Surface {
       catalog: catalog.version,
       types: Object.fromEntries(catalog.objectTypes().map((t) => [t.name, { fields: specs(t.fields) }])),
       edges: Object.fromEntries(
-        catalog.edgeTypes().map((e) => [e.name, { from: e.from, to: e.to, counted: e.atype !== undefined }]),
+        catalog
+          .edgeTypes()
+          .map((e) => [e.name, { from: e.from, to: e.to, counted: e.atype !== undefined, foreign: e.foreign }]),
       ),
     }),
   };
@@ -93,7 +106,7 @@ function projected(catalog: Catalog, resolved: Resolved): Surface {
   const vocabulary: Vocabulary = {
     edge(name) {
       const e = edges.get(name);
-      return e === undefined ? undefined : { to: e.to, counted: e.atype !== undefined };
+      return e === undefined ? undefined : { from: e.from, to: e.to, counted: e.atype !== undefined };
     },
     edges: () => [...edges.keys()],
     // The projected fields, not the type's: a filter on a field the projection drops has to be
@@ -113,7 +126,7 @@ function projected(catalog: Catalog, resolved: Resolved): Surface {
       projection: { name: resolved.name, hash: resolved.hash },
       types: Object.fromEntries(resolved.objects.map((o) => [o.type.name, { fields: specs(o.fields) }])),
       edges: Object.fromEntries(
-        resolved.edges.map((e) => [e.name, { from: e.from, to: e.to, counted: e.atype !== undefined }]),
+        resolved.edges.map((e) => [e.name, { from: e.from, to: e.to, counted: e.atype !== undefined, foreign: e.foreign }]),
       ),
     }),
   };

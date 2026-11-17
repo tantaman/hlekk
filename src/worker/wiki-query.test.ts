@@ -103,9 +103,24 @@ describe("what the guard refuses", () => {
   });
 
   it("more frames than a plan may hold", () => {
-    // Many shallow hops: each is cheap on its own, so only the frame count catches this.
-    const hops = Array.from({ length: LIMITS.maxFrames + 2 }, () => ({ edge: pageLinks.name, limit: 1 }));
+    // Many shallow hops: each is cheap on its own, so only the frame count catches this. Each needs
+    // its own name, or what catches it first is two of them landing under one.
+    const hops = Array.from({ length: LIMITS.maxFrames + 2 }, (_, i) => ({ as: `h${i}`, edge: pageLinks.name, limit: 1 }));
     assert.match(refusal({ from, hops }).message, /frames/);
+  });
+
+  it("two of a caller's own names landing on one", () => {
+    // The answer is `{...payload, id, $version, ...relations, ...counts}`, so a collision means one
+    // of them silently wins. This builder strips the `wiki.` prefix from both a hop's name and a
+    // count's, so a bare count and a bare hop over one edge are the same name — which is what an
+    // author writing the page card's query by hand would reach for first.
+    assert.match(
+      refusal({ from, counts: [pageLinks.name], hops: [{ edge: pageLinks.name, limit: 5 }] }).message,
+      /"page_links" is already the "wiki\.page_links" hop/,
+    );
+    assert.match(refusal({ from, hops: [{ as: "x", edge: pageLinks.name }, { as: "x", edge: linkedFrom.name }] }).message, /cannot be both/);
+    // And a name the row already carries, which `id` would not shadow but collapse.
+    assert.match(refusal({ from, hops: [{ as: "id", edge: pageLinks.name }] }).message, /a row already carries/);
   });
 
   it("a count naming an edge that does not exist", () => {
@@ -115,12 +130,17 @@ describe("what the guard refuses", () => {
 
 describe("what the guard permits, and what it says it costs", () => {
   it("the page card the demo itself renders", () => {
+    // The names the card itself uses, which are distinct on purpose: a count and a hop over one
+    // edge both default to the edge's short name here, and one answer cannot be both.
     const spec: QuerySpec = {
       from,
-      counts: [pageLinks.name, linkedFrom.name],
+      counts: [
+        { as: "linkCount", edge: pageLinks.name },
+        { as: "backlinkCount", edge: linkedFrom.name },
+      ],
       hops: [
-        { edge: pageLinks.name, limit: 25 },
-        { edge: pageCategories.name, limit: 25 },
+        { as: "links", edge: pageLinks.name, limit: 25 },
+        { as: "categories", edge: pageCategories.name, limit: 25 },
       ],
     };
     const cost = check(spec);
