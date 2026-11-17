@@ -232,8 +232,10 @@ export class Directory {
    * This database's current key pair, generating one the first time it is asked for.
    *
    * On first use rather than at creation, which amounts to the same thing for a database that is
-   * ever linked to and costs nothing for one that is not — and that laziness is the direction
-   * PLAN.md step 8 wants, where an empty database costs zero until its first write.
+   * ever linked to and costs nothing for one that is not. Not because an empty database has to be
+   * free — one deployment is one database, so nobody is counting the empty ones — but because a key
+   * is the one piece of per-database state that is expensive to generate and pointless to have
+   * before anything asks for it.
    */
   async identity(now = 0): Promise<KeyPair> {
     const row = this.sql.all<{ id: string; pub: string; seed: string | null }>(
