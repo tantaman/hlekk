@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!--
+  The demo's social card, at the 1200x630 every crawler expects. `scripts/make-og.mjs` renders this
+  file with headless Chrome and writes the PNG into `src/worker/wiki-og.ts`, which the Worker serves
+  at /og.png. This file is the source of truth for the design; the module is generated from it.
+
+  WHY A RENDERED PAGE rather than an SVG served directly: no crawler that matters accepts SVG for
+  og:image -- X, Slack, Facebook, LinkedIn and iMessage all want a raster -- so a raster has to be
+  produced somewhere, and producing it from the page's own CSS is what keeps the card and the page
+  the same design rather than two drawings of one idea.
+
+  THE LOOK is the page's, borrowed the same way the page borrows Rindle Cloud's: the tokens, the
+  dot-grid paper, the brand mark, the host chip from .hw-cluster .hw-h, and orange as the only
+  accent. The chips are laid out in two tidy rows here instead of wrapping, because a card is a
+  fixed size and a wrap that lands one chip on a third row looks like a mistake.
+
+  WHAT THE NUMBERS ARE. 950,421 pages and 42,817,596 edges are measured and are the same on all
+  three placements -- both loaded sides carry exactly that, and the third is loaded from the same
+  records. 43 hosts and 192 vshards follow from `/admin/init?hosts=50&indexVshards=64`, which is
+  deterministic and gives every deployment a byte-identical shard map. If any of that changes, this
+  card is stale and needs re-rendering; nothing here is read at runtime.
+
+  WHAT THE LIT CHIPS ARE NOT. They are illustrative -- a clustered neighbourhood, which is what a
+  graph-derived affinity key is for -- and the card deliberately names no count and no ratio. The
+  measured figures are 27.0 hosts of 43 for the category key against the hash control's 34.2 (1.27x)
+  and a predicted 8.6 for the graph key, which is a prediction until the third placement is loaded
+  (docs/wikimedia-demo.md, PLAN.md step 1). A card is the wrong place to quote a number whose status
+  is "not yet read off a deployment".
+-->
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@300;400;500;600;700;800&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,400&display=swap">
+<style>
+:root{
+  --paper:#f2eee7;--panel:#fcfaf5;--white:#fff;
+  --ink:#171411;--ink-d:#5f564b;--ink-f:#746a5d;
+  --line:#d8cebc;--line2:#c7baa3;--dot:#d8d0bd;
+  --orange:#ff4d00;--cobalt:#2a4ddb;--teal:#04756b;
+  --font-sans:'Hanken Grotesk',sans-serif;--font-mono:'DM Mono',ui-monospace,monospace;
+}
+*{box-sizing:border-box;margin:0}
+html,body{width:1200px;height:630px;overflow:hidden}
+body{background:var(--paper);color:var(--ink);font-family:var(--font-sans);
+  -webkit-font-smoothing:antialiased;
+  background-image:radial-gradient(var(--dot) 1.1px,transparent 1.1px);background-size:26px 26px}
+
+.card{width:1200px;height:630px;padding:50px 64px 42px;display:flex;flex-direction:column}
+
+/* ---- the brand row, the page's own header without the nav */
+.top{display:flex;align-items:center;justify-content:space-between}
+.brand{display:inline-flex;align-items:center;gap:13px}
+.mark{width:26px;height:26px;border-radius:7px;border:2px solid var(--ink);position:relative;flex:none}
+.mark::after{content:"";position:absolute;right:-4px;bottom:-4px;width:9px;height:9px;border-radius:50%;background:var(--orange)}
+.name{font-family:var(--font-mono);font-size:22px;font-weight:500;letter-spacing:-.01em}
+.name b{font-weight:500;color:var(--ink-f)}
+.host{font-family:var(--font-mono);font-size:13px;letter-spacing:.04em;color:var(--ink-d);
+  background:var(--white);border:1px solid var(--line2);border-radius:8px;padding:6px 12px}
+
+/* ---- the hero, the page's own */
+.ey{font-size:14px;letter-spacing:.22em;text-transform:uppercase;color:var(--orange);margin:36px 0 16px}
+h1{font-weight:800;font-size:54px;line-height:1.05;letter-spacing:-.022em;max-width:24ch}
+.lede{font-size:20.5px;line-height:1.5;color:var(--ink-d);margin-top:20px;white-space:nowrap}
+
+/* ---- the measured figures */
+.kv{display:flex;gap:46px;margin-top:30px}
+.k{font-size:12px;letter-spacing:.11em;text-transform:uppercase;color:var(--ink-f);margin-bottom:6px}
+.v{font-family:var(--font-mono);font-size:27px;font-weight:500;letter-spacing:-.01em}
+
+/* ---- the cluster: every host drawn, the ones a read touched lit.
+   Same chip as the page's .hw-cluster .hw-h, two tidy rows instead of a wrap. */
+.cluster{margin-top:auto;padding-top:34px}
+.legend{display:flex;gap:18px;align-items:center;font-family:var(--font-mono);font-size:13px;
+  letter-spacing:.03em;color:var(--ink-d);margin-bottom:13px}
+.legend i{font-style:normal;display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.legend b{width:13px;height:13px;border-radius:4px;border:1px solid var(--line2);background:var(--white);flex:none}
+.legend .lit{background:var(--orange);border-color:var(--orange)}
+.hosts{display:flex;flex-wrap:wrap;gap:6px;width:1012px}
+.h{width:40px;height:34px;border-radius:7px;border:1px solid var(--line2);background:var(--white);
+  font-family:var(--font-mono);font-size:13px;color:var(--ink-d);
+  display:flex;align-items:center;justify-content:center;flex:none}
+.h.is-lit{background:var(--orange);border-color:var(--orange);color:var(--white)}
+
+.foot{margin-top:26px;padding-top:17px;border-top:1px solid var(--line);
+  font-family:var(--font-mono);font-size:13px;letter-spacing:.02em;color:var(--ink-f);
+  display:flex;justify-content:space-between}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="top">
+    <span class="brand"><span class="mark"></span><span class="name">hlekk <b>wiki</b></span></span>
+    <span class="host">title &rarr; id &rarr; traverse</span>
+  </div>
+
+  <p class="ey">read-only · cross-host graph traversal</p>
+  <h1>A SimpleWiki spread across 43&nbsp;Durable Objects.</h1>
+
+  <p class="lede">A page's links point anywhere, so one read assembles its neighbourhood from many hosts at once.</p>
+
+  <div class="kv">
+    <div><p class="k">pages</p><p class="v">950,421</p></div>
+    <div><p class="k">edges</p><p class="v">42,817,596</p></div>
+    <div><p class="k">host objects</p><p class="v">43</p></div>
+    <div><p class="k">vshards</p><p class="v">192</p></div>
+  </div>
+
+  <div class="cluster">
+    <div class="legend">
+      <i><b class="lit"></b>hosts one page's links came from</i>
+      <i><b></b>holds data, not read</i>
+    </div>
+    <div class="hosts" id="hosts"></div>
+  </div>
+
+  <div class="foot">
+    <span>a graph query plane across Durable Objects</span>
+    <span>mirror of a simplewiki dump</span>
+  </div>
+</div>
+<script>
+// Illustrative, not a cited measurement: a clustered neighbourhood, which is what the graph-derived
+// affinity key is for. The count is deliberately not named in the card.
+const LIT = new Set([3,4,5,11,12,18,19,20,26,27,33,38]);
+document.getElementById("hosts").innerHTML = Array.from({length:43},(_,i)=>
+  '<div class="h' + (LIT.has(i) ? ' is-lit' : '') + '">' + i + '</div>').join("");
+</script>
+</body>
+</html>
