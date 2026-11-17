@@ -114,6 +114,11 @@ const inert = (extra: Record<string, unknown> = {}): WorkerEnv => {
 
 const source = readFileSync(new URL("./wiki-app.ts", import.meta.url), "utf8");
 const routes = [...source.matchAll(/path === "([^"]+)"/g)].map((m) => m[1]!);
+// Routes mounted under a prefix rather than matched by name, which the line above cannot see. The
+// cross-database protocol is one, and the next one will be too, so the prefixes are scraped and
+// classified the same way: open by default is the failure this file exists to prevent, and a
+// prefix is a larger piece of surface to leave unclassified than a route.
+const prefixes = [...source.matchAll(/path\.startsWith\(`\$\{([A-Z_]+)\}\//g)].map((m) => m[1]!);
 const methodFor = (path: string) => (path.startsWith("/ingest/") || path === "/admin/wipe" ? "POST" : "GET");
 const ask = (path: string, headers: Record<string, string> = {}) =>
   new Request("https://wiki.example.com" + path, {
@@ -137,6 +142,61 @@ describe("the wiki Worker's entry module", () => {
 describe("the wiki Worker's routes", () => {
   /** What a visitor may reach. Everything else the Worker serves has to be an operator path. */
   const PUBLIC = ["/", "/wiki", "/cluster", "/health", "/lookup", "/page", "/relation", "/schema", "/price", "/query", "/counts"];
+
+  /** Prefixes a visitor may reach, by the constant the Worker mounts them under. */
+  const PUBLIC_PREFIXES = ["PROTOCOL_PREFIX"];
+
+  it("mount no prefix this file has not classified", () => {
+    assert.deepEqual(
+      prefixes.filter((name) => !PUBLIC_PREFIXES.includes(name)),
+      [],
+      "a prefix-mounted surface is public until it is listed here",
+    );
+    assert.deepEqual(prefixes, ["PROTOCOL_PREFIX"], "the pattern has stopped matching, or a mount was added");
+  });
+
+  it("serve the protocol under its prefix, to a visitor with no token", async () => {
+    // Read-only and public by design: the first database on the internet is one already loaded, and
+    // the serving half needs no identity. What matters here is that it is NOT behind the operator
+    // guard and does not become so by accident.
+    const descriptor = await worker.fetch(ask("/db"), inert());
+    assert.equal(descriptor.status, 200);
+    const d = (await descriptor.json()) as { protocol: string; database: string; routes: Record<string, string> };
+    assert.equal(d.protocol, "hlekk");
+    assert.equal(d.database, "https://wiki.example.com/db");
+    assert.equal(d.routes.read, "https://wiki.example.com/db/read");
+
+    const vocabulary = await worker.fetch(ask("/db/vocabulary"), inert());
+    assert.equal(vocabulary.status, 200);
+    assert.deepEqual(
+      Object.keys(((await vocabulary.json()) as { types: Record<string, unknown> }).types),
+      ["wiki.page"],
+    );
+
+    // A configured URI is authoritative over the request's origin, since the URI is the database's
+    // identity and a deployment reachable under two names would otherwise advertise two.
+    const configured = await worker.fetch(ask("/db"), inert({ HLEKK_DATABASE_URI: "https://db.example/wiki" }));
+    assert.equal(((await configured.json()) as { database: string }).database, "https://db.example/wiki");
+
+    const read = (body: unknown, env: WorkerEnv) =>
+      worker.fetch(
+        new Request("https://wiki.example.com/db/read", { method: "POST", body: JSON.stringify(body) }),
+        env,
+      );
+
+    // Past the guard, since the refusal comes from the protocol's own check — which runs before any
+    // I/O, so a sealed env is never reached and 400 is the proof it got this far.
+    const refused = await read({ ids: ["1"], hops: [{ edge: "no.such_edge" }] }, sealed());
+    assert.equal(refused.status, 400);
+    assert.equal(((await refused.json()) as { at: string }).at, "hops[0]");
+
+    // And a permitted read does reach for a binding. The sealed env reports that by throwing, which
+    // the handler turns into a 500 that says nothing — so the status is the only tell, which is the
+    // point of it.
+    const touched = await read({ ids: ["1"] }, sealed());
+    assert.equal(touched.status, 500);
+    assert.deepEqual(await touched.json(), { error: "internal error" });
+  });
 
   it("are each either public by name or behind the guard", () => {
     assert.ok(routes.length >= 20, `found ${routes.length} routes; the pattern has stopped matching`);

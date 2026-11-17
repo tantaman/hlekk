@@ -12,7 +12,9 @@
     "ingest:local": "node scripts/ingest-local.ts",
     "ingest:deployed": "node scripts/ingest-deployed.ts",
     "wiki:deploy": "wrangler deploy --config wrangler.wiki.jsonc",
-    "og": "node scripts/make-og.mjs"
+    "og": "node scripts/make-og.mjs",
+    "conformance": "node scripts/conformance.mjs",
+    "conformance:node": "node scripts/conformance-node.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

@@ -10,6 +10,7 @@
 // A `Plan` never crosses the wire in either direction — see `request.ts` for why.
 
 import type { Catalog } from "../catalog/catalog.ts";
+import { decodeCursor } from "../schema/query.ts";
 import { normalize } from "./normalize.ts";
 import type { ListEntry, QueryResult } from "./normalize.ts";
 import { DEFAULT_HOP_LIMIT, DEFAULT_LIMITS, Refused, check, countEdge } from "./request.ts";
@@ -135,7 +136,15 @@ export function planOf(req: ReadRequest, catalog: Catalog): Plan {
   const frames: Frame[] = [];
   const emit = (source: Source, node: Partial<Hop> & Request, isRoot: boolean): number => {
     const index = frames.length;
-    frames.push({ source, limit: isRoot ? undefined : (node.limit ?? DEFAULT_HOP_LIMIT), children: [], counts: [] });
+    frames.push({
+      source,
+      limit: isRoot ? undefined : (node.limit ?? DEFAULT_HOP_LIMIT),
+      // `check` has already decoded this one, so a cursor here is known to be well formed. The root
+      // takes none: the entry is ids, and a list of ids is not a page.
+      after: isRoot || node.after === undefined ? undefined : decodeCursor(node.after),
+      children: [],
+      counts: [],
+    });
     const children = (node.hops ?? []).map((hop) => {
       const edge = catalog.edgeNamed(hop.edge)!;
       const child: Source =
@@ -267,6 +276,17 @@ export interface ServeOptions {
   catalog: Catalog;
   source: ReadSource;
   vocabulary: Vocabulary;
+  /**
+   * Which object types this database exposes at all, by integer.
+   *
+   * The vocabulary narrows what a request may *say*; this narrows what an answer may *hold*, and the
+   * two are not the same question. The entry is ids, and an id does not carry its type, so a caller
+   * naming the id of an unexposed object would otherwise get it back — the one way into a narrowed
+   * database's unnarrowed half. Enforced through the policy rather than at encode time so that the
+   * walk in `enforce` applies: an object hidden here takes its descendants with it, which is what
+   * makes it indistinguishable from absent rather than merely missing.
+   */
+  exposes?: (otype: number) => boolean;
   policy?: Policy;
   limits?: Limits;
   /** Ids one request may enter from. Separate from `Limits`, which bounds the tree below the entry. */
@@ -276,26 +296,49 @@ export interface ServeOptions {
 export const MAX_IDS = 100;
 
 /**
+ * Prices one read, reading nothing.
+ *
+ * Split out of `serve` so the two cannot disagree. `docs/protocol.md` makes "a request is priced
+ * before it runs" the one non-negotiable property, and a price route that is a second implementation
+ * of the same arithmetic is a price a caller cannot rely on — so there is one implementation and
+ * both routes call it. The conformance suite checks the equality from outside, which only means
+ * anything because it could have failed.
+ *
+ * The entry is validated before the price, because the price depends on it: the tree is gathered
+ * once per root, so `check` needs the width of the entry to total it. Pricing first meant pricing
+ * for one root and then serving `maxIds` of them — the tree under a request certified at 10,101
+ * nodes materialized a hundred times over, which is the work amplifier this guard exists to remove.
+ * The ordering also decides which fault a request carrying both is told about, and "this costs too
+ * much" is not something a caller whose `ids` is a string can act on.
+ */
+export function price(req: ReadRequest, opts: ServeOptions): Cost {
+  const { vocabulary, limits = DEFAULT_LIMITS, maxIds = MAX_IDS } = opts;
+  const ids = req?.ids;
+  if (!Array.isArray(ids) || ids.length === 0) throw new Refused("ids", "at least one id is required");
+  if (ids.length > maxIds) throw new Refused("ids", `${ids.length} ids, the maximum is ${maxIds}`);
+  if (ids.some((id) => typeof id !== "string")) throw new Refused("ids", "every id must be a decimal string");
+  return check(req, vocabulary, limits, ids.length);
+}
+
+/**
  * Answers one read. Throws `Refused` — from `request.ts`, with a path into the request — for anything
  * that must not run; a caller turns that into whatever its transport calls a bad request.
  */
 export async function serve(req: ReadRequest, opts: ServeOptions): Promise<Served> {
-  const { catalog, source, vocabulary, policy = PUBLIC, limits = DEFAULT_LIMITS, maxIds = MAX_IDS } = opts;
-  // The entry first, then the price, because the price depends on it: the tree is gathered once per
-  // root, so `check` needs the width of the entry to total it. Pricing first meant pricing for one
-  // root and then serving `maxIds` of them — the tree under a request certified at 10,101 nodes
-  // materialized a hundred times over, which is the work amplifier this guard exists to remove.
-  // The ordering also decides which fault a request carrying both is told about, and "this costs
-  // too much" is not something a caller whose `ids` is a string can act on.
-  const ids = req.ids;
-  if (!Array.isArray(ids) || ids.length === 0) throw new Refused("ids", "at least one id is required");
-  if (ids.length > maxIds) throw new Refused("ids", `${ids.length} ids, the maximum is ${maxIds}`);
-  if (ids.some((id) => typeof id !== "string")) throw new Refused("ids", "every id must be a decimal string");
-  const cost = check(req, vocabulary, limits, ids.length);
+  const { catalog, source, exposes, policy = PUBLIC } = opts;
+  const cost = price(req, opts);
 
   const plan = planOf(req, catalog);
-  const result = await source.normalized(plan, [...ids]);
-  return { result: enforce(result, plan, policy), cost, cache: policy.cache() };
+  const result = await source.normalized(plan, [...req.ids]);
+  const effective: Policy =
+    exposes === undefined
+      ? policy
+      : {
+          object: (id, otype) => exposes(otype) && policy.object(id, otype),
+          count: (id, atype) => policy.count(id, atype),
+          cache: () => policy.cache(),
+        };
+  return { result: enforce(result, plan, effective), cost, cache: policy.cache() };
 }
 
 export { Refused };
