@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import vm from "node:vm";
 
+import { isOperatorPath } from "./guard.ts";
 import { WIKI_UI } from "./wiki-ui.ts";
 import { storedTitle } from "./wiki.ts";
 
@@ -116,5 +117,16 @@ describe("the inline UI", () => {
     // render time and the test suite would otherwise never know.
     assert.match(scripts[0]!, /function clusterGrid\(/);
     assert.match(scripts[0]!, /clusterGrid\(r\.hosts\)/);
+  });
+
+  it("asks for nothing a visitor may not have", () => {
+    // The page read its host roster from /admin/where, which is why that route could not simply be
+    // closed. Every path the script names has to be one the Worker answers without a token, or the
+    // page degrades for everyone and nothing here would say so.
+    const asked = [...scripts[0]!.matchAll(/fetch\(\s*["']([^"'?]+)/g)].map((m) => m[1]!);
+    assert.ok(asked.includes("/cluster"), "the roster comes from /cluster");
+    assert.ok(asked.length >= 4, `found ${asked.length} fetches; the pattern has stopped matching`);
+    assert.deepEqual(asked.filter(isOperatorPath), []);
+    assert.doesNotMatch(scripts[0]!, /["'\/]admin\/|["'\/]ingest\//, "no operator path is built by concatenation either");
   });
 });

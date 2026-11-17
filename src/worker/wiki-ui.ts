@@ -327,17 +327,20 @@ const stored = (t) => {
 const nf = (n) => Number(n).toLocaleString();
 
 let SCHEMA = null;
-// The host roster: every host in the database, with what it holds. Read once, because it costs a
-// call per host and does not change while the demo is being looked at. If it cannot be had the grid
+// The host roster: every host in the database, with what it holds. Read once per page, and held by
+// the Worker beyond that, because it does not change while the demo is being looked at. If it cannot be had the grid
 // degrades to the chip row it replaced rather than failing the page -- the read's own figures are
 // what matter, and they do not come from here.
 let CLUSTER = null;
 
 async function loadCluster() {
   try {
-    const d = await fetch("/admin/where").then((r) => r.json());
+    // The public roster, not the operator's view of the cluster: that one is closed to a browser.
+    // This is the three numbers per host the grid draws, held by the Worker so a visit does not cost
+    // a call per host.
+    const d = await fetch("/cluster").then((r) => r.json());
     if (!Array.isArray(d.hosts)) return;
-    CLUSTER = { hosts: d.hosts, indexVshards: (d.indexVshards || []).length };
+    CLUSTER = { hosts: d.hosts, indexVshards: Number(d.indexVshards) || 0 };
     // The hero's host counts were literals, written when the pilot had 43. The grid below draws the
     // real roster, so a stale number up here is a page contradicting itself in two places a viewer
     // can see at once -- and the headline is now one of them. One source for all three. The markup

@@ -46,6 +46,19 @@
   // deliberate deploy -- set it to the comma-separated names of the abandoned databases being
   // reclaimed, run the wipes, then deploy again without it.
   //
+  // HLEKK_ADMIN_TOKEN is absent from every one of these configs, and has to stay absent: it is a
+  // secret, and `vars` is committed. It is the bearer token that opens /admin/* and /ingest/*, which
+  // refuse everything without it -- so what this file deploys can be read and cannot be changed.
+  // To operate a deployment, set one on that Worker and hand the same value to the driver:
+  //
+  //   openssl rand -hex 32 | npx wrangler secret put HLEKK_ADMIN_TOKEN --config wrangler.wiki.jsonc
+  //   HLEKK_ADMIN_TOKEN=... node scripts/load-wiki.ts --base https://...
+  //
+  // and `wrangler secret delete` it afterwards to close the deployment again. The same Worker runs
+  // from wrangler.wiki-hash.jsonc, wrangler.wiki-graph.jsonc and wrangler.enwiki.jsonc; each holds
+  // its own token, and a driver's `--placement` forward needs the two ends to share one. Locally,
+  // put it in `.dev.vars`, which is ignored. See `src/worker/guard.ts`.
+  //
   // HLEKK_SHED_BYTES is deliberately absent. It lowers the placement controller's threshold so a
   // demo can be watched rebalancing, and this database must not rebalance: wikimedia-demo.md puts
   // moves and epoch transitions out of scope and keeps every vshard at epoch 0, which is what keeps

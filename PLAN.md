@@ -130,12 +130,14 @@ each refused with the canonical one named; `toKey` throwing on every qualified f
 The serving half needs no storage change, so the first database on the internet that answers the
 protocol can be one that is already loaded: the wiki, under the `PUBLIC` policy, with no identity.
 
-**Before anything is advertised.** `src/worker/wiki-app.ts` serves `/ingest/pages`, `/ingest/edges`,
-`/admin/init`, `/admin/size`, `/admin/cpu`, `/admin/where` and `/admin/route` with no gate in code.
-`/admin/wipe` and `/admin/r2probe` are armed by configuration and refuse when it is absent; the rest
-answer anyone who can reach the Worker, and the two ingest routes write. A database whose URI is
-handed to strangers cannot keep those open. Give them the same treatment: a configuration value that
-arms them, absent in every committed config.
+**Before anything is advertised.** `/admin/*` and `/ingest/*` on the wiki Worker are closed in code
+behind a bearer token, `HLEKK_ADMIN_TOKEN`, and refuse everything while it is unset
+(`src/worker/guard.ts`). That closes nothing that is already deployed. `hlekk-wiki`,
+`hlekk-wiki-hash`, `hlekk-wiki-graph` and `hlekk-enwiki` each serve the routes as they were until
+redeployed, so redeploying all four comes before any database URI is handed out. Two things are
+left as they were, on purpose. `/counts` is public and takes as many ids as a URL holds, each one a
+read. And `src/worker/app.ts`, the small issue-tracker demo, has no gate at all: it is a local
+harness, and it must not be deployed as it stands.
 
 **Build**
 
@@ -389,7 +391,7 @@ What turns the repository into a standard and a reference implementation of it.
 - **README, LICENSE, a contribution guide** that says how a protocol change is proposed, and CI for
   typecheck, tests and the conformance suite against the Node adapter.
 - **A review of every route on every deployed Worker** before the announcement, starting from the
-  list in step 2.
+  two left open in step 2.
 
 ## 8. Hosting and the agent surface
 
