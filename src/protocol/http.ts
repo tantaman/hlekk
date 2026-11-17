@@ -31,7 +31,7 @@ import type { Cacheability } from "../query/serve.ts";
 import type { Catalog } from "../catalog/catalog.ts";
 import { canonicalDb } from "../query/ref.ts";
 import { WIRE_VERSION, encodeRead } from "./wire.ts";
-import { SignatureRefused, reachable, verifyRequest } from "./identity.ts";
+import { CALLER_HEADER, SignatureRefused, reachable, verifyRequest } from "./identity.ts";
 import type { Caller, PublicKey } from "./identity.ts";
 import type { Pins } from "./client.ts";
 import type { Surface } from "./surface.ts";
@@ -159,7 +159,18 @@ const serveOptions = (binding: Binding, policy?: Policy): ServeOptions => ({
  */
 async function authorize(request: Request, binding: Binding, body: string): Promise<{ policy?: Policy } | Response> {
   let caller: Caller | null = null;
-  if (binding.callerKeys !== undefined) {
+  if (binding.callerKeys === undefined) {
+    // This database verifies nothing, and its descriptor says so by publishing no key. A signature
+    // presented anyway is refused rather than ignored: the caller took the trouble to make a claim,
+    // and silently reading it as anonymous would leave it unable to tell whether the claim was
+    // honoured — which is the same hazard as a downgrade, from the other side.
+    if (request.headers.get(CALLER_HEADER) !== null || request.headers.get("signature") !== null) {
+      return json(
+        { error: "this database verifies no signatures; its descriptor publishes no key", at: "signature" },
+        400,
+      );
+    }
+  } else {
     try {
       caller = await verifyRequest({
         method: request.method,

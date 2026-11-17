@@ -16,6 +16,7 @@ import { Host } from "../host/host.ts";
 import { Deliverer } from "../host/outbox.ts";
 import type { ExecReply, Reply, Routed, Snapshot } from "../host/host.ts";
 import { nodeSql } from "../host/sql.node.ts";
+import type { Sql } from "../host/sql.ts";
 import type { StorageFormat } from "../host/schema.ts";
 import { systemRuntime } from "../runtime/runtime.ts";
 import type { Runtime } from "../runtime/runtime.ts";
@@ -57,6 +58,15 @@ export interface LocalOptions {
   /** The storage format this database is created with. Defaults to what a new database gets, which
    *  is 2; the suite also runs under 1 so that nothing silently depends on the new key. */
   format?: StorageFormat;
+  /**
+   * Where each engine's rows go, by name: `"directory"`, or `"h-<n>"` for a host.
+   *
+   * In memory by default, which is what the suite wants. A seam rather than a branch because
+   * `adapters/node/` needs the same cluster over files, and the whole point of this class is that
+   * everything above the storage is the code a deployment runs — `docs/design.md`'s platform seams,
+   * with one more of them.
+   */
+  storage?: (name: string) => Sql;
   /** Time and chance. Pass a deterministic one and the whole cluster replays from a seed. */
   runtime?: Runtime;
   /** A vshard's soft byte cap, lowered in tests so growth and rebalancing are reachable. */
@@ -97,11 +107,13 @@ export class LocalCluster {
   readonly down = new Set<number>();
 
   readonly runtime: Runtime;
+  readonly #storage: (name: string) => Sql;
 
   constructor(opts: LocalOptions = {}) {
     this.runtime = opts.runtime ?? systemRuntime;
     this.database = opts.database ?? "db";
-    this.directory = Directory.open(nodeSql(), {
+    this.#storage = opts.storage ?? (() => nodeSql());
+    this.directory = Directory.open(this.#storage("directory"), {
       database: this.database,
       batch: opts.batch,
       uri: opts.uri,
@@ -196,7 +208,10 @@ export class LocalCluster {
     if (!host) {
       // Told its format rather than left to guess, which is what the directory recording it is for.
       const format = this.directory.storageFormat();
-      this.hosts.set(index, (host = Host.open(nodeSql(), this.directory.catalog(), this.runtime.clock, format)));
+      this.hosts.set(
+        index,
+        (host = Host.open(this.#storage(`h-${index}`), this.directory.catalog(), this.runtime.clock, format)),
+      );
       this.directory.addHost(index);
     }
     return host;

@@ -306,6 +306,11 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
    */
   async function signature(method: string, url: string, body: string): Promise<SignedHeaders> {
     if (opts.identity === undefined) return {};
+    // Nor when the responder said it takes none. A descriptor with no key is a database that
+    // authenticates nobody, and presenting a credential to one is making a claim nobody will check —
+    // which it refuses, rightly, rather than ignore.
+    const descriptor = (await limits()) as { keys?: unknown[] } | null;
+    if (descriptor !== null && (descriptor.keys?.length ?? 0) === 0) return {};
     const { database, pair } = await opts.identity();
     if (database === null) return {};
     return signRequest({

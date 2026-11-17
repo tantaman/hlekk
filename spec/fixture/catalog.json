@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "objects": {
+    "conf.page": {
+      "otype": 1,
+      "fields": {
+        "title": "string",
+        "rank": "number",
+        "note": {
+          "optional": "string"
+        }
+      }
+    },
+    "conf.tag": {
+      "otype": 2,
+      "fields": {
+        "label": "string"
+      }
+    }
+  },
+  "edges": {
+    "conf.page_links": {
+      "from": "conf.page",
+      "to": "conf.page",
+      "atype": 1
+    },
+    "conf.page_tags": {
+      "from": "conf.page",
+      "to": "conf.tag",
+      "atype": 2
+    },
+    "conf.page_elsewhere": {
+      "from": "conf.page",
+      "to": "conf.page",
+      "foreign": true,
+      "atype": 3
+    }
+  },
+  "tombstones": [],
+  "sum": "7b2ae57d208b8669"
+}

@@ -17,11 +17,44 @@
 //
 // Exits non-zero if any check fails.
 
-const [uri] = process.argv.slice(2);
-if (!uri) {
-  console.error("usage: node scripts/conformance.mjs <database URI>");
+import { readFileSync, readdirSync } from "node:fs";
+
+import { validate } from "./lib/jsonschema.mjs";
+
+const argv = process.argv.slice(2);
+const [uri] = argv;
+const fixtureAt = flag("--fixture");
+if (!uri || uri.startsWith("--")) {
+  console.error("usage: node scripts/conformance.mjs <database URI> [--fixture <manifest>]");
   process.exit(2);
 }
+
+function flag(name) {
+  const at = argv.indexOf(name);
+  if (at === -1) return undefined;
+  const value = argv[at + 1];
+  if (value === undefined) {
+    console.error(`${name} needs a value`);
+    process.exit(2);
+  }
+  return value;
+}
+
+/** The fixture's manifest, when one was given: which id this implementation gave each named object.
+ *  Ids are minted by the implementation, so the suite cannot know them — see spec/fixture/README.md. */
+const fixture = fixtureAt === undefined ? null : JSON.parse(readFileSync(fixtureAt, "utf8"));
+const id = (name) => {
+  const got = fixture?.ids?.[name];
+  if (got === undefined) throw new Error(`the manifest names no id for "${name}"`);
+  return got;
+};
+
+/** The normative schemas. Loaded from `spec/`, which is the artifact an implementation is held to;
+ *  the validator beside this file imports nothing from `src/`. */
+const schemas = {};
+const schemaDir = new URL("../spec/schemas/", import.meta.url);
+for (const name of readdirSync(schemaDir)) schemas[name] = JSON.parse(readFileSync(new URL(name, schemaDir), "utf8"));
+const invalid = (name, body) => validate(schemas[name], body, schemas[name], "", schemas);
 
 const checks = [];
 const check = (name, ok, detail) => checks.push({ name, ok: Boolean(ok), detail });
@@ -42,13 +75,15 @@ async function send(route, body) {
   return { status: res.status, body: parsed };
 }
 
-/** A refusal has to name where, or a caller can only retry blind. */
+/** A refusal has to name where, or a caller can only retry blind — and it has to be the shape the
+ *  spec says a refusal is. */
 function refused(name, response, where) {
   const at = response.body?.at;
+  const shape = response.body === null ? ["no body"] : invalid("refusal.json", response.body);
   check(
     name,
-    response.status === 400 && typeof at === "string" && (where === undefined || at === where),
-    `status ${response.status}, at ${JSON.stringify(at)}`,
+    response.status === 400 && typeof at === "string" && (where === undefined || at === where) && shape.length === 0,
+    `status ${response.status}, at ${JSON.stringify(at)}${shape.length > 0 ? `, ${shape.join("; ")}` : ""}`,
   );
 }
 
@@ -89,6 +124,11 @@ check(
   "every edge's endpoints are types it also states",
   edges.every(([, e]) => e.from in (vocabulary?.types ?? {}) && e.to in (vocabulary?.types ?? {})),
 );
+check(
+  "and the whole vocabulary validates against spec/schemas/vocabulary.json",
+  vocabulary !== null && invalid("vocabulary.json", vocabulary).length === 0,
+  (vocabulary === null ? ["no body"] : invalid("vocabulary.json", vocabulary)).join("; "),
+);
 
 const countable = edges.find(([, e]) => e.counted)?.[0];
 const uncounted = edges.find(([, e]) => !e.counted)?.[0];
@@ -121,7 +161,17 @@ if (countable) {
   );
   check(
     "every object key is a bare decimal id of this database",
-    Object.keys(read.body?.objects ?? {}).every((id) => /^(0|[1-9][0-9]*)$/.test(id)),
+    Object.keys(read.body?.objects ?? {}).every((key) => /^(0|[1-9][0-9]*)$/.test(key)),
+  );
+  check(
+    "the answer validates against spec/schemas/read-response.json",
+    invalid("read-response.json", read.body).length === 0,
+    invalid("read-response.json", read.body).join("; "),
+  );
+  check(
+    "and the price against spec/schemas/price-response.json",
+    invalid("price-response.json", priced.body).length === 0,
+    invalid("price-response.json", priced.body).join("; "),
   );
 } else {
   check("a countable edge is exposed, so pricing can be checked", false, "no edge reports counted: true");
@@ -198,6 +248,113 @@ function deeper(edge, depth) {
   let hop = { edge, limit: 1 };
   for (let i = 1; i < depth; i++) hop = { edge, limit: 1, hops: [hop] };
   return hop;
+}
+
+// ---- what only a fixture can show
+//
+// Everything above runs against a live database without being told what is in it. These need the
+// published catalog, graph and policy of spec/fixture/, because what they check is what a policy
+// does — and a policy is only observable by asking for something it hides.
+
+if (fixture !== null) {
+  check(
+    "the manifest names the database the suite was pointed at",
+    fixture.database === uri,
+    `manifest says ${JSON.stringify(fixture.database)}`,
+  );
+
+  // Forbidden indistinguishable from absent, TRANSITIVELY. `root` links to three pages and one of
+  // them is hidden; `behind-hidden` is reachable only through it. Had `hidden` genuinely not
+  // existed, the engine would never have gathered what is under it — so its descendants being in
+  // the answer would be both the tell and the disclosure.
+  const through = await send("read", {
+    ids: [id("root")],
+    hops: [{ as: "links", edge: "conf.page_links", limit: 10, hops: [{ as: "deeper", edge: "conf.page_links", limit: 10 }] }],
+  });
+  const objects = Object.keys(through.body?.objects ?? {});
+  check("a hidden object is absent from the answer", !objects.includes(id("hidden")), objects.length + " objects");
+  check(
+    "and so is one reachable only through it",
+    !objects.includes(id("behind-hidden")),
+    "forbidden has to be indistinguishable from absent transitively, or the descendants are the tell",
+  );
+  const links = through.body?.lists?.[`1:${id("root")}`]?.ids ?? [];
+  check(
+    "a hidden object is absent from the list that named it, not nulled in place",
+    !links.includes(id("hidden")) && links.includes(id("visible-a")),
+    `list holds ${links.length}`,
+  );
+  check(
+    "and the list is short beside a count that still counts it, which is what a deleted object looks like",
+    links.length === 2,
+    `list holds ${links.length}, expected the two that are visible`,
+  );
+
+  // A count is a separately authorized operation. The object is readable and the count is not.
+  const counted = await send("read", { ids: [id("countless-owner")], counts: ["conf.page_tags"] });
+  check(
+    "an object whose count is forbidden is still readable",
+    id("countless-owner") in (counted.body?.objects ?? {}),
+    `status ${counted.status}`,
+  );
+  check(
+    "and the count is absent rather than zero",
+    Object.keys(counted.body?.counts ?? {}).length === 0,
+    `counts ${JSON.stringify(counted.body?.counts)}`,
+  );
+
+  // Paging. The same list read two at a time has to be the list read whole, in the same order.
+  const whole = await send("read", { ids: [id("paged")], hops: [{ as: "l", edge: "conf.page_links", limit: 10 }] });
+  const all = whole.body?.lists?.[`1:${id("paged")}`]?.ids ?? [];
+  const pages = [];
+  let after;
+  for (let i = 0; i < 6; i++) {
+    const hop = { as: "l", edge: "conf.page_links", limit: 2, ...(after === undefined ? {} : { after }) };
+    const page = await send("read", { ids: [id("paged")], hops: [hop] });
+    const list = page.body?.lists?.[`1:${id("paged")}`];
+    if (list === undefined) break;
+    pages.push(...list.ids);
+    if (!list.more || list.cursor === null) break;
+    after = list.cursor;
+  }
+  check("a list read in pages is the list read whole", JSON.stringify(pages) === JSON.stringify(all), `${pages.length} vs ${all.length}`);
+  check("and it is five pages long, so the paging was real", all.length === 5, `${all.length} rows`);
+
+  // A reference this database holds and did not follow. A URI is mintable before the database
+  // behind it exists, so the reference is in the list and nothing stands behind it.
+  const onward = await send("read", {
+    ids: [id("elsewhere-owner")],
+    hops: [{ as: "out", edge: "conf.page_elsewhere", limit: 10 }],
+  });
+  const refs = onward.body?.lists?.[`1:${id("elsewhere-owner")}`]?.ids ?? [];
+  check("a reference into another database is listed", refs.some((r) => r.includes("#")), JSON.stringify(refs));
+  check(
+    "and nothing stands behind it: a database answering a read never follows one",
+    refs.every((r) => !(r in (onward.body?.objects ?? {}))),
+  );
+
+  // Signatures are not ignored. A syntactically valid one that cannot be verified must be refused —
+  // not read as the anonymous caller, because then stripping a header would be a downgrade.
+  const forged = await fetch(`${uri}/read`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "hlekk-caller": "https://nobody.invalid/db",
+      "content-digest": "sha-256=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:",
+      "signature-input":
+        'hlekk=("@method" "@target-uri" "content-digest" "hlekk-caller");created=1700000000;keyid="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";alg="ed25519"',
+      signature: `hlekk=:${"A".repeat(86)}==:`,
+    },
+    body: JSON.stringify({ ids: [id("root")] }),
+  }).then((r) => r.status, () => 0);
+  // 401 or 403 from a database that verifies and could not; 400 from one that verifies nothing and
+  // says so, which is a refusal and not an oversight — a caller that presented a credential has to
+  // learn that nobody checked it.
+  check(
+    "a signature that cannot be verified is refused, not read as anonymous",
+    forged >= 400 && forged < 500,
+    `status ${forged}${forged === 200 ? " — stripping a header would then be a downgrade" : ""}`,
+  );
 }
 
 for (const c of checks) {

@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hlekk.dev/spec/schemas/vocabulary.json",
+  "title": "GET {db}/vocabulary \u2014 the exposed types and edges",
+  "description": "A name is only half of an agreement: a globally unique type name says nothing about whether the reader knows the shape behind it. This states each exposed type's fields so a caller can compare them with its own declaration and decline a type it cannot read through.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "catalog": {
+      "description": "The responder's catalog version. Not a compatibility token.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "projection": {
+      "description": "The named selection this database exposes, when it exposes one rather than its whole catalog.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hash": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "name",
+        "hash"
+      ],
+      "additionalProperties": false
+    },
+    "types": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "common.json#/$defs/typeName"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "fields": {
+            "description": "Empty for a type exposed only as an endpoint: an id a caller can hold and link to, with nothing to read.",
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "optional": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "type",
+                "optional"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "fields"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "edges": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "common.json#/$defs/typeName"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "from": {
+            "$ref": "common.json#/$defs/typeName"
+          },
+          "to": {
+            "$ref": "common.json#/$defs/typeName"
+          },
+          "counted": {
+            "description": "False for a field relationship, which follows an id in a payload and stores nothing \u2014 so it can be traversed but has no maintained counter to read.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "counted"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "v",
+    "catalog",
+    "types",
+    "edges"
+  ],
+  "additionalProperties": false
+}
