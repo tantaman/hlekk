@@ -32,6 +32,8 @@ import type { Ref } from "../query/ref.ts";
 import type { Fields, Id, Miss, Obj, Plan } from "../query/types.ts";
 import type { ReadSet } from "../query/stores.ts";
 import { WIRE_VERSION, decodeRead } from "./wire.ts";
+import { reachable, signRequest, wellFormed } from "./identity.ts";
+import type { KeyPair, PublicKey, SignedHeaders } from "./identity.ts";
 import type { Descriptor } from "./http.ts";
 
 /** How long one request to another database may take. */
@@ -55,6 +57,23 @@ export class ForeignUnreachable extends Error {
   constructor(database: string, why: string) {
     super(`${database} could not be read: ${why}`);
     this.name = "ForeignUnreachable";
+    this.database = database;
+  }
+}
+
+/** The database at this URI answered with a key its pin cannot reach.
+ *
+ *  A URI can be reassigned: a database torn down and another brought up at the same name is, to
+ *  everyone holding an edge into it, a different database. An allocated identifier would make that
+ *  detectable by having a second name, and would reintroduce the central allocator the whole design
+ *  exists to avoid. The pin is the answer instead, and this is what it buys — the edge fails rather
+ *  than resolving to a stranger's objects under a name that meant someone else. Only an operator
+ *  clears it. */
+export class Repudiated extends Error {
+  readonly database: string;
+  constructor(database: string, why: string) {
+    super(`${database} is repudiated: ${why}`);
+    this.name = "Repudiated";
     this.database = database;
   }
 }
@@ -99,6 +118,27 @@ export interface ForeignOptions {
    * but not canonical, and is the state a database that was never told its own URI is in.
    */
   self?: string;
+  /**
+   * The asking database's own identity, for signing. Absent, requests go unsigned, which is the
+   * ANONYMOUS caller and not an error: a responder serving public data authenticates nobody, and
+   * step 2's deployed wiki is exactly that.
+   */
+  identity?: () => Promise<{ database: string | null; pair: KeyPair }>;
+  /**
+   * Where this database records what another proved about itself. Absent, the responder's published
+   * keys are taken at face value every time, which is trust on every use rather than on first use —
+   * fine for a test and not for a deployment.
+   */
+  pins?: Pins;
+  /** Seconds since the epoch. Injectable so a test can pin a signature's `created`. */
+  now?: () => number;
+}
+
+/** The registry's pin columns, as the asking half needs them. */
+export interface Pins {
+  pinOf(uri: string): Promise<{ pinned: string | null; state: string | null }>;
+  pin(uri: string, keyId: string): Promise<void>;
+  repudiate(uri: string): Promise<void>;
 }
 
 /**
@@ -134,12 +174,16 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
       await guarded;
     }
     const url = route === "" ? base : `${base}/${route}`;
+    const payload = body === undefined ? undefined : JSON.stringify(body);
     let res: Response;
     try {
       res = await call(url, {
-        method: body === undefined ? "GET" : "POST",
-        headers: body === undefined ? {} : { "content-type": "application/json" },
-        body: body === undefined ? undefined : JSON.stringify(body),
+        method: payload === undefined ? "GET" : "POST",
+        headers:
+          payload === undefined
+            ? {}
+            : { "content-type": "application/json", ...(await signature("POST", url, payload)) },
+        body: payload,
         // A database that moved is a different database.
         redirect: "error",
         signal: AbortSignal.timeout(deadline),
@@ -147,7 +191,10 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     } catch (e) {
       throw new ForeignUnreachable(db, (e as Error).message);
     }
-    if (res.status === 400) {
+    if (res.status === 400 || res.status === 401 || res.status === 403) {
+      // The responder answered, and said no. A caller cannot retry its way out of any of these — a
+      // malformed request, an unverifiable signature, a caller this database will not serve — so
+      // they are refusals with a reason rather than a transport failure to back off from.
       const refusal = (await text(res, cap).then(parse, () => null)) as { error?: string; at?: string } | null;
       throw new ForeignRefused(db, `${refusal?.at ?? "?"}: ${refusal?.error ?? `status ${res.status}`}`);
     }
@@ -192,6 +239,87 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     return out;
   }
 
+  /**
+   * The headers that name this database and prove it.
+   *
+   * Nothing is signed when there is no identity to sign with, or no URI to sign as: a signature
+   * names the caller, and a database that was never told its own URI has no name to claim. The
+   * responder then sees the anonymous caller, which is a thing its policy decides about rather than
+   * an error.
+   */
+  async function signature(method: string, url: string, body: string): Promise<SignedHeaders> {
+    if (opts.identity === undefined) return {};
+    const { database, pair } = await opts.identity();
+    if (database === null) return {};
+    return signRequest({
+      method,
+      url,
+      body,
+      caller: database,
+      seed: pair.seed,
+      keyId: pair.public.id,
+      created: opts.now?.() ?? Math.floor(Date.now() / 1000),
+    });
+  }
+
+  /**
+   * Trust on first use, checked on later contact.
+   *
+   * The descriptor is public and unsigned — it has to be, or verifying it would need the key it
+   * carries — so what makes it trustworthy is TLS for the first contact and the pin for every one
+   * after.
+   *
+   * **The recorded state is read on every batch**, and the descriptor only when the pin has moved.
+   * That is deliberate: a repudiation has to make every read through the alias fail, and a check
+   * memoized for the life of a client would let an isolate that happened to verify first keep
+   * reading a database another isolate has already refused. The cost is one directory call per
+   * foreign batch, beside an internet round trip — which is to say, not the expensive part. The
+   * alternative, caching the state with a short window, trades a guarantee for a few milliseconds
+   * and is not worth it while a foreign hop costs what it costs.
+   */
+  async function identify(): Promise<void> {
+    const pins = opts.pins;
+    if (pins === undefined) return;
+    const held = await pins.pinOf(db);
+    if (held.state === "repudiated") {
+      throw new Repudiated(db, "an operator has to clear this before a read through it can run again");
+    }
+    if (verified !== null && held.pinned === verified) return; // nothing has moved since the last check
+    const descriptor = (await limits()) as (Descriptor & { keys?: PublicKey[] }) | null;
+    const keys = descriptor?.keys ?? [];
+    if (keys.length === 0) {
+      // A database that publishes no key cannot be pinned, and a pin held against one that used to
+      // publish keys is not something to quietly forget.
+      if (held.pinned !== null) {
+        await pins.repudiate(db);
+        throw new Repudiated(db, "it published a key before and publishes none now");
+      }
+      verified = null; // nothing to pin, so nothing is settled: the next batch asks again
+      return;
+    }
+    if (!(await wellFormed(keys))) throw new ForeignUnreachable(db, "its descriptor's keys are malformed");
+
+    if (held.pinned === null) {
+      // First contact. The current key — the one it has not retired — is what gets pinned.
+      const current = keys.find((k) => k.retired === undefined) ?? keys[keys.length - 1]!;
+      await pins.pin(db, current.id);
+      verified = current.id;
+      return;
+    }
+    const reached = await reachable(keys, held.pinned);
+    if (reached === null) {
+      await pins.repudiate(db);
+      throw new Repudiated(db, `it publishes no key reachable from the pinned ${held.pinned}`);
+    }
+    // The pin advances along the rotation chain, so the next contact starts from the newest key it
+    // has proved rather than from one that may fall out of the grace window.
+    if (reached.id !== held.pinned) await pins.pin(db, reached.id);
+    verified = reached.id;
+  }
+
+  /** The pin this client last checked a descriptor against. */
+  let verified: string | null = null;
+
   return {
     async exec(_plan: Plan, tasks: Miss[]): Promise<HostReply> {
       // Only objects cross a boundary in this step. A list or a count that lives elsewhere is named
@@ -206,6 +334,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
 
       const objects: [Ref, Obj | null][] = [];
       try {
+        await identify();
         const max = (await limits())?.limits?.maxIds ?? DEFAULT_BATCH;
         for (let i = 0; i < ids.length; i += max) {
           const slice = ids.slice(i, i + max);
@@ -222,7 +351,10 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
           }
         }
       } catch (e) {
-        if (opts.omit === undefined) throw e;
+        // `omit` covers a database that could not be reached. A repudiated one was reached and
+        // answered — with a key that is not the one it proved before — and omitting that would turn
+        // the loudest signal in the design into an empty list.
+        if (opts.omit === undefined || e instanceof Repudiated) throw e;
         // Opted into an answer without it. Every reference this batch asked for comes back null and
         // the database is named in the report, so the answer says what is missing instead of
         // looking complete.

@@ -31,6 +31,9 @@ import type { Cacheability } from "../query/serve.ts";
 import type { Catalog } from "../catalog/catalog.ts";
 import { canonicalDb } from "../query/ref.ts";
 import { WIRE_VERSION, encodeRead } from "./wire.ts";
+import { SignatureRefused, reachable, verifyRequest } from "./identity.ts";
+import type { Caller, PublicKey } from "./identity.ts";
+import type { Pins } from "./client.ts";
 import type { Surface } from "./surface.ts";
 
 /** Bytes a request body may hold. A read with the maximum 100 ids and a full tree of filters is a
@@ -39,14 +42,10 @@ export const MAX_BODY = 64 * 1024;
 
 export const DESCRIPTOR_VERSION = 1;
 
-/** A published signing key. Empty until step 5, and empty means this database authenticates nobody —
- *  which a caller has to be able to tell from a database that does and did not say so. */
-export interface DescriptorKey {
-  id: string;
-  alg: "ed25519";
-  /** The public key, base64url, no padding. */
-  key: string;
-}
+/** A published signing key. `identity.ts` owns the shape; it is re-exported here because the
+ *  descriptor is where a caller finds one, and an empty list means this database authenticates
+ *  nobody — which a caller has to be able to tell from one that does and did not say so. */
+export type DescriptorKey = PublicKey;
 
 export interface Descriptor {
   v: number;
@@ -69,14 +68,40 @@ export interface Binding {
   catalog: Catalog;
   source: ReadSource;
   surface: Surface;
+  /** The policy for every caller alike. `policyFor` overrides it per caller. */
   policy?: Policy;
+  /**
+   * The policy for one caller, and whether this database distinguished it.
+   *
+   * Called with the verified caller, or null for the anonymous one — a request that carries no
+   * signature at all, which is not an error: a database serving public data authenticates nobody.
+   * `serve` does not change for any of this, because `Policy` is already per request.
+   *
+   * `remember` is how **strangers do not grow the registry**. A responder records a caller only when
+   * its policy distinguishes that caller; anyone else is verified and forgotten. Without that, every
+   * stranger who ever called would be a row, and the registry is the one piece of per-database state
+   * outside the lock.
+   */
+  policyFor?: (caller: Caller | null) => Promise<{ policy: Policy; remember?: boolean }>;
+  /**
+   * How this database learns a caller's published keys: by reading the caller's own descriptor at
+   * its own URI, with the same defences a read of it gets. Absent, no signature can be verified, so
+   * every caller is the anonymous one.
+   */
+  callerKeys?: (database: string) => Promise<readonly PublicKey[]>;
+  /** Where a remembered caller's key is pinned. */
+  pins?: Pins;
   limits?: Limits;
   maxIds?: number;
   maxBody?: number;
   /** The path the routes hang off, when it is not the path of the database URI. Only for a
    *  deployment whose public URI is not its mount point. */
   prefix?: string;
+  /** The keys this database publishes in its descriptor. */
   keys?: DescriptorKey[];
+  /** Seconds since the epoch, as this database sees it, for the signature's creation window. */
+  now?: () => number;
+  maxSkewSeconds?: number;
 }
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
@@ -115,15 +140,66 @@ export function descriptorOf(binding: Binding): Descriptor {
   };
 }
 
-const serveOptions = (binding: Binding): ServeOptions => ({
+const serveOptions = (binding: Binding, policy?: Policy): ServeOptions => ({
   catalog: binding.catalog,
   source: binding.source,
   vocabulary: binding.surface.vocabulary,
   exposes: (otype) => binding.surface.typeName(otype) !== undefined,
-  policy: binding.policy,
+  policy: policy ?? binding.policy,
   limits: binding.limits,
   maxIds: binding.maxIds,
 });
+
+/**
+ * Who is calling, and what they may see.
+ *
+ * The responder reads the caller's keys from the caller's own descriptor, which is an outbound
+ * request made during an inbound one — that is what "a URI resolves to a key at a well-known path
+ * under it" costs, and it is cached per caller by whatever supplies `callerKeys`.
+ */
+async function authorize(request: Request, binding: Binding, body: string): Promise<{ policy?: Policy } | Response> {
+  let caller: Caller | null = null;
+  if (binding.callerKeys !== undefined) {
+    try {
+      caller = await verifyRequest({
+        method: request.method,
+        url: request.url,
+        body,
+        headers: request.headers,
+        now: binding.now?.() ?? Math.floor(Date.now() / 1000),
+        maxSkewSeconds: binding.maxSkewSeconds,
+        keysOf: binding.callerKeys,
+      });
+    } catch (e) {
+      if (e instanceof SignatureRefused) return json({ error: e.message, at: "signature" }, 401);
+      throw e;
+    }
+  }
+  if (binding.policyFor === undefined) return {};
+  const decided = await binding.policyFor(caller);
+  // Pinned only when the policy said this caller is one it distinguishes. The registry is symmetric
+  // — this database pins a caller's key the way it pins one it interns — and only the alias is
+  // outbound-only.
+  if (decided.remember === true && caller !== null && binding.pins !== undefined) {
+    const held = await binding.pins.pinOf(caller.database);
+    if (held.state === "repudiated") return json({ error: "this caller is repudiated here", at: "signature" }, 403);
+    if (held.pinned === null) await binding.pins.pin(caller.database, caller.key.id);
+    else if (held.pinned !== caller.key.id) {
+      // The caller signed with a key this database has not seen before. A rotation it has not caught
+      // up with looks exactly like a substitution from here, and the descriptor is what tells them
+      // apart — which is `pinned()` on the asking side. A responder that cannot walk the chain
+      // refuses rather than advancing the pin on the strength of the request itself.
+      const keys = await binding.callerKeys!(caller.database);
+      const reached = await reachable(keys, held.pinned);
+      if (reached === null || reached.id !== caller.key.id) {
+        await binding.pins.repudiate(caller.database);
+        return json({ error: "this caller's key is not reachable from the one it proved before", at: "signature" }, 403);
+      }
+      await binding.pins.pin(caller.database, reached.id);
+    }
+  }
+  return { policy: decided.policy };
+}
 
 /** `Cache-Control` for what the body already states. The body is normative — a proxy may strip a
  *  header and a caller must not have to trust one — but a responder that states reuse in the body
@@ -164,12 +240,22 @@ export async function handle(request: Request, binding: Binding): Promise<Respon
   if (route === "read" || route === "price") {
     const refusal = method(request, "POST");
     if (refusal !== null) return refusal;
-    const body = await read(request, binding.maxBody ?? MAX_BODY);
-    if (body instanceof Response) return body;
-    const req = body as ReadRequest;
+    const raw = await body(request, binding.maxBody ?? MAX_BODY);
+    if (raw instanceof Response) return raw;
+    // Who is calling is settled before the body is parsed as a request, so an unauthorized caller is
+    // told so rather than told what is wrong with a request it may not submit at all.
+    const authorized = await authorize(request, binding, raw);
+    if (authorized instanceof Response) return authorized;
+    let req: ReadRequest;
     try {
-      if (route === "price") return json({ v: WIRE_VERSION, cost: price(req, serveOptions(binding)) });
-      const served = await serve(req, serveOptions(binding));
+      req = JSON.parse(raw) as ReadRequest;
+    } catch {
+      return json({ error: "body is not JSON" }, 400);
+    }
+    const options = serveOptions(binding, authorized.policy);
+    try {
+      if (route === "price") return json({ v: WIRE_VERSION, cost: price(req, options) });
+      const served = await serve(req, options);
       return json(encodeRead(served, binding.surface), 200, { "cache-control": cacheControl(served.cache) });
     } catch (e) {
       if (e instanceof Refused) return json({ error: e.message, at: e.at, offset: e.offset }, 400);
@@ -198,7 +284,7 @@ function method(request: Request, allowed: "GET" | "POST"): Response | null {
  * byte is read, but it is a claim and a chunked body carries none, so the decoded text is checked as
  * well — before `JSON.parse`, which is the work a 413 exists to refuse.
  */
-async function read(request: Request, maxBody: number): Promise<unknown | Response> {
+async function body(request: Request, maxBody: number): Promise<string | Response> {
   const claimed = request.headers.get("content-length");
   if (claimed !== null && Number(claimed) > maxBody) {
     return json({ error: `body of ${claimed} bytes, the maximum is ${maxBody}` }, 413);
@@ -212,9 +298,8 @@ async function read(request: Request, maxBody: number): Promise<unknown | Respon
   // Bytes, not characters: a body of multi-byte text is as expensive as its bytes.
   const bytes = new TextEncoder().encode(text).byteLength;
   if (bytes > maxBody) return json({ error: `body of ${bytes} bytes, the maximum is ${maxBody}` }, 413);
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return json({ error: "body is not JSON" }, 400);
-  }
+  // Returned as text and not as parsed JSON, because the signature covers a digest OF THE BYTES: a
+  // body re-serialized from a parse is a different body, and verifying against one would make the
+  // signature depend on this implementation's JSON writer.
+  return text;
 }
