@@ -153,6 +153,10 @@ export class SqlStore implements Store {
   }
 
   edges(id1: Id, atype: number, after: Cursor | null, n: number): Promise<Maybe<EdgePage>> {
+    // A token is another database's own continuation, and this host holds no part of that database.
+    // Loud rather than ignored: silently reading from the head would answer a later page with the
+    // first one.
+    if (after?.token !== undefined) throw new TypeError("a host cannot place another database's continuation token");
     if (!this.owns(id1)) return Promise.resolve(UNKNOWN);
     // One row past the limit: it says only whether the list goes on.
     const stmt = PAGE[this.format];

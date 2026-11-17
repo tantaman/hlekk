@@ -47,6 +47,7 @@ export class HostStore implements Store {
   }
 
   edges(id1: Id, atype: number, after: Cursor | null, n: number): Promise<Maybe<EdgePage>> {
+    if (after?.token !== undefined) throw new TypeError("a host cannot place another database's continuation token");
     if (!this.host.owns(id1)) return Promise.resolve(UNKNOWN);
     // SELECT id2, time, data FROM assocs WHERE id1 = ? AND atype = ? AND (time, id2) < (?, ?)
     // ORDER BY time DESC, id2 DESC LIMIT n + 1 -- the extra row only says whether the list goes on.
@@ -93,6 +94,9 @@ export interface KnownRun {
   from: Cursor | null;
   rows: Edge[];
   complete: boolean;
+  /** For a list another database holds: where IT says the run continues. The coordinator cannot work
+   *  that out — the responder dropped whatever its policy hides — so it carries what it was told. */
+  next?: string;
 }
 
 /** The coordinator's normalized graph: everything hosts have shipped back so far. */
@@ -115,7 +119,28 @@ export class Cache {
     // Nothing known yet: the segment is the run, starting wherever it was read from. A plan can name
     // a starting cursor, so the first read of a list is not always a read of its head.
     if (!cur) {
-      this.lists.set(k, { from: after, rows: s.rows, complete: s.complete });
+      this.lists.set(k, { from: after, rows: s.rows, complete: s.complete, ...(s.next !== undefined ? { next: s.next } : {}) });
+      return;
+    }
+    // A list another database holds joins by TOKEN and not by sort key: the rows the responder
+    // dropped are rows this side never saw, so the last row it holds is not where the next page
+    // began. Only the token the responder handed back says that.
+    if (after?.token !== undefined || cur.next !== undefined || s.next !== undefined) {
+      if (after?.token !== undefined && cur.next === after.token) {
+        this.lists.set(k, {
+          from: cur.from,
+          rows: [...cur.rows, ...s.rows],
+          complete: s.complete,
+          ...(s.next !== undefined ? { next: s.next } : {}),
+        });
+        return;
+      }
+      if (after === null && (s.complete || s.rows.length > cur.rows.length || cur.from !== null)) {
+        // A re-read of the head supersedes whatever was held, as it does for a local list.
+        this.lists.set(k, { from: null, rows: s.rows, complete: s.complete, ...(s.next !== undefined ? { next: s.next } : {}) });
+      }
+      // Anything else is two runs of a foreign list that do not meet, and joining them would invent
+      // adjacency across rows a policy removed.
       return;
     }
     if (after === null) {
@@ -152,6 +177,21 @@ export class Cache {
   page(id1: Id, atype: number, after: Cursor | null, n: number): Maybe<EdgePage> {
     const list = this.lists.get(listKey(id1, atype));
     if (!list) return UNKNOWN;
+    // A foreign list is addressed by token, and a run is only an answer to the read that asked for
+    // the token it starts at. Anything else is UNKNOWN, which sends the read to the database that
+    // holds the list — the only party that can place a token.
+    if (after?.token !== undefined) {
+      if (list.from?.token !== after.token) return UNKNOWN;
+      const rows = list.rows.slice(0, n);
+      return { rows, complete: list.complete && n >= list.rows.length, ...(list.next !== undefined ? { next: list.next } : {}) };
+    }
+    if (list.from?.token !== undefined) return UNKNOWN; // held from a token, asked for by sort key
+    if (list.next !== undefined) {
+      // A head read of a foreign list: the run is what it is, and `next` is where it goes on.
+      if (list.from !== null) return UNKNOWN;
+      const rows = list.rows.slice(0, n);
+      return { rows, complete: list.complete && n >= list.rows.length, next: list.next };
+    }
     // The known run has to cover where this read starts, or its rows say nothing about it.
     if (after === null) {
       if (list.from !== null) return UNKNOWN;

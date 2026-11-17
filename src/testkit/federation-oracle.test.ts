@@ -36,6 +36,7 @@ import { assertSound } from "./invariants.ts";
 
 const A = "https://a.example/db";
 const B = "https://b.example/db";
+const C = "https://c.example/db";
 
 /** The lock, with every edge type that CAN be foreign marked as one, and which atypes those are.
  *
@@ -72,7 +73,7 @@ interface Built {
   split: string[];
 }
 
-async function fuzzCase(seed: number): Promise<Built | null> {
+async function fuzzCase(seed: number, databases: readonly string[] = [A, B]): Promise<Built | null> {
   const r = seeded(seed);
   // No inverse pairs and no cascades, so every stored edge type MAY cross. Both are what the
   // catalog refuses `foreign` on, and a schema of mostly paired types is one whose edges mostly
@@ -109,12 +110,15 @@ async function fuzzCase(seed: number): Promise<Built | null> {
   const laid = await replay(control.client(), shape, script, () => control.deliverAll());
 
   // The split: the same script across two databases.
-  const split = splitOf(script, crossing, seeded(seed ^ 0x7c3a), [A, B], { payloadRefsCross: true });
+  const split = splitOf(script, crossing, seeded(seed ^ 0x7c3a), databases, { payloadRefsCross: true });
   const f = await federate({
-    members: [
-      { uri: A, lock, database: "a", batch: 64, runtime: deterministic(seed) },
-      { uri: B, lock, database: "b", batch: 64, runtime: deterministic(seed ^ 1) },
-    ],
+    members: databases.map((uri, i) => ({
+      uri,
+      lock,
+      database: `db${i}`,
+      batch: 64,
+      runtime: deterministic(seed ^ i),
+    })),
   });
   const again = await replaySplit(f, shape, script, split, async () => {
     for (const m of f.members.values()) await m.cluster.deliverAll();
@@ -138,9 +142,6 @@ async function fuzzCase(seed: number): Promise<Built | null> {
     generateQuery(seeded(seed ^ 0x9e37), shape, pick.t, shape.types[pick.t].gen(id) as unknown as Query<never, unknown>, {
       depth,
       width: 2,
-      // A count below the root is a count of an object that may be in the other database, which is
-      // a request with `counts` and step 6's work. The root is always local, so its counts are not.
-      countsBelow: 0,
     });
 
   return {
@@ -177,13 +178,13 @@ function anonymize(answer: Json, spellings: readonly { id: string; at: number }[
   // holds the object in the split, because a bare payload id IS responder-relative. Position
   // mapping has already run, so a real id of 0 is gone by here.
   text = text.split('"0"').join('"@nowhere"');
-  for (const uri of [A, B]) text = text.split(`"${uri}#0"`).join('"@nowhere"');
+  for (const uri of [A, B, C]) text = text.split(`"${uri}#0"`).join('"@nowhere"');
   // A cursor is storage coordinates and not part of what the answer MEANS: it carries the target's
   // alias and its id in its own database, so the same page of the same list has a different cursor
   // once the list holds a foreign row. Whether there IS one is kept, because that says whether the
   // list can be continued. What a cursor over a list in another database should be to an
   // application is open in PLAN.md, and this is where that openness shows.
-  return text.replace(/"cursor":"v\d+:[^"]*"/g, '"cursor":"<cursor>"');
+  return text.replace(/"cursor":"(?:v\d+|t2):[^"]*"/g, '"cursor":"<cursor>"');
 }
 
 /**
@@ -207,7 +208,7 @@ describe("the federation oracle, fuzzed", () => {
   // database and bring back the objects it points at. A query that then keeps going inside that
   // database is Milestone B, and the test below pins that it is refused by name rather than answered
   // short.
-  it("answers a one-hop query across two databases as one database holding both graphs would", async () => {
+  it("answers a query at depth across two databases as one database holding both graphs would", async () => {
     let checked = 0;
     let crossed = 0;
     let answered = 0;
@@ -217,11 +218,11 @@ describe("the federation oracle, fuzzed", () => {
       if (!built) continue;
       const { control, f, map, root, rootType, query, crossings } = built;
 
-      const expected = anonymize(await run(control.client(), query(map.control[root]!, 1)), spellingsOf(map));
+      const expected = anonymize(await run(control.client(), query(map.control[root]!, 3)), spellingsOf(map));
       const home = f.member(map.where[root]!);
       // The split's ids are its own, and an object in the other database is named by a reference, so
       // both spellings map to the same position: either is what an answer could carry.
-      const got = anonymize(await run(home.db, query(map.local[root]!, 1)), spellingsOf(map, map.where[root]!));
+      const got = anonymize(await run(home.db, query(map.local[root]!, 3)), spellingsOf(map, map.where[root]!));
 
       assert.equal(
         got,
@@ -242,6 +243,26 @@ describe("the federation oracle, fuzzed", () => {
     assert.ok(answered > checked / 2, `most answers should hold rows, got ${answered} of ${checked}`);
   });
 
+  // Three, so a read can leave A for B and leave B for C — and the coordinator asks C itself rather
+  // than B asking on its behalf. Cycles come free: the generated graph is not acyclic, and a split
+  // by component puts edges back and forth across every pair.
+  it("answers the same across three databases, cycles included", async () => {
+    let checked = 0;
+    let spread = 0;
+    for (let seed = 301; seed <= 318; seed++) {
+      const built = await fuzzCase(seed, [A, B, C]);
+      if (!built) continue;
+      const { control, f, map, root, query, crossings } = built;
+      const expected = anonymize(await run(control.client(), query(map.control[root]!, 3)), spellingsOf(map));
+      const got = anonymize(await run(f.member(map.where[root]!).db, query(map.local[root]!, 3)), spellingsOf(map, map.where[root]!));
+      assert.equal(got, expected, `seed ${seed}: a query over three databases disagreed (${crossings} crossing edges)`);
+      spread = Math.max(spread, new Set(map.where).size);
+      checked++;
+    }
+    assert.ok(checked >= 12, `expected most seeds to produce a case, got ${checked}`);
+    assert.ok(spread === 3, `the graph has to actually land in three databases, saw ${spread}`);
+  });
+
   it("gives the same answer under both drivers when the query crosses a boundary", async () => {
     let crossed = 0;
     for (let seed = 101; seed <= 115; seed++) {
@@ -250,7 +271,7 @@ describe("the federation oracle, fuzzed", () => {
       const { f, map, root, query, crossings } = built;
       const home = f.member(map.where[root]!);
       const ids = spellingsOf(map, map.where[root]!);
-      const plan = () => query(map.local[root]!, 1);
+      const plan = () => query(map.local[root]!, 3);
       assert.equal(
         anonymize((await plan().run(home.db, { driver: "rounds" })) as unknown as Json, ids),
         anonymize((await plan().run(home.db, { driver: "async" })) as unknown as Json, ids),
@@ -261,30 +282,31 @@ describe("the federation oracle, fuzzed", () => {
     assert.ok(crossed >= 3, `edges have to cross, saw at most ${crossed}`);
   });
 
-  // The other half of "failure is stated, never inferred". A deeper query reaches a list that lives
-  // in the other database, and this step fetches objects across a boundary and nothing else — so it
-  // has to fail by name. An answer that was short by one level, or an empty list where the truth is
-  // "ask that database", would be a wrong answer that looks like a right one.
-  it("refuses a deeper query by name rather than answering it short", async () => {
-    let refused = 0;
-    let agreed = 0;
-    for (let seed = 201; seed <= 220; seed++) {
+  // What **the query riding inside one database** buys: the coordinator sends a frame's subtree as
+  // hops, so the responder's own engine does the traversal below the objects it was asked for. A
+  // traversal of depth n inside one database therefore costs one request rather than n.
+  it("asks a database once per dependent level and not once per hop", async () => {
+    let deepest = 0;
+    for (let seed = 401; seed <= 430; seed++) {
       const built = await fuzzCase(seed);
       if (!built) continue;
-      const { control, f, map, root, query } = built;
+      const { f, map, root, query, crossings } = built;
+      if (crossings === 0) continue;
       const home = f.member(map.where[root]!);
-      try {
-        const got = anonymize(await run(home.db, query(map.local[root]!, 3)), spellingsOf(map, map.where[root]!));
-        // A query that never reached a foreign list still has to agree.
-        const expected = anonymize(await run(control.client(), query(map.control[root]!, 3)), spellingsOf(map));
-        assert.equal(got, expected, `seed ${seed}: a deep query that stayed answerable disagreed`);
-        agreed++;
-      } catch (e) {
-        assert.equal((e as Error).name, "NotFollowed", `seed ${seed}: ${(e as Error).message}`);
-        refused++;
+      const away = [...f.members.values()].find((m) => m.uri !== home.uri)!;
+      away.served.read = 0;
+      await run(home.db, query(map.local[root]!, 3));
+      // One request would be the floor: the first level that needs the other database. Each further
+      // level that DEPENDS on what came back is another, because the coordinator cannot ask for what
+      // it does not yet know the ids of. What it must not be is one per hop per object.
+      if (away.served.read > 0) {
+        assert.ok(
+          away.served.read <= 4,
+          `seed ${seed}: ${away.served.read} requests to one database for a depth-3 query, which is per-hop and not per-level`,
+        );
+        deepest = Math.max(deepest, away.served.read);
       }
     }
-    assert.ok(refused > 0, "some deep query has to reach a list in the other database");
-    assert.ok(agreed > 0, "and some has to stay answerable, or this says nothing about the ones that do");
+    assert.ok(deepest > 0, "some query has to have reached the other database at all");
   });
 });

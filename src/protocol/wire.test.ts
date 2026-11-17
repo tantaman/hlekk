@@ -118,6 +118,22 @@ describe("the wire format", () => {
 describe("decoding a stranger's answer", () => {
   const good = async () => roundTrip(encodeRead((await answer()).served, surfaceOf(SERVED_CATALOG))) as Record<string, unknown>;
 
+  it("accepts a reference in a list, which is what an unfollowed one looks like", async () => {
+    const body = await good();
+    const lists = body.lists as Record<string, { ids: string[]; edges?: unknown[] }>;
+    const key = Object.keys(lists)[0]!;
+    const entry = lists[key]!;
+    const forged = {
+      ...body,
+      lists: { [key]: { ids: ["https://elsewhere.example/db#5"], cursor: null, more: false } },
+    };
+    const decoded = decodeRead(forged, SERVED_CATALOG);
+    // The reference is kept and no object stands behind it. That is the only way a caller can tell
+    // "the responder holds a reference it will not follow" from "there is nothing there".
+    assert.deepEqual(decoded.result.lists[key]!.ids, ["https://elsewhere.example/db#5"]);
+    void entry;
+  });
+
   it("refuses an object key that is not a bare id of the database answering", async () => {
     const body = await good();
     const objects = body.objects as Record<string, unknown>;
@@ -184,7 +200,10 @@ describe("decoding a stranger's answer", () => {
     const cases: [unknown, string][] = [
       [{ ids: ["5"], cursor: 7, more: false }, `${at}.cursor`],
       [{ ids: ["5"], cursor: null, more: "no" }, `${at}.more`],
-      [{ ids: ["https://x.example/db#5"], cursor: null, more: false }, `${at}.ids[0]`],
+      // A reference is fine in a list — it is how an unfollowed one is reported — but not a
+      // non-canonical spelling of one.
+      [{ ids: ["https://X.example/db#5"], cursor: null, more: false }, `${at}.ids[0]`],
+      [{ ids: ["5x"], cursor: null, more: false }, `${at}.ids[0]`],
     ];
     for (const [entry, where] of cases) {
       const err = caught(() => decodeRead({ ...body, lists: { [key]: entry } }, SERVED_CATALOG)) as WireError;

@@ -261,7 +261,7 @@ export async function handle(request: Request, binding: Binding): Promise<Respon
       if (e instanceof Refused) return json({ error: e.message, at: e.at, offset: e.offset }, 400);
       // Everything else, a `WireError` included, is this database failing: naming its own types is
       // not something the caller did, so it is a fault here and not a 400.
-      return fault();
+      return fault(e);
     }
   }
 
@@ -269,7 +269,11 @@ export async function handle(request: Request, binding: Binding): Promise<Respon
 }
 
 /** A 500 that says nothing. A stranger learns that this database broke, not how. */
-const fault = (): Response => json({ error: "internal error" }, 500);
+const fault = (e?: unknown): Response => {
+  // Logged, not sent: a deployment's operator has to be able to find this, and a stranger must not.
+  if (e !== undefined) console.error("hlekk: a read faulted", e);
+  return json({ error: "internal error" }, 500);
+};
 
 function method(request: Request, allowed: "GET" | "POST"): Response | null {
   if (request.method === allowed) return null;

@@ -9,7 +9,7 @@
 // It is a serializer, not a mechanism: the coordinator already gathers exactly this, and `materialize`
 // throws it away on the way out.
 
-import { encodeCursor } from "../schema/query.ts";
+import { encodeCursor, encodeToken } from "../schema/query.ts";
 import type { Cache } from "./stores.ts";
 import { listKey } from "./types.ts";
 import type { Fields, Id, Json, Plan } from "./types.ts";
@@ -124,6 +124,11 @@ function continuation(
   if (source.kind !== "edge") return { cursor: null, more: false };
   const run = graph.lists.get(listKey(parent, source.atype));
   if (!run) return { cursor: null, more: false };
+  // A list another database holds continues from the token it handed back, wrapped so an application
+  // can hold it and give it straight back. What such a token should MEAN to an application — whose
+  // clock its `time` is, whether it survives the responder's own rotation of them — is open in
+  // PLAN.md; what is settled is that the responder owns it and this side does not invent one.
+  if (run.next !== undefined) return { cursor: encodeToken(run.next), more: true };
   const last = run.rows[Math.min(returned, run.rows.length) - 1];
   const cursor = last ? encodeCursor(last.time, last.db, last.id2) : null;
   return { cursor, more: returned < run.rows.length || !run.complete };

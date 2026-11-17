@@ -86,7 +86,23 @@ export interface Cursor {
   time: number;
   db: number;
   id2: Id;
+  /**
+   * A continuation this database did not mint, for a list that lives in another one.
+   *
+   * Exclusive with the three fields above: when it is set they are placeholders and nothing orders
+   * by them. A responder drops rows the caller may not see, so the last VISIBLE row is not where the
+   * list resumes — only the responder knows that, and it says so in the page it answers. Trying to
+   * continue a foreign list from the caller's own sort key would silently skip whatever the policy
+   * removed at the boundary.
+   */
+  token?: string;
 }
+
+/** Whether a continuation is a token the database holding the list handed back. */
+export const isToken = (after: Cursor | null): boolean => after?.token !== undefined;
+
+/** A cursor that is only a token. The sort key is a placeholder: nothing compares it. */
+export const tokenCursor = (token: string): Cursor => ({ time: 0, db: 0, id2: "0", token });
 
 /** Numeric order over canonical decimal ids: length first, then lexicographic. A host orders by the
  *  8-byte big-endian blob, which sorts numerically, so the coordinator has to agree with it or a
@@ -131,9 +147,13 @@ export class ForeignEdge extends Error {
  * with nothing to mark it as one.
  */
 export function targetOf(e: Edge): Ref {
+  // The resolved reference wins where there is one. A row in a list that another database answered
+  // carries its target as a reference and no alias of this database's — there is nothing for an
+  // alias to mean, since the ordering is the responder's — so `target` is the only thing that says
+  // which object it is.
+  if (e.target !== undefined) return e.target;
   if (e.db === 0) return e.id2;
-  if (e.target === undefined) throw new ForeignEdge(e);
-  return e.target;
+  throw new ForeignEdge(e);
 }
 
 /** The storage coordinates an edge list is ordered by. Separate from `targetOf` because the order is
@@ -164,6 +184,9 @@ export const referenceRow = (ref: Ref, edge: Edge): Row => ({
 export interface EdgePage {
   rows: Edge[];
   complete: boolean;
+  /** Where the database holding this list says it continues, for a list this database does not hold.
+   *  Absent for a local list, which continues from its own last row. */
+  next?: string;
 }
 
 // ---- plans
@@ -217,6 +240,7 @@ export function missKey(m: Miss): string {
   // a local object can have the same low half, and one key for both would drop one of them.
   if (m.kind === "object") return m.db ? `o:${m.db}:${m.id}` : `o:${m.id}`;
   if (m.kind === "count") return `c:${listKey(m.id1, m.atype)}`;
+  if (m.after?.token !== undefined) return `e:${listKey(m.id1, m.atype)}:t:${m.after.token}`;
   return `e:${listKey(m.id1, m.atype)}:${m.after ? `${m.after.time}:${m.after.db}:${m.after.id2}` : "head"}`;
 }
 

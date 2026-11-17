@@ -80,6 +80,37 @@ export interface WriteOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
+/**
+ * What one query may spend reaching other databases.
+ *
+ * Per query, not per client: a foreign client is built once per isolate and a budget that lived
+ * there would be shared by every query the isolate runs, which is the opposite of what it is for.
+ * One tenant's query latency is partly another tenant's problem the moment a hop crosses the
+ * internet, and three numbers are what bound it — a deadline, how many requests, and how many
+ * databases.
+ */
+export interface Budget {
+  /** Milliseconds for the whole query's foreign hops. */
+  deadlineMs?: number;
+  /** Requests to other databases. */
+  requests?: number;
+  /** Databases one query may reach. */
+  databases?: number;
+}
+
+export const DEFAULT_BUDGET: Required<Budget> = { deadlineMs: 15_000, requests: 64, databases: 8 };
+
+/** A query's budget, spent. `what` is which of the three ran out, so a caller can raise the right
+ *  one rather than guessing. */
+export class BudgetSpent extends Error {
+  readonly what: "deadline" | "requests" | "databases";
+  constructor(what: "deadline" | "requests" | "databases", detail: string) {
+    super(`this query's foreign-hop budget is spent: ${detail}`);
+    this.name = "BudgetSpent";
+    this.what = what;
+  }
+}
+
 export interface QueryOptions {
   /** Rounds sends every outstanding read and waits; async lets each branch move on when its own data
    *  lands. Async is the default: its latency is the longest chain of dependent reads. */
@@ -91,6 +122,8 @@ export interface QueryOptions {
    * does — see `Foreign` in `query/ops.ts` for why that is not an option but a rule.
    */
   foreign?: Foreign;
+  /** What this query may spend reaching other databases. Defaults to `DEFAULT_BUDGET`. */
+  budget?: Budget;
 }
 
 /** This database's own URI and the aliases it has allocated, read once per isolate. */
@@ -226,7 +259,7 @@ export class Hlekk {
   /** The answer and the graph it was read from. The builder uses the graph for cursors; `normalized`
    *  turns it into a result that holds each object once. */
   async answer(plan: Plan, rootIds: Id[], opts: QueryOptions = {}): Promise<Answer> {
-    const route = await this.#router(rootIds.filter((id) => !isQualified(id)).map(vshardOf));
+    const route = await this.#router(rootIds.filter((id) => !isQualified(id)).map(vshardOf), opts.budget);
     // The async driver's batching window is a deferred turn, so it goes through the clock too: a
     // virtual one closes the window without waiting, and closes it at a repeatable point.
     return opts.driver === "rounds"
@@ -243,10 +276,14 @@ export class Hlekk {
    * many of its objects a query needs — the same property that makes a wide local fan-out one
    * request per host.
    */
-  async #router(seed: readonly bigint[]): Promise<(id: Ref) => HostClient> {
+  async #router(seed: readonly bigint[], budget?: Budget): Promise<(id: Ref) => HostClient> {
     await this.routes.routeAll(seed);
+    const spending = this.#budget(budget);
     return (id: Ref) => {
-      if (isQualified(id)) return this.#foreignClientFor(parseRef(id).db!);
+      if (isQualified(id)) {
+        const database = parseRef(id).db!;
+        return spending(database, this.#foreignClientFor(database));
+      }
       const vshard = vshardOf(id);
       const route = this.routes.peek(vshard);
       // A driver's route() is synchronous, so a vshard the cache has never seen cannot be resolved
@@ -254,6 +291,48 @@ export class Hlekk {
       // sending, so the guess costs nothing.
       const host = route?.host ?? this.#anyHost();
       return this.#clientFor(host);
+    };
+  }
+
+  /**
+   * One query's budget, as a wrapper around whichever foreign client it reaches for.
+   *
+   * The wrapper and not the client, because the client is cached for the isolate and the budget is
+   * not. Every hop goes through here, so the three numbers are enforced in one place and a refusal
+   * says which ran out.
+   */
+  #budget(given: Budget | undefined): (database: string, client: HostClient) => HostClient {
+    const budget = { ...DEFAULT_BUDGET, ...given };
+    const until = this.clock.now() + budget.deadlineMs;
+    const reached = new Set<string>();
+    let requests = budget.requests;
+    // One wrapper per database per query, and not one per call. Both drivers batch by client
+    // IDENTITY, so a fresh object per miss would put every miss in its own batch — twelve objects in
+    // one database would be twelve requests, which is exactly what the batching exists to avoid.
+    const wrapped = new Map<string, HostClient>();
+    const wrap = (database: string, client: HostClient): HostClient => ({
+      exec: async (plan, tasks) => {
+        if (this.clock.now() > until) {
+          throw new BudgetSpent("deadline", `${budget.deadlineMs} ms for foreign hops, and ${database} was still to ask`);
+        }
+        if (requests <= 0) {
+          throw new BudgetSpent("requests", `${budget.requests} requests to other databases, and ${database} was still to ask`);
+        }
+        if (!reached.has(database) && reached.size >= budget.databases) {
+          throw new BudgetSpent(
+            "databases",
+            `${budget.databases} databases, and ${database} would be the ${reached.size + 1}st`,
+          );
+        }
+        reached.add(database);
+        requests--;
+        return client.exec(plan, tasks);
+      },
+    });
+    return (database, client) => {
+      let held = wrapped.get(database);
+      if (!held) wrapped.set(database, (held = wrap(database, client)));
+      return held;
     };
   }
 

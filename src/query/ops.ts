@@ -7,7 +7,8 @@
 // window, a node's relationships), so a remote store can batch them and a slow branch doesn't hold up
 // the rest.
 
-import { UNKNOWN, cursorOf, isReference, referenceRow, targetOf } from "./types.ts";
+import { isQualified } from "./ref.ts";
+import { UNKNOWN, cursorOf, isReference, referenceRow, targetOf, tokenCursor } from "./types.ts";
 import type { Cond, Cursor, Edge, End, Fields, Id, Json, Maybe, Miss, Node, Obj, Plan, Ref, Row, Store, Stream, Unknown } from "./types.ts";
 
 export const DEFAULT_LIMIT = 50;
@@ -196,7 +197,10 @@ export class EdgeHop implements Op {
         if (o !== null) yield node({ obj: o, edge: e }); // an edge to a deleted object is dropped
       }
       if (page.complete || page.rows.length === 0) return "done";
-      after = cursorOf(page.rows[page.rows.length - 1]!);
+      // The responder's own token where it gave one, and this database's sort key otherwise. A
+      // foreign list cannot be continued from the last row the caller can see: the rows between it
+      // and the next page are the ones the policy removed.
+      after = page.next !== undefined ? tokenCursor(page.next) : cursorOf(page.rows[page.rows.length - 1]!);
     }
   }
 }
@@ -246,9 +250,18 @@ export class FieldHop implements Op {
   async *fetch(p: Pass, req: Req): Stream {
     const id = req.parent?.obj.data[this.field];
     if (typeof id !== "string") return "done";
-    // A payload id may be qualified: that is the other place `query/ref.ts` allows one. A host
-    // answers UNKNOWN for it rather than refusing, and this is the miss that sends it to the
-    // database that holds it — already absolute, since a payload carries the URI and not an alias.
+    // A payload id may be qualified: that is the other place `query/ref.ts` allows one. A database
+    // ANSWERING a read does not follow one, for the same reason it does not follow an edge — it
+    // would be fetching from a third party on the caller's behalf — so the reference is listed and
+    // nothing is loaded. The edge is synthetic: a field relationship stores nothing, so there is no
+    // row that reached this one.
+    if (p.foreign === "reference" && isQualified(id)) {
+      yield node(referenceRow(id, { id1: req.parent!.obj.id, atype: -1, db: 1, id2: id, target: id, time: 0, data: null }));
+      return "done";
+    }
+    // A host answers UNKNOWN for a qualified reference rather than refusing, and this is the miss
+    // that sends it to the database that holds it — already absolute, since a payload carries the
+    // URI and not an alias.
     const o = await p.store.object(id, this.frame);
     if (o === UNKNOWN) {
       p.miss({ kind: "object", id, frame: this.frame });
