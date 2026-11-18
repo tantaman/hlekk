@@ -279,7 +279,7 @@ describe("a hint's answer", () => {
     }
     const get = await f.fetch(`${WIKI}/hint`);
     assert.equal(get.status, 405);
-    assert.equal(get.headers.get("allow"), "POST");
+    assert.equal(get.headers.get("allow"), "POST, OPTIONS");
   });
 
   it("is a refusal for a database hinting itself", async () => {

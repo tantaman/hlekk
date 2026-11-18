@@ -39,6 +39,7 @@ import type { ReadRequest } from "../query/serve.ts";
 import { DESCRIPTOR_VERSION } from "./http.ts";
 import { WIRE_VERSION, decodeRead } from "./wire.ts";
 import { reachable, signRequest, wellFormed } from "./identity.ts";
+import { retryAfterOf } from "./backoff.ts";
 import type { KeyPair, SignedHeaders } from "./identity.ts";
 import type { Descriptor } from "./http.ts";
 
@@ -60,10 +61,14 @@ export class ForeignRefused extends Error {
 
 export class ForeignUnreachable extends Error {
   readonly database: string;
-  constructor(database: string, why: string) {
+  /** Seconds the database asked to be left alone for, when what it said was "not now" — a 429 or a
+   *  503 with `Retry-After`. Absent for every other way of not being readable. */
+  readonly retryAfter?: number;
+  constructor(database: string, why: string, retryAfter?: number | null) {
     super(`${database} could not be read: ${why}`);
     this.name = "ForeignUnreachable";
     this.database = database;
+    if (retryAfter !== undefined && retryAfter !== null) this.retryAfter = retryAfter;
   }
 }
 
@@ -149,6 +154,17 @@ export interface ForeignOptions {
    */
   cache?: ResponseCache;
   /**
+   * Keeps a database's descriptor for as long as that database said it may be kept, and asks again
+   * with its validator after that.
+   *
+   * Absent, the descriptor is read before every batch, which is what this did before a responder
+   * said anything about how long one is good for. Present, a caller goes up to that long — and never
+   * more than `MAX_DESCRIPTOR_SECONDS` — without re-checking the database's keys against its pin.
+   * That is the same trade an answer's `seconds` already is: what this database knows about another
+   * is as old as the other said it may be.
+   */
+  descriptors?: DescriptorCache;
+  /**
    * Checks that the two catalogs mean the same thing by a type name, once per database and type.
    *
    * A globally unique name says nothing about whether the reader knows the shape behind it, so a
@@ -192,6 +208,49 @@ export class ResponseCache {
     if (this.#held.size >= 128) this.#held.delete(this.#held.keys().next().value!);
     this.#held.set(key, { body, until: now + seconds * 1000 });
   }
+}
+
+/** The longest a descriptor is kept without asking again, whatever its database claims. A
+ *  responder may say a year; a caller that believed it would not look at that database's keys for a
+ *  year. Five minutes is the signature window, which is already how stale two databases' views of
+ *  each other are allowed to be. */
+export const MAX_DESCRIPTOR_SECONDS = 300;
+
+/** Descriptors, each kept for as long as its database permitted and revalidated after. One per
+ *  asking database, held for the life of an isolate. */
+export class DescriptorCache {
+  readonly #held = new Map<string, { descriptor: Descriptor; etag: string | null; until: number }>();
+  /** Descriptors answered from here without a request, for a test that counts them. */
+  hits = 0;
+  /** Descriptors a responder confirmed unchanged with a 304. */
+  confirmed = 0;
+
+  peek(db: string): { descriptor: Descriptor; etag: string | null; until: number } | undefined {
+    return this.#held.get(db);
+  }
+
+  /** Whether a descriptor for this database would be answered from here right now. */
+  fresh(db: string, now: number = Date.now()): boolean {
+    const held = this.#held.get(db);
+    return held !== undefined && held.until > now;
+  }
+
+  /** `seconds` below zero is "do not keep this at all"; zero keeps it only to ask "has it changed". */
+  put(db: string, descriptor: Descriptor, etag: string | null, seconds: number, now: number): void {
+    this.#held.delete(db);
+    if (seconds < 0 || (seconds === 0 && etag === null)) return;
+    if (this.#held.size >= 256) this.#held.delete(this.#held.keys().next().value!);
+    this.#held.set(db, { descriptor, etag, until: now + Math.min(seconds, MAX_DESCRIPTOR_SECONDS) * 1000 });
+  }
+}
+
+/** How long a response says it may be reused, from `Cache-Control`: -1 for `no-store`, 0 where it
+ *  says nothing a cache can act on, otherwise `max-age`. */
+function freshFor(headers: Headers): number {
+  const control = (headers.get("cache-control") ?? "").toLowerCase();
+  if (control.includes("no-store")) return -1;
+  const age = /(?:^|[\s,])max-age=(\d{1,9})/.exec(control);
+  return age === null ? 0 : Number(age[1]);
 }
 
 /** The registry's pin columns, as the asking half needs them. */
@@ -662,7 +721,7 @@ function fieldEdge(catalog: Catalog, field: string): string | undefined {
   return matches.length === 1 ? matches[0].name : undefined;
 }
 
-export type TransportOptions = Pick<ForeignOptions, "fetch" | "guard" | "maxResponseBytes" | "deadlineMs">;
+export type TransportOptions = Pick<ForeignOptions, "fetch" | "guard" | "maxResponseBytes" | "deadlineMs" | "descriptors" | "now">;
 
 /** What came back, before anyone has decided what it means. */
 export interface Exchanged {
@@ -724,12 +783,20 @@ export async function exchange(
 /** A request whose only acceptable answer is a JSON body. A refusal is named as one, with the path
  *  the responder gave; anything else that is not a success is the database not being readable. */
 export async function readJson(db: string, url: string, opts: TransportOptions, init: RequestInit, spend?: () => AbortSignal): Promise<unknown> {
-  const res = await exchange(db, url, opts, init, spend);
+  return jsonOf(db, await exchange(db, url, opts, init, spend));
+}
+
+/** The JSON a successful answer carries, or the error its status is. */
+function jsonOf(db: string, res: Exchanged): unknown {
   if ([400, 401, 403].includes(res.status)) {
     const refusal = refusalOf(res.body);
     throw new ForeignRefused(db, `${refusal?.at ?? "?"}: ${refusal?.error ?? `status ${res.status}`}`);
   }
-  if (res.status < 200 || res.status > 299) throw new ForeignUnreachable(db, `status ${res.status}`);
+  if (res.status < 200 || res.status > 299) {
+    // "Not now" keeps its number. A caller that retries at once after a 429 is the reason there is
+    // a 429, and the only way it can do otherwise is to be handed how long.
+    throw new ForeignUnreachable(db, `status ${res.status}`, retryAfterOf(res.headers));
+  }
   try {
     return parse(res.body);
   } catch {
@@ -797,9 +864,36 @@ export async function discoverPinned(
   return descriptor;
 }
 
-export async function discover(database: string, opts: TransportOptions, spend?: () => AbortSignal): Promise<Descriptor> {
+/**
+ * A database's descriptor, validated.
+ *
+ * With `opts.descriptors`, one that is still inside the lifetime its database gave it is answered
+ * without a request, and one past it is asked for with its validator — so a database whose
+ * descriptor has not changed says so in a 304 and sends nothing. `fresh` skips the first of those
+ * and still does the second: it is for the one caller with a reason to doubt what it holds, which
+ * is a responder shown a key id its copy of the caller's descriptor does not list.
+ */
+export async function discover(
+  database: string,
+  opts: TransportOptions & { fresh?: boolean },
+  spend?: () => AbortSignal,
+): Promise<Descriptor> {
   const db = canonicalDb(database);
-  const d = await readJson(db, db, opts, {}, spend) as Descriptor;
+  const cache = opts.descriptors;
+  const now = opts.now?.() ?? Date.now();
+  const held = cache?.peek(db);
+  if (cache !== undefined && held !== undefined && held.until > now && opts.fresh !== true) {
+    cache.hits++;
+    return held.descriptor;
+  }
+  const res = await exchange(db, db, opts, held?.etag ? { headers: { "if-none-match": held.etag } } : {}, spend);
+  if (res.status === 304 && cache !== undefined && held !== undefined) {
+    // Unchanged, on the database's own word, and good for however long it now says.
+    cache.confirmed++;
+    cache.put(db, held.descriptor, held.etag, freshFor(res.headers), now);
+    return held.descriptor;
+  }
+  const d = jsonOf(db, res) as Descriptor;
   if (!d || d.protocol !== "hlekk" || d.v !== DESCRIPTOR_VERSION || d.database !== db ||
       !Array.isArray(d.wire) || !d.wire.includes(WIRE_VERSION) || d.wire.some(v => !Number.isSafeInteger(v) || v < 1) ||
       !Number.isSafeInteger(d.catalog) || d.catalog < 0 ||
@@ -820,6 +914,14 @@ export async function discover(database: string, opts: TransportOptions, spend?:
   if (d.routes.hint !== undefined && d.routes.hint !== db + "/hint") {
     throw new ForeignUnreachable(db, "invalid descriptor route hint");
   }
+  if (d.routes.object !== undefined && d.routes.object !== db + "/objects/{id}") {
+    throw new ForeignUnreachable(db, "invalid descriptor route object");
+  }
+  if (d.routes.list !== undefined && d.routes.list !== db + "/objects/{id}/{edge}{?limit,after}") {
+    throw new ForeignUnreachable(db, "invalid descriptor route list");
+  }
+  // Kept only once it has passed everything above: a descriptor that is not one is not remembered.
+  cache?.put(db, d, res.headers.get("etag"), freshFor(res.headers), now);
   return d;
 }
 

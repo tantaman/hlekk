@@ -96,18 +96,106 @@ Every route is served under the database URI.
 | `{db}/read` | `POST` | [read request](schemas/read-request.json) | [read response](schemas/read-response.json) |
 | `{db}/price` | `POST` | [read request](schemas/read-request.json) | [price response](schemas/price-response.json) |
 | `{db}/hint` | `POST` | [hint](schemas/hint-request.json) | [hint response](schemas/hint-response.json), with `202` |
+| `{db}/objects/{id}` | `GET` | — | [read response](schemas/read-response.json) |
+| `{db}/objects/{id}/{edge}` | `GET` | — | [read response](schemas/read-response.json) |
 
-`{db}/hint` is **OPTIONAL** (§11). Every other route is **REQUIRED**.
+The first four routes are **REQUIRED**. `{db}/hint` is **OPTIONAL** (§11), and so are the two under
+`{db}/objects` (§3.2).
 
-- Every request and response body **MUST** be JSON, with `Content-Type: application/json`.
+- Every request and response body **MUST** be JSON, with `Content-Type: application/json`. A
+  response with no body — a `204`, a `304`, the answer to a `HEAD` — carries none.
 - A responder **MUST** answer `405` with an `Allow` header for a method a route does not take, and
   `404` for a path that is not one of its routes.
+- A responder **SHOULD** answer `HEAD` wherever it answers `GET`, with the same headers and no body.
+- A responder **SHOULD** answer `OPTIONS` on each of its routes with a `2xx` and an `Allow` header
+  naming every method the route takes.
 - A responder **MUST NOT** redirect. A caller **MUST NOT** follow a redirect: a database that moved
   is a different database.
 - A responder **MUST** state a maximum request body size in its descriptor, **MUST** answer `413` for
   a body over it, and **MUST** decide that before parsing the body.
 - A responder **MUST** serve its descriptor without requiring authentication. Verifying it would
   need the key it carries.
+
+**A header restates the body; it does not add to it.** Everything below in this section, and every
+header named anywhere in this document, is for a party that does not speak this protocol — a cache,
+a browser, a client with nothing but a way to fetch a URL. A caller that does speak it **MUST** be
+able to act on a response whose headers were stripped on the way, with one exception: `Retry-After`
+(§8), which is the only thing a `429` says that its body does not.
+
+### 3.1 `QUERY`
+
+A read is safe and idempotent, and `POST` cannot say so. A responder **MAY** therefore also take
+`QUERY` ([RFC 10008](https://www.rfc-editor.org/rfc/rfc10008)) on `{db}/read` and `{db}/price`.
+
+- A responder that takes `QUERY` **MUST** treat it as the same request `POST` would have been: the
+  same body, priced, refused and answered identically.
+- It **MUST** name `QUERY` in the `Allow` it sends for that route, and **SHOULD** send
+  `Accept-Query: application/json` on that route's responses.
+- It **MUST** refuse a `QUERY` that states no `Content-Type` with `400`, and one that states any
+  media type but `application/json` with `415`. This is RFC 10008's requirement, and it is stricter
+  than this protocol is about `POST`.
+- `POST` remains **REQUIRED**. A caller **MUST NOT** send `QUERY` to a responder it has not seen
+  name it, in an `Allow` or an `Accept-Query`.
+- A signature (§7.2) covers `@method`, so a request signed as one method is not a signature for the
+  other.
+
+### 3.2 Reading by URL
+
+A responder **MAY** serve two reads by `GET`, for whatever can only fetch a URL:
+
+| Request | Is exactly the read |
+| --- | --- |
+| `GET {db}/objects/{id}` | `{ "ids": ["{id}"] }` |
+| `GET {db}/objects/{id}/{edge}?limit={n}&after={cursor}` | `{ "ids": ["{id}"], "hops": [{ "edge": "{edge}", "limit": n, "after": "{cursor}" }] }` |
+
+`limit` and `after` are each optional, and are left out of the hop where they are left out of the
+URL.
+
+- A responder that serves them **MUST** state both in its descriptor's `routes`, as the URI Templates
+  ([RFC 6570](https://www.rfc-editor.org/rfc/rfc6570)) `{db}/objects/{id}` under `object` and
+  `{db}/objects/{id}/{edge}{?limit,after}` under `list`, with `{db}` replaced by its own URI and the
+  rest literal. One that does not serve them **MUST NOT** state them. A caller **MUST NOT** request
+  one from a responder whose descriptor does not state it.
+- The answer **MUST** be the answer `POST {db}/read` gives that read for the same caller: priced
+  (§5.2), subject to the same policy (§8), in the same body. A refusal's `at` is a path into that
+  read.
+- Where that read's answer has no root — the object does not exist, or this caller may not see it —
+  the responder **MUST** answer `404`, and the two cases **MUST** be the same response, body and
+  headers alike. Every other status means what §8 says it means.
+- A responder **MUST** refuse a query parameter this section does not define, and one given more
+  than once, with `400`.
+- There is one hop and no more. A responder **MUST NOT** accept a deeper path or a request tree in a
+  query string.
+- A request to either **MAY** be signed (§7.2). It has no body, so its `Content-Digest` is the
+  digest of zero bytes.
+
+> Why exactly a read: a second way to spell a request is a second thing for a price, a policy and a
+> cache key to disagree about. These two are fixed shapes — an object, and one page of one of its
+> lists — so there is nothing to spell. Why they exist at all: a client that can only `GET` could
+> read a database's vocabulary and none of its objects.
+
+### 3.3 Validators
+
+- A responder **SHOULD** send an `ETag` on every `200` it gives to `GET`, `HEAD` or `QUERY`.
+- An `ETag` **MUST** be a strong validator ([RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) §8.8.1):
+  two responses with the same one carry the same bytes. A digest of the body is always one. An
+  object's `version` alone is not: what a caller is shown also depends on the responder's projection
+  (§4.2) and its policy for that caller.
+- A responder that sends `ETag` **MUST** answer a request whose `If-None-Match` matches it with
+  `304` and no body.
+- A `304` **MUST** carry the `Cache-Control` and `Vary` the `200` would have.
+
+### 3.4 Browsers
+
+A page on another origin can read a response only if the responder says it may
+([CORS](https://fetch.spec.whatwg.org/#http-cors-protocol)).
+
+- A responder whose answers depend on nothing but the request **SHOULD** send
+  `Access-Control-Allow-Origin: *`, and **SHOULD** answer a preflight `OPTIONS` allowing the methods
+  the route takes and the headers of §7.2.
+- A responder **MUST NOT** send `Access-Control-Allow-Credentials`.
+- A responder that is reachable only from inside a network, or only from the machine it runs on,
+  and relies on that, **MUST NOT** send `Access-Control-Allow-Origin`. See §10.
 
 ## 4. The descriptor and the vocabulary
 
@@ -127,7 +215,22 @@ anything.
   caller **MUST** be able to tell from a database that does and did not say so.
 - `routes` **MUST** state `read`, `price` and `vocabulary`, each as the route §3 gives it. It
   **MUST** state `hint` where this database takes hints and **MUST NOT** state it where it does not
-  (§11.1), so that a caller can tell the two apart without sending anything.
+  (§11.1), so that a caller can tell the two apart without sending anything. The same holds for
+  `object` and `list` (§3.2).
+
+**How long a descriptor is good for.** A responder **SHOULD** send `Cache-Control` on its descriptor
+and its vocabulary, and both are the same for every caller.
+
+- A caller **MAY** reuse a descriptor for the freshness lifetime its `Cache-Control` states, without
+  asking again. It **SHOULD NOT** do so for longer than 300 seconds whatever is stated, and **MUST
+  NOT** do so at all where nothing is stated or it says `no-store`.
+- While it reuses one, a caller has not contacted the database for the purposes of §7.3: it learns
+  of a changed key when it next reads the descriptor and not before. That is what the lifetime costs,
+  and a caller that will not pay it reads the descriptor every time.
+- A responder that verifies a caller against a descriptor it is reusing, and is shown a key id that
+  descriptor does not list, **SHOULD** read the descriptor again before it refuses. A rotation it
+  has not seen yet looks exactly like a key nobody published.
+- A responder **SHOULD** keep a retired key published (§7.3) for at least the lifetime it states.
 
 ### 4.2 The vocabulary
 
@@ -249,7 +352,17 @@ Every read response **MUST** state its own cacheability. A caller **MUST NOT** k
 **MAY** keep one marked `public` for any caller for the stated seconds.
 
 A responder **MAY** also set `Cache-Control`. Where it does, the header **MUST** agree with the body;
-the body is normative.
+the body is normative. `never` is `no-store`, `caller` is `private` with that `max-age`, and `public`
+is `public` with it.
+
+A responder that sends a `Cache-Control` permitting reuse on an answer to `GET` or `QUERY` **MUST**
+also send `Vary: Hlekk-Caller`.
+
+> Why: a shared cache already knows to be careful with a request that carries `Authorization`, and
+> a caller here is named in another header. Without `Vary`, an answer kept for the anonymous caller
+> is handed to a signed one that was owed more — a wrong answer that looks exactly like a right one.
+> A `caller` answer is `private` and a shared cache does not keep it at all; this is for the
+> `public` ones. A `POST` is kept by nothing, whatever it is invited to.
 
 ## 6. References a responder does not follow
 
@@ -299,7 +412,8 @@ implementation:
 - **MUST** cover exactly the four components above, in that order, and **MUST** refuse a
   `Signature-Input` that covers any other set, in any other order, or under any other label.
 - **MUST** use `ed25519` and **MUST** refuse any other `alg`.
-- **MUST** compute `Content-Digest` as RFC 9530 specifies, over the request body's **bytes**.
+- **MUST** compute `Content-Digest` as RFC 9530 specifies, over the request body's **bytes**. A
+  request with no body (§3.2) carries the digest of zero bytes, and is otherwise signed the same.
 - **MUST** build the signature base as RFC 9421 §2.5 specifies over those components, and **MUST**
   verify against the bytes received rather than against a re-serialization of a parse.
 - **MUST** refuse a `created` outside an accepted window around its own clock, and **SHOULD** accept
@@ -349,12 +463,13 @@ A refusal body is [`schemas/refusal.json`](schemas/refusal.json).
 
 | Status | When |
 | --- | --- |
-| `400` | The request is wrong: a name the vocabulary does not have, a cost over budget, a member this specification does not define, a body that is not JSON, a signature presented to a database that verifies none |
+| `400` | The request is wrong: a name the vocabulary does not have, a cost over budget, a member this specification does not define, a body that is not JSON, a signature presented to a database that verifies none, a `QUERY` that states no media type |
 | `401` | A signature was presented and could not be verified, or a route that requires one (§11.2) was sent none |
 | `403` | The caller is verified and this database will not serve it, or its pin is repudiated here |
-| `404` | Not one of this database's routes |
+| `404` | Not one of this database's routes; or, on a route of §3.2, no such object for this caller |
 | `405` | Not a method this route takes |
 | `413` | The body is over the stated cap |
+| `415` | A `QUERY` whose media type is not `application/json` (§3.1) |
 | `429` | The request was acceptable and this caller has sent more than this database will take from it now |
 | `500` | This database failed |
 | `503` | The request was acceptable and this database is not taking requests now, from anyone |
@@ -372,6 +487,42 @@ can correct the part that was wrong instead of retrying blind.
 
 A `500` **MUST NOT** say anything about the failure beyond that there was one. A stranger learns that
 this database broke, not how.
+
+### 8.1 The kind of a refusal
+
+A refusal body is an [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem, with this protocol's
+`error`, `at` and `offset` beside it. A responder **SHOULD** send RFC 9457's `type`, `title`,
+`status` and `detail`; `error` remains **REQUIRED**, and `detail` says what `error` says.
+
+`type` is what a program branches on. It is `https://hlekk.dev/spec/problems/` followed by one of:
+
+| `type` ends in | Status | It means | A caller should |
+| --- | --- | --- | --- |
+| `malformed` | `400` | Not a request this specification defines: a wrong type, an unknown member, two names that collide, a body that is not JSON | Fix what it sent; `at` says where |
+| `vocabulary` | `400` | A name the vocabulary does not have, or does not allow there | Read `{db}/vocabulary` again |
+| `limit` | `400` | Over a limit the descriptor states, the price included | Read the descriptor's `limits` again, or ask for less |
+| `signature` | `400`, `401` | The signature was not accepted, was required and absent, or was presented to a database that verifies none | Not retry unchanged |
+| `forbidden` | `403` | Verified, and not served | Not retry |
+| `not-found` | `404` | Not a route; or no such object for this caller | — |
+| `method` | `405` | Not a method the route takes | Read `Allow` |
+| `too-large` | `413` | The body is over the cap | Read `limits.maxBody` |
+| `media-type` | `415` | Not a media type the route takes | Read `Accept-Query` |
+| `too-many` | `429` | Not now, for this caller | Wait for `Retry-After` |
+| `unavailable` | `503` | Not now, for anyone | Wait for `Retry-After` |
+| `fault` | `500` | This database failed | — |
+
+A `type` is an identifier. Nothing need be served at it, and a caller **MUST NOT** fetch one in
+order to act on a refusal. A caller **MUST** treat a `type` it does not know as it treats the status
+alone.
+
+A refusal is served as `application/json`, like every other body (§3), and not as
+`application/problem+json`.
+
+> Why three kinds for a `400` and not thirty: the distinction a program acts on is which document to
+> go back to — none, the vocabulary, or the limits. `at` already says where and `error` says what,
+> in a sentence that may be reworded. Why not the media type RFC 9457 registers: §3 said every body
+> is `application/json` before this section was written, and a caller built against that is owed the
+> header it was promised. The members are what is branched on, and they are all here.
 
 **Forbidden is indistinguishable from absent.** A responder **MUST NOT** let a caller tell an object
 its policy hides from one that does not exist, and this **MUST** hold transitively: an object
@@ -391,6 +542,9 @@ it refuses one, the count **MUST** be absent rather than zero.
 - A new **optional** member of a body does not require a new version, but a responder **MUST** refuse
   a request member it does not know (§5.1), so a caller **MUST NOT** send one to a responder that has
   not advertised the version that defines it.
+- A new **optional route**, a new method on an existing route, and a header do not require a new
+  version either. Each is something a responder states — in `routes`, in `Allow` — before a caller
+  uses it, and a caller that never looks is answered exactly as it was before.
 
 ## 10. Security considerations
 
@@ -413,6 +567,15 @@ it refuses one, the count **MUST** be absent rather than zero.
   It is not harmless to cost, so a responder **MAY** refuse a repeated signature.
 - **The descriptor is unauthenticated** (§3). Its trustworthiness on first contact is TLS and the
   domain's; afterwards it is the pin's (§7.3).
+- **An answer a browser may read is an answer any page may read.** `Access-Control-Allow-Origin`
+  (§3.4) is safe exactly where an answer depends on the request alone: a page then learns nothing
+  through a visitor's browser that it could not have fetched itself. Where the gate is the network —
+  a database reachable from inside it, or from one machine — the header hands every page that
+  visitor opens the reach the visitor has. A responder whose URI is a loopback one (§2.1) **SHOULD
+  NOT** send it by default.
+- **A kept descriptor is a database not looked at.** A caller that reuses one (§4.1) does not
+  notice a changed key until the lifetime runs out. That is bounded by what the responder states and
+  by the caller's own cap, and it is the same exposure an answer's `seconds` already is.
 - **A hint is an instruction to make a request too** (§11). It is bounded by being signed — the
   request it causes goes to the database that asked for it, and to no database a third party chose —
   and by being looked at off the request path, under a quota per caller. A responder **SHOULD** ask
@@ -539,3 +702,44 @@ It permits nothing else: every other part of that read's answer is kept or not a
 > and either was or was not. Telling another database about it is a second act, toward a server that
 > may be down for a week, and making the first wait on the second is how one database's outage
 > becomes another's.
+
+## 12. Being found
+
+Nothing in this section is needed to follow a reference: a reference carries the database's URI,
+and the URI is enough. This is for a reader that starts somewhere else — at a host name, or at a
+page written for a person — and it is all **OPTIONAL**.
+
+### 12.1 From an origin
+
+A database may be mounted at any path, so its URI cannot be guessed from its host. An origin that
+serves one or more databases **MAY** list them in an API catalog
+([RFC 9727](https://www.rfc-editor.org/rfc/rfc9727)) at `/.well-known/api-catalog`.
+
+- Each database is one entry of the catalog's Linkset: `anchor` is the database URI,
+  `service-meta` links to the descriptor — which is at that same URI — and `service-desc` links to
+  `{db}/vocabulary`, each with `type` `application/json`.
+- A reader tells an entry that is a database of this protocol from any other API the origin lists by
+  reading the descriptor, whose `protocol` says so (§4.1).
+- A catalog is not a registry. It names what its own origin serves and nothing else, a database is
+  exactly as reachable left out of it as listed in it, and a caller **MUST NOT** treat anything it
+  says as a statement about a database's identity (§7.3).
+
+### 12.2 From a document about an object
+
+A page, or any other representation written for a person, that is about one object **MAY** point at
+it with a link ([RFC 8288](https://www.rfc-editor.org/rfc/rfc8288)), in a `Link` header or an HTML
+`<link>`:
+
+```
+Link: <https://db.example/wiki/objects/281474976710691>; rel="alternate"; type="application/json"
+```
+
+- The target **SHOULD** be the object's URL under §3.2 where the database serves that route, since
+  it is the one spelling a client that has never heard of this protocol can fetch.
+- A reader recovers the reference from it: the database URI is everything before `/objects/`, and
+  the id is the segment after.
+
+A responder **SHOULD** send, on a `200` under §3.2, `Link` headers to its descriptor with
+`rel="service-meta"` and to its vocabulary with `rel="service-desc"`; on its descriptor, the second;
+and on its vocabulary, the first. An object fetched from a URL somebody was handed then leads to
+what database it is in and what can be asked of it.

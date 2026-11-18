@@ -71,7 +71,13 @@ a published shard map — become files, and everything above them is the same co
 ```bash
 curl http://127.0.0.1:8080/db            # the descriptor: versions, keys, limits
 curl http://127.0.0.1:8080/db/vocabulary # the types and edges it exposes
+curl http://127.0.0.1:8080/.well-known/api-catalog  # what this origin serves
+curl http://127.0.0.1:8080/db/objects/<id>           # one object, by URL: a 404 until there is one
+curl http://127.0.0.1:8080/db/objects/<id>/<edge>    # one page of one of its lists
 ```
+
+The two under `objects/` are exactly the reads a `POST` to `/read` would make, for whatever can only
+fetch a URL. Anything deeper is a request: `POST` or `QUERY` a tree of hops to `/db/read`.
 
 A second one of these, on another machine, with an edge drawn at its URI, is a federation.
 
@@ -114,7 +120,7 @@ implementation under test would be checking that the implementation agrees with 
   says so plainly; it is the principle the design would actually break, and the answer here is not to
   break it.
 
-## Two defaults worth knowing
+## Three defaults worth knowing
 
 - **A mounted database is publicly readable.** The protocol exists so a database can be read by
   another, and one that answers nothing is not participating in it, so that is where a responder
@@ -122,6 +128,10 @@ implementation under test would be checking that the implementation agrees with 
   all. What makes it safe is that **mounting the handler is the act of exposure**: a database that
   exists and is not mounted is reachable by nobody. `src/query/serve.ts` records the one thing that
   would invert that argument.
+- **A page in a browser may read it, unless it is on loopback.** For the same reason reads are
+  public: an answer depends on the request and on nothing a browser adds. That stops being true
+  wherever the network is the gate, so a database at a loopback URI sends no CORS headers until
+  asked (`--cors`), and one that is protected by where it sits has to say `--no-cors`.
 - **Writes are nobody's but yours.** There is no write operation in the protocol and there is not
   going to be one. Writing is your own client, inside your own deployment, behind whatever you
   already have.

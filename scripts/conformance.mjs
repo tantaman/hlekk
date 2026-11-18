@@ -132,6 +132,24 @@ check(
   takesHints ? `stated as ${JSON.stringify(descriptor.routes.hint)}` : "not stated: this database takes no hints",
 );
 
+// Optional, and checked for what it has to mean where it is sent. A validator is a promise that the
+// same tag is the same bytes, so a responder that sends one has to honour it.
+{
+  const etag = descriptorRes.headers.get("etag");
+  check(
+    "it may say how long it is good for, and carry a validator",
+    true,
+    `Cache-Control ${JSON.stringify(descriptorRes.headers.get("cache-control"))}, ETag ${etag === null ? "not sent, which is allowed" : "sent"}`,
+  );
+  if (etag !== null) {
+    const again = await fetch(uri, { headers: { "if-none-match": etag } });
+    const sent = await again.text();
+    check("a descriptor asked for with its own validator is a 304 with no body", again.status === 304 && sent === "", `status ${again.status}, ${sent.length} bytes`);
+    const other = await fetch(uri, { headers: { "if-none-match": '"not-this-one"' } });
+    check("and with somebody else's validator is the descriptor", other.status === 200, `status ${other.status}`);
+  }
+}
+
 // ---- the vocabulary
 
 const vocabularyRes = await fetch(`${uri}/vocabulary`);
@@ -337,6 +355,110 @@ check("GET on a POST route is 405", getRead === 405, `status ${getRead}`);
 const unknown = await fetch(`${uri}/no-such-route`).then((r) => r.status, () => 0);
 check("an unknown route is 404", unknown === 404, `status ${unknown}`);
 
+// ---- the kind of a refusal
+//
+// RFC 9457's `type` is a SHOULD, so a responder that sends none passes. One that sends it has to
+// send the right one, because a program that branches on it goes back to the wrong document
+// otherwise.
+{
+  const kindOf = async (name, body, expected) => {
+    const res = await send("read", body);
+    const type = res.body?.type;
+    check(
+      `${name} is of kind ${expected}, where a kind is stated`,
+      type === undefined || type === `https://hlekk.dev/spec/problems/${expected}`,
+      type === undefined ? "not stated, which is allowed" : type,
+    );
+    check(
+      `and where it is stated, detail says what error says and status says what was sent`,
+      type === undefined || (res.body.detail === res.body.error && res.body.status === res.status),
+    );
+  };
+  await kindOf("no ids at all", { ids: [] }, "malformed");
+  await kindOf("an unknown edge", { ids: [SOME_ID], hops: [{ edge: "no.such_edge" }] }, "vocabulary");
+  await kindOf("too many ids", { ids: Array.from({ length: (limits.maxIds ?? 100) + 1 }, () => SOME_ID) }, "limit");
+}
+
+// ---- OPTIONS and QUERY
+//
+// Both optional. What is checked is that a responder which says it takes QUERY treats it as the
+// request POST would have been — and it says so in `Allow`, which is the only place a caller is
+// allowed to learn it from.
+{
+  const options = await fetch(`${uri}/read`, { method: "OPTIONS" });
+  const allow = (options.headers.get("allow") ?? "").split(",").map((m) => m.trim().toUpperCase());
+  await options.arrayBuffer();
+  check(
+    "OPTIONS on a route says what it takes, or is refused as any other method is",
+    (options.status >= 200 && options.status < 300 && allow.includes("POST")) || options.status === 405,
+    `status ${options.status}, Allow ${JSON.stringify(options.headers.get("allow"))}`,
+  );
+  if (allow.includes("QUERY")) {
+    const request = { ids: [SOME_ID] };
+    const asQuery = async (headers, body = JSON.stringify(request)) => {
+      const res = await fetch(`${uri}/read`, { method: "QUERY", headers, body });
+      return { status: res.status, body: await res.json().catch(() => null) };
+    };
+    const queried = await asQuery({ "content-type": "application/json" });
+    const posted = await send("read", request);
+    check("a QUERY is answered as the POST it is the same request as", queried.status === 200 && isDeepStrictEqual(queried.body, posted.body), `status ${queried.status}`);
+    // A Buffer, because fetch gives a string body a media type of its own accord and the point is
+    // a request that states none.
+    const untyped = await asQuery({}, Buffer.from(JSON.stringify(request)));
+    check("a QUERY that states no media type is refused with 400", untyped.status === 400, `status ${untyped.status}`);
+    const mistyped = await asQuery({ "content-type": "text/plain" });
+    check("and one that states another is refused with 415", mistyped.status === 415, `status ${mistyped.status}`);
+  } else {
+    check("QUERY", true, "skipped: Allow does not name it, so a caller must not send it");
+  }
+}
+
+// ---- reading by URL
+
+const readsByUrl = descriptor?.routes?.object !== undefined || descriptor?.routes?.list !== undefined;
+/** GET, with the status and the body it came with. */
+async function get(path, headers = {}) {
+  const res = await fetch(`${uri}/${path}`, { headers });
+  const text = await res.text();
+  let body = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    // left null
+  }
+  return { status: res.status, body, text, headers: res.headers };
+}
+{
+  check(
+    "the routes that read by URL are stated as exactly their templates, or not at all",
+    !readsByUrl ||
+      (descriptor.routes.object === `${uri}/objects/{id}` && descriptor.routes.list === `${uri}/objects/{id}/{edge}{?limit,after}`),
+    readsByUrl ? JSON.stringify([descriptor.routes.object, descriptor.routes.list]) : "not stated: this database reads by request only",
+  );
+  const byUrl = await get(`objects/${SOME_ID}`);
+  if (readsByUrl) {
+    const byBody = await send("read", { ids: [SOME_ID] });
+    // Exactly the read it stands for: the same body where there is an object, and a 404 where the
+    // read has no root.
+    check(
+      "an object by URL is the read that names it",
+      byUrl.status === 200 ? isDeepStrictEqual(byUrl.body, byBody.body) : byUrl.status === 404 && byBody.body?.roots?.length === 0,
+      `GET ${byUrl.status}, read has ${byBody.body?.roots?.length} roots`,
+    );
+    const stray = await get(`objects/${SOME_ID}?depth=2`);
+    check("a parameter that route does not define is refused", stray.status === 400, `status ${stray.status}`);
+    const deeper = anyEdge ? await get(`objects/${SOME_ID}/${encodeURIComponent(anyEdge)}/${encodeURIComponent(anyEdge)}`) : null;
+    check("and there is one hop and no more: a deeper path is not a route", deeper === null || deeper.status === 404, `status ${deeper?.status}`);
+    const etag = byUrl.headers.get("etag");
+    if (byUrl.status === 200 && etag !== null) {
+      const again = await get(`objects/${SOME_ID}`, { "if-none-match": etag });
+      check("an object asked for with its own validator is a 304 with no body", again.status === 304 && again.text === "", `status ${again.status}`);
+    }
+  } else {
+    check("a database that states no such route has none", byUrl.status === 404, `status ${byUrl.status}`);
+  }
+}
+
 // ---- hints, as far as they can be checked without being a caller
 
 {
@@ -447,6 +569,50 @@ if (fixture !== null) {
     "and nothing stands behind it: a database answering a read never follows one",
     refs.every((r) => !(r in (onward.body?.objects ?? {}))),
   );
+
+  if (readsByUrl) {
+    const root = await get(`objects/${id("root")}`);
+    const rootByBody = await send("read", { ids: [id("root")] });
+    check("an object that is there is a 200 by URL, and the same body as by request", root.status === 200 && isDeepStrictEqual(root.body, rootByBody.body), `status ${root.status}`);
+
+    // The one place a status could be the tell. A 404 for one and a 403 for the other, or two
+    // different sentences, and "forbidden is absent" is only true of the route nobody uses.
+    const hiddenByUrl = await get(`objects/${id("hidden")}`);
+    const absentByUrl = await get(`objects/${absent}`);
+    check(
+      "by URL, a hidden object and an absent one are the same 404",
+      hiddenByUrl.status === 404 && absentByUrl.status === 404 && hiddenByUrl.text === absentByUrl.text,
+      `${hiddenByUrl.status} and ${absentByUrl.status}`,
+    );
+    check(
+      "down to the headers a cache would act on",
+      ["cache-control", "vary", "etag"].every((h) => hiddenByUrl.headers.get(h) === absentByUrl.headers.get(h)),
+    );
+    const underHidden = await get(`objects/${id("hidden")}/conf.page_links`);
+    check("and so is a list under a hidden one", underHidden.status === 404 && underHidden.text === absentByUrl.text, `status ${underHidden.status}`);
+
+    // One page of one list, continued by the cursor the last page handed back — which is the whole
+    // of what a client that can only GET needs in order to walk.
+    const first = await get(`objects/${id("paged")}/conf.page_links?limit=2`);
+    const firstByBody = await send("read", { ids: [id("paged")], hops: [{ edge: "conf.page_links", limit: 2 }] });
+    check("a list by URL is the read with that one hop", first.status === 200 && isDeepStrictEqual(first.body, firstByBody.body), `status ${first.status}`);
+    const walked = [];
+    let cursor;
+    for (let i = 0; i < 6; i++) {
+      const page = await get(`objects/${id("paged")}/conf.page_links?limit=2${cursor === undefined ? "" : `&after=${encodeURIComponent(cursor)}`}`);
+      const list = Object.values(page.body?.lists ?? {})[0];
+      if (list === undefined) break;
+      walked.push(...list.ids);
+      if (!list.more || list.cursor === null) break;
+      cursor = list.cursor;
+    }
+    check("and it pages by URL to the same five rows", JSON.stringify(walked) === JSON.stringify(all), `${walked.length} vs ${all.length}`);
+    check(
+      "an answer by URL that a cache may keep says it varies by caller",
+      !/max-age/.test(root.headers.get("cache-control") ?? "") || /hlekk-caller/i.test(root.headers.get("vary") ?? ""),
+      `Cache-Control ${JSON.stringify(root.headers.get("cache-control"))}, Vary ${JSON.stringify(root.headers.get("vary"))}`,
+    );
+  }
 
   // Signatures are not ignored. A syntactically valid one that cannot be verified must be refused —
   // not read as the anonymous caller, because then stripping a header would be a downgrade.

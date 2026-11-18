@@ -28,6 +28,9 @@ export interface Args {
   identity: boolean;
   /** Allows a loopback URI, which `privateAddressGuard` refuses otherwise. */
   allowLoopback: boolean;
+  /** Whether a page in a browser may read this database. Unset, it may unless the URI is a loopback
+   *  one, which is where a development database lives and the one place that must be asked for. */
+  cors?: boolean;
   /** The edge type that records an edge another database drew at this one. Absent, no hints are
    *  taken. See `BacklinkOptions.edge` for what a bare name admits. */
   backlinks?: string;
@@ -70,6 +73,12 @@ export function parse(argv: readonly string[]): Args {
       case "--backlinks":
         args.backlinks = value();
         break;
+      case "--cors":
+        args.cors = true;
+        break;
+      case "--no-cors":
+        args.cors = false;
+        break;
       default:
         throw new TypeError(`unknown argument ${flag}`);
     }
@@ -92,7 +101,7 @@ export async function main(argv: readonly string[]): Promise<void> {
     backlinks: args.backlinks === undefined ? undefined : { edge: args.backlinks },
   });
 
-  const node = await listen(database.binding, { path: args.path, port: args.port, host: args.host, database: args.uri });
+  const node = await listen(database.binding, { path: args.path, port: args.port, host: args.host, database: args.uri, cors: args.cors });
 
   const keys = database.binding.keys ?? [];
   console.log(`hlekk: serving ${node.database} from ${args.dir}`);

@@ -28,7 +28,7 @@ import type { StorageFormat } from "../../host/schema.ts";
 import { Deliverer } from "../../host/outbox.ts";
 import { discover, foreignClient } from "../../protocol/client.ts";
 import type { ForeignOptions, Pins } from "../../protocol/client.ts";
-import { ResponseCache } from "../../protocol/client.ts";
+import { DescriptorCache, ResponseCache } from "../../protocol/client.ts";
 import { surfaceOf } from "../../protocol/surface.ts";
 import type { Binding } from "../../protocol/http.ts";
 import type { Projection } from "../../catalog/projection.ts";
@@ -167,6 +167,10 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
 
   const catalog = cluster.directory.catalog();
   const cache = new ResponseCache();
+  // What this database knows of every other's keys, limits and routes, kept for as long as each said
+  // it may be. One for the process, so a read, a hint and a caller's signature all look at the same
+  // copy of a database's descriptor.
+  const descriptors = new DescriptorCache();
   const guard = privateAddressGuard({ allowLoopback: opts.allowLoopback ?? false });
   const identity = opts.identity ?? true;
   const own = () => cluster.directory.databaseUri() ?? undefined;
@@ -187,6 +191,7 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
       catalog,
       guard,
       cache,
+      descriptors,
       agree: true,
       self: own(),
       identity: signAs,
@@ -196,6 +201,7 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
   /** How this database reaches another outside of a query: to hint, and to check a hint. */
   const reach = () => ({
     guard,
+    descriptors,
     identity: signAs,
     pins: identity ? pins : undefined,
     fetch: opts.foreign?.fetch,
@@ -230,7 +236,21 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
     publishedKeys: identity ? () => cluster.directory.publishedKeys() : undefined,
     get keys() { return identity ? cluster.directory.publishedKeys() : undefined; },
     pins: identity ? pins : undefined,
-    callerKeys: identity ? async (uri) => (await discover(uri, { guard, ...opts.foreign })).keys : undefined,
+    callerKeys: identity
+      ? async (uri, wanted) => {
+          const transport = { guard, descriptors, ...opts.foreign };
+          const remembered = descriptors.fresh(uri, transport.now?.() ?? Date.now());
+          const keys = (await discover(uri, transport)).keys;
+          // A key id the remembered descriptor does not list is either a key nobody published or a
+          // rotation since it was read. One more look, past the lifetime the caller's database gave
+          // it, tells them apart — and only when the first answer came from memory, so a stranger
+          // inventing key ids buys one request here and not two.
+          if (remembered && wanted !== undefined && !keys.some((k) => k.id === wanted)) {
+            return (await discover(uri, { ...transport, fresh: true })).keys;
+          }
+          return keys;
+        }
+      : undefined,
     hints,
   };
 

@@ -24,9 +24,9 @@ Figures marked **measured** were read off a real artifact and say how.
 
 ## Where this stands
 
-Built, with typecheck clean and **585 of 585 tests passing under both storage formats**
-(`npm run test:formats`), **42 of 42** conformance checks against the published fixture
-(`npm run conformance:fixture`) and **30 of 30** without one (`npm run conformance:node`):
+Built, with typecheck clean and **678 of 678 tests passing under both storage formats**
+(`npm run test:formats`), **84 of 84** conformance checks against the published fixture
+(`npm run conformance:fixture`) and **55 of 55** without one (`npm run conformance:node`):
 
 - **Step 1.** `src/query/ref.ts`. A reference is a local id or `<database URI>#<id>`, with one
   canonical spelling for the URI, refused rather than repaired.
@@ -56,6 +56,15 @@ Built, with typecheck clean and **585 of 585 tests passing under both storage fo
   records an outbound edge of its own for what that read showed. Nothing sent is stored, the graph is
   still outbound links only, and the conformance suite checks it by being a hinting database itself.
   [`docs/protocol.md`](docs/protocol.md), *Backlinks*, has the threat model and what was rejected.
+- **Step 10.** The parts of HTTP that somebody who does not speak this protocol can use, and none of
+  the parts that would make it less strict. A lifetime and a digest validator on the descriptor and
+  the vocabulary, with a client that keeps one for as long as it was told and no longer than five
+  minutes; `QUERY` beside `POST`; two reads by URL, `GET {db}/objects/{id}` and
+  `GET {db}/objects/{id}/{edge}`, each exactly a read; `OPTIONS` and CORS, off for a loopback URI;
+  `429` and `503` with `Retry-After` behind an admission hook; RFC 9457 kinds on every refusal; and
+  the origin's RFC 9727 catalog. All additive under §9: a caller that never looks is answered as it
+  was. [`docs/protocol.md`](docs/protocol.md), *What HTTP is for here*, has the test each was held
+  to and what failed it.
 
 Not built: step 8, below.
 
@@ -224,6 +233,19 @@ steps above, so that nothing reads as finished that is not.
   and gives up as *unknown* past four pages. Asking for one edge is a new request member, and so a
   new wire version.
 
+### Left out of step 10, with the reason
+
+- **A limiter.** `Binding.admit` is where one goes and nothing ships with one, because what
+  identifies a caller that does not sign is an address, and only the platform in front of the
+  handler has it.
+- **`QUERY` from the asking half.** The client still `POST`s. It gains nothing until there is a
+  shared cache between two databases, and until then choosing a method per responder is machinery
+  for nobody.
+- **The catalog on Workers.** `serveCatalog` is for whoever owns the origin. The Node adapter calls
+  it; the wiki Worker has routes of its own at its root and does not.
+- **`application/problem+json`.** A refusal carries RFC 9457's members and is still served as
+  `application/json`, which is what §3 promised every caller. The media type is for a wire version.
+
 ## Open
 
 - [x] Whether a failed foreign hop fails the query by default. **It does**, and a caller opts into an
@@ -252,6 +274,8 @@ steps above, so that nothing reads as finished that is not.
       format 2.
 - [ ] How long a retired key's grace window is. `pruneKeys` takes one and nothing chooses it; a
       caller pinned on a pruned key is repudiated on next contact, which is the cost of the window
-      being finite.
+      being finite. Step 10 gave it a floor and not a value: at least the lifetime the descriptor
+      states (`Binding.describedFor`, a minute by default), since a caller may be holding a copy
+      that old.
 - [ ] Whether a responder should refuse a repeated signature. A read applies nothing, so replay
       inside the skew window is harmless to correctness and not to cost.

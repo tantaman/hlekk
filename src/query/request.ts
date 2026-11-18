@@ -104,16 +104,33 @@ export interface Request {
   hops?: Hop[];
 }
 
+/**
+ * Which of three things a refused request got wrong, named by what the caller should re-read.
+ *
+ * - `malformed`: not a request at all — a wrong type, an unknown member, two names that collide.
+ *   Nothing the database publishes would have helped; the caller's own code is wrong.
+ * - `vocabulary`: a name the vocabulary does not have, or does not allow there. Re-read it.
+ * - `limit`: over a limit the database states, the price included. Re-read the limits, or ask for
+ *   less.
+ *
+ * Three and not thirty, because the distinction a program acts on is which document to go back to.
+ * `at` already says where, and the message says what; this says what to do about it without parsing
+ * the message, which is English and may be reworded.
+ */
+export type RefusalKind = "malformed" | "vocabulary" | "limit";
+
 export class Refused extends Error {
   /** Where in the submitted request the problem is, as a path, so a caller can point at it. */
   readonly at: string;
   /** For a request submitted as text, the character offset to put the caret at. */
   readonly offset?: number;
-  constructor(at: string, message: string, offset?: number) {
+  readonly kind: RefusalKind;
+  constructor(at: string, message: string, offset?: number, kind: RefusalKind = "malformed") {
     super(`${at}: ${message}`);
     this.name = "Refused";
     this.at = at;
     this.offset = offset;
+    this.kind = kind;
   }
 }
 
@@ -159,10 +176,10 @@ export function describe(spec: FieldSpec): { type: string; optional: boolean } {
 
 function checkValue(at: string, field: string, value: Json, objectType: string, vocab: Vocabulary): void {
   const fields = vocab.fields(objectType);
-  if (fields === undefined) throw new Refused(at, `no object type "${objectType}" is exposed`);
+  if (fields === undefined) throw new Refused(at, `no object type "${objectType}" is exposed`, undefined, "vocabulary");
   const spec = fields[field];
   if (spec === undefined) {
-    throw new Refused(at, `no field "${field}" on ${objectType}; it has ${Object.keys(fields).join(", ")}`);
+    throw new Refused(at, `no field "${field}" on ${objectType}; it has ${Object.keys(fields).join(", ")}`, undefined, "vocabulary");
   }
   const { type } = describe(spec);
   const actual = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
@@ -170,7 +187,7 @@ function checkValue(at: string, field: string, value: Json, objectType: string, 
   // answer is harder to understand than a refusal.
   const want = type.startsWith("enum") ? "string" : type.startsWith("id(") ? "string" : type;
   if (want !== "json" && actual !== want) {
-    throw new Refused(at, `field "${field}" is ${type}, but the value is ${actual}`);
+    throw new Refused(at, `field "${field}" is ${type}, but the value is ${actual}`, undefined, "vocabulary");
   }
 }
 
@@ -241,7 +258,7 @@ export function checkAliases(req: Request, aliasing: Aliasing = PROTOCOL_ALIASIN
     };
     for (const [i, hop] of (node.hops ?? []).entries()) {
       const path = `${at}hops[${i}]`;
-      if (depth > maxDepth) throw new Refused(path, `hops nest ${depth} deep, the maximum is ${maxDepth}`);
+      if (depth > maxDepth) throw new Refused(path, `hops nest ${depth} deep, the maximum is ${maxDepth}`, undefined, "limit");
       if (hop === null || typeof hop !== "object" || Array.isArray(hop)) throw new Refused(path, "expected an object");
       if (typeof hop.edge !== "string" || !hop.edge) throw new Refused(path + ".edge", "expected an edge name");
       if (hop.as !== undefined && (typeof hop.as !== "string" || !hop.as)) throw new Refused(path + ".as", "expected an alias");
@@ -275,9 +292,9 @@ export const REQUEST_MEMBERS = ["ids", "counts", "hops"] as const;
 function checkCount(c: CountSpec, at: string, vocab: Vocabulary): void {
   if (typeof c === "object" && c !== null) onlyKnown(c, COUNT_MEMBERS, at);
   const edge = vocab.edge(countEdge(c));
-  if (edge === undefined) throw new Refused(at, `no edge "${countEdge(c)}"`);
+  if (edge === undefined) throw new Refused(at, `no edge "${countEdge(c)}"`, undefined, "vocabulary");
   if (edge.counted === false) {
-    throw new Refused(at, `edge "${countEdge(c)}" has no count: it follows an id in a payload and stores nothing`);
+    throw new Refused(at, `edge "${countEdge(c)}" has no count: it follows an id in a payload and stores nothing`, undefined, "vocabulary");
   }
 }
 
@@ -302,11 +319,11 @@ function checkHop(
   if (hop === null || typeof hop !== "object") throw new Refused(at, "expected an object");
   onlyKnown(hop, HOP_MEMBERS, at);
   if (depth > limits.maxDepth) {
-    throw new Refused(at, `hops nest ${depth} deep, the maximum is ${limits.maxDepth}`);
+    throw new Refused(at, `hops nest ${depth} deep, the maximum is ${limits.maxDepth}`, undefined, "limit");
   }
   const edge = typeof hop.edge === "string" ? vocab.edge(hop.edge) : undefined;
   if (edge === undefined) {
-    throw new Refused(at, `no edge "${String(hop.edge)}"; the schema has ${vocab.edges().join(", ")}`);
+    throw new Refused(at, `no edge "${String(hop.edge)}"; the schema has ${vocab.edges().join(", ")}`, undefined, "vocabulary");
   }
   // A hop has to start where its parent lands. It can only ever return nothing otherwise, and
   // "nothing" is an answer a caller cannot tell from a true empty list — which is the one thing a
@@ -317,18 +334,20 @@ function checkHop(
       at,
       `"${hop.edge}" starts at ${edge.from}, and this hop is under ${parent}.` +
         ` From ${parent} the schema has ${available.length === 0 ? "no edges" : available.join(", ")}`,
+      undefined,
+      "vocabulary",
     );
   }
   const limit = hop.limit ?? DEFAULT_HOP_LIMIT;
   if (!Number.isInteger(limit) || limit < 1 || limit > limits.maxLimit) {
-    throw new Refused(at, `limit must be an integer in 1..${limits.maxLimit}, got ${String(hop.limit)}`);
+    throw new Refused(at, `limit must be an integer in 1..${limits.maxLimit}, got ${String(hop.limit)}`, undefined, "limit");
   }
   if (hop.after !== undefined) {
     // A field relationship follows an id in a payload: there is no list, so there is nothing to
     // continue. Checked before the cursor itself, because "this edge cannot be paged" is the
     // actionable half.
     if (edge.counted === false) {
-      throw new Refused(at, `edge "${hop.edge}" cannot be continued: it follows an id in a payload and has no list`);
+      throw new Refused(at, `edge "${hop.edge}" cannot be continued: it follows an id in a payload and has no list`, undefined, "vocabulary");
     }
     try {
       decodeCursor(hop.after);
@@ -344,13 +363,13 @@ function checkHop(
     checkValue(`${at}.where[${i}]`, c.field, c.value, edge.to, vocab);
   }
   if ((hop.where ?? []).length > limits.maxWhere) {
-    throw new Refused(at, `${hop.where!.length} filters, the maximum is ${limits.maxWhere}`);
+    throw new Refused(at, `${hop.where!.length} filters, the maximum is ${limits.maxWhere}`, undefined, "limit");
   }
   for (const [i, c] of (hop.counts ?? []).entries()) {
     checkCount(c, `${at}.counts[${i}]`, vocab);
   }
   if ((hop.counts ?? []).length > limits.maxCounts) {
-    throw new Refused(at, `${hop.counts!.length} counts, the maximum is ${limits.maxCounts}`);
+    throw new Refused(at, `${hop.counts!.length} counts, the maximum is ${limits.maxCounts}`, undefined, "limit");
   }
 
   // The rows this hop can produce is its limit times however many rows reached it — which is the
@@ -386,7 +405,7 @@ export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_
     checkCount(c, `counts[${i}]`, vocab);
   }
   if ((req.counts ?? []).length > limits.maxCounts) {
-    throw new Refused("counts", `${req.counts!.length} counts, the maximum is ${limits.maxCounts}`);
+    throw new Refused("counts", `${req.counts!.length} counts, the maximum is ${limits.maxCounts}`, undefined, "limit");
   }
 
   let frames = 1;
@@ -404,7 +423,7 @@ export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_
     nodes += under.nodes;
   }
   if (frames > limits.maxFrames) {
-    throw new Refused("query", `compiles to ${frames} frames, the maximum is ${limits.maxFrames}`);
+    throw new Refused("query", `compiles to ${frames} frames, the maximum is ${limits.maxFrames}`, undefined, "limit");
   }
   if (nodes > limits.maxNodes) {
     throw new Refused(
@@ -413,6 +432,8 @@ export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_
         `This is the product of the limits down each path${roots === 1 ? "" : `, times the ${roots} roots it enters from`}, ` +
         `and no amount of storage reading would reveal it — ` +
         `lower a limit${roots === 1 ? "" : ", enter from fewer ids"} or remove a hop.`,
+      undefined,
+      "limit",
     );
   }
   return { frames, nodes };

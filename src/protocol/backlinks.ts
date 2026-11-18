@@ -34,6 +34,7 @@ import type { ForeignOptions, TransportOptions } from "./client.ts";
 import { signRequest } from "./identity.ts";
 import type { SignedHeaders } from "./identity.ts";
 import type { ReceivedHint } from "./hint.ts";
+import { retryAfterOf } from "./backoff.ts";
 import { WireError, decodeRead } from "./wire.ts";
 
 /** What both halves need to reach another database: a transport, and optionally a name to sign as
@@ -108,14 +109,6 @@ export async function sendHint(target: Ref, source: Id, edge: string, opts: Reac
     if ((e as Error).name === "PrivateAddress") return { sent: false, why: "unreachable", error: (e as Error).message };
     throw e;
   }
-}
-
-/** `Retry-After` as whole seconds, or null. Only the delta form: an HTTP-date is a second spelling
- *  of the same fact that depends on two clocks agreeing, and this protocol sends the first. */
-export function retryAfterOf(headers: { get(name: string): string | null }): number | null {
-  const raw = headers.get("retry-after");
-  if (raw === null || !/^\d{1,9}$/.test(raw.trim())) return null;
-  return Number(raw.trim());
 }
 
 // ---- checking

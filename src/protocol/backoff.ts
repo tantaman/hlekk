@@ -30,3 +30,11 @@ export class Backoff extends Error {
     this.whose = whose;
   }
 }
+
+/** `Retry-After` as whole seconds, or null. Only the delta form: an HTTP-date is a second spelling
+ *  of the same fact that depends on two clocks agreeing, and this protocol sends the first. */
+export function retryAfterOf(headers: { get(name: string): string | null }): number | null {
+  const raw = headers.get("retry-after");
+  if (raw === null || !/^\d{1,9}$/.test(raw.trim())) return null;
+  return Number(raw.trim());
+}

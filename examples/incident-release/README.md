@@ -45,7 +45,7 @@ curl -fsS "$DB/vocabulary"
 curl -fsS --json "{\"ids\":[\"$ID\"],\"hops\":[{\"edge\":\"ops.deployed_release\"}]}" "$DB/read"
 ```
 
-The response's `objects` contains the incident. The release reference appears in `lists`. Follow that reference to its own publisher. For the bundled fixture, run the following request.
+The response's `objects` contains the incident. The release reference appears in `lists`. The same read is available by URL, for an agent whose only tool fetches one: `$DB/objects/$ID/ops.deployed_release`. Follow that reference to its own publisher. For the bundled fixture, run the following request.
 
 ```sh
 curl -fsS --json '{"ids":["742"]}' http://127.0.0.1:8461/releases/read

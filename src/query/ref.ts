@@ -186,6 +186,10 @@ export function formatRef(db: string | null, id: Id): Ref {
   return `${canonicalDb(db)}#${id}`;
 }
 
+/** Whether a canonical database URI names a loopback host — the one place `http` is allowed, for
+ *  development, and so the one kind of database that is reachable from this machine and no further. */
+export const isLoopbackDb = (uri: string): boolean => LOOPBACK.test(new URL(canonicalDb(uri)).hostname);
+
 /** Whether a reference names another database. Cheap enough to call before parsing, and the only
  *  thing most call sites need to know. */
 export const isQualified = (ref: Ref): boolean => ref.includes("#");

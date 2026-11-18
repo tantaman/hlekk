@@ -97,6 +97,14 @@
         "hint": {
           "description": "Stated only by a database that takes hints, and then exactly `{db}/hint`. Its absence is how a caller tells one that does not, without sending anything.",
           "type": "string"
+        },
+        "object": {
+          "description": "Stated only by a database that serves one object by GET, and then exactly the URI Template `{db}/objects/{id}`, where `{db}` is this database's URI and `{id}` is literal.",
+          "type": "string"
+        },
+        "list": {
+          "description": "Stated only by a database that serves one page of one list by GET, and then exactly the URI Template `{db}/objects/{id}/{edge}{?limit,after}`.",
+          "type": "string"
         }
       },
       "required": [

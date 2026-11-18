@@ -54,9 +54,13 @@
     },
     "refusal": {
       "title": "A refused request",
-      "description": "The body of a 400, 401, 403 or 413. `at` is a path into the submitted request, so a caller can correct the part that was wrong instead of retrying blind.",
+      "description": "The body of any 4xx or 5xx: an RFC 9457 problem with this protocol's own members beside it. `at` is a path into the submitted request, so a caller can correct the part that was wrong instead of retrying blind. Only `error` is required, because it is the only member version 1 had.",
       "type": "object",
       "properties": {
+        "type": { "description": "RFC 9457. A URI naming the kind of refusal, which is what a program branches on: `https://hlekk.dev/spec/problems/` and one of malformed, vocabulary, limit, signature, forbidden, not-found, method, too-large, media-type, too-many, unavailable, fault. An identifier; nothing need be served at it.", "type": "string", "pattern": "^https://hlekk\\.dev/spec/problems/[a-z-]+$" },
+        "title": { "description": "RFC 9457. The kind, in words. The same for every refusal of one `type`.", "type": "string", "minLength": 1 },
+        "status": { "description": "RFC 9457. The status this body was sent with, for a reader that was handed the body alone.", "type": "integer", "minimum": 400, "maximum": 599 },
+        "detail": { "description": "RFC 9457. What `error` says. Both are sent so that a reader of either finds it.", "type": "string", "minLength": 1 },
         "error": { "type": "string", "minLength": 1 },
         "at": { "type": "string" },
         "offset": { "description": "For a request submitted as text, where to put the caret.", "type": "integer", "minimum": 0 }

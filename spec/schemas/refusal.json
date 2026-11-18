@@ -1,10 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hlekk.dev/spec/schemas/refusal.json",
-  "title": "A refused request — the body of a 400, 401, 403, 404, 405, 413 or 500",
-  "description": "`at` is a path into the submitted request, so a caller can correct the part that was wrong instead of retrying blind. A 500 carries `error` alone and says nothing about itself: a stranger learns that this database broke, not how.",
+  "title": "A refused request — the body of any 4xx or 5xx",
+  "description": "An RFC 9457 problem with this protocol's own members beside it. `at` is a path into the submitted request, so a caller can correct the part that was wrong instead of retrying blind. A 500 says nothing about itself beyond that it happened: a stranger learns that this database broke, not how. Only `error` is required, because it is the only member version 1 had; a responder SHOULD send the four RFC 9457 members too.",
   "type": "object",
   "properties": {
+    "type": { "description": "RFC 9457. A URI naming the kind of refusal, which is what a program branches on: `https://hlekk.dev/spec/problems/` and one of malformed, vocabulary, limit, signature, forbidden, not-found, method, too-large, media-type, too-many, unavailable, fault. An identifier; nothing need be served at it.", "type": "string", "pattern": "^https://hlekk\\.dev/spec/problems/[a-z-]+$" },
+    "title": { "description": "RFC 9457. The kind, in words. The same for every refusal of one `type`.", "type": "string", "minLength": 1 },
+    "status": { "description": "RFC 9457. The status this body was sent with, for a reader that was handed the body alone.", "type": "integer", "minimum": 400, "maximum": 599 },
+    "detail": { "description": "RFC 9457. What `error` says. Both are sent so that a reader of either finds it.", "type": "string", "minLength": 1 },
     "error": { "type": "string", "minLength": 1 },
     "at": { "type": "string" },
     "offset": { "type": "integer", "minimum": 0 }
