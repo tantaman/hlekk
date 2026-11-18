@@ -28,6 +28,12 @@ export interface Args {
   identity: boolean;
   /** Allows a loopback URI, which `privateAddressGuard` refuses otherwise. */
   allowLoopback: boolean;
+  /** Whether a page in a browser may read this database. Unset, it may unless the URI is a loopback
+   *  one, which is where a development database lives and the one place that must be asked for. */
+  cors?: boolean;
+  /** The edge type that records an edge another database drew at this one. Absent, no hints are
+   *  taken. See `BacklinkOptions.edge` for what a bare name admits. */
+  backlinks?: string;
 }
 
 export function parse(argv: readonly string[]): Args {
@@ -64,6 +70,15 @@ export function parse(argv: readonly string[]): Args {
       case "--allow-loopback":
         args.allowLoopback = true;
         break;
+      case "--backlinks":
+        args.backlinks = value();
+        break;
+      case "--cors":
+        args.cors = true;
+        break;
+      case "--no-cors":
+        args.cors = false;
+        break;
       default:
         throw new TypeError(`unknown argument ${flag}`);
     }
@@ -83,14 +98,34 @@ export async function main(argv: readonly string[]): Promise<void> {
     lock,
     identity: args.identity,
     allowLoopback: args.allowLoopback,
+    backlinks: args.backlinks === undefined ? undefined : { edge: args.backlinks },
   });
 
-  const node = await listen(database.binding, { path: args.path, port: args.port, host: args.host, database: args.uri });
+  const node = await listen(database.binding, { path: args.path, port: args.port, host: args.host, database: args.uri, cors: args.cors });
 
   const keys = database.binding.keys ?? [];
   console.log(`hlekk: serving ${node.database} from ${args.dir}`);
   console.log(`  catalog version ${database.catalog.version}, storage format ${database.cluster.directory.storageFormat()}`);
   console.log(`  ${keys.length === 0 ? "no published key: every caller is the anonymous one" : `key ${keys[keys.length - 1]!.id}`}`);
+
+  if (args.backlinks !== undefined) {
+    console.log(`  taking hints, and recording what they turn out to be true of as ${args.backlinks}`);
+    // No alarm on Node, so a timer asks. Unref'd: it is not a reason for the process to stay up.
+    //
+    // A second after the last look FINISHED, not every second: a look waits on other databases, and
+    // one that is slow to answer must not find the next look already started beside it. `confirm`
+    // would not let two run at once in any case; this is so that the timer does not queue up behind
+    // itself either.
+    const again = (): void => {
+      setTimeout(() => {
+        void database
+          .confirm()
+          .catch((e) => console.error("hlekk: some hints could not be settled", e))
+          .finally(again);
+      }, 1000).unref();
+    };
+    again();
+  }
 
   const stop = async (): Promise<void> => {
     await node.close();

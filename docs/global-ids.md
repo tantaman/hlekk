@@ -257,8 +257,9 @@ outbox.
 - **An `inverse` on an edge type that permits foreign targets.** Delivery routes through the host's
   own client, which is scoped to one database, and retries forever. Writing the other half would mean
   a host in one database holding credentials to write into another — a trust boundary crossed inside
-  a path with no give-up. If the target database wants a backlink it subscribes; it does not get
-  written into. So a cross-database edge is one-directional.
+  a path with no give-up. If the target database wants a backlink it is told where to look and reads
+  for itself ([`protocol.md`](protocol.md), *Backlinks*); it does not get written into. So a
+  cross-database edge is one-directional, and a backlink is a second one, drawn by the other side.
 - **`onDelete: cascade` on one.** A cascade across the boundary is a remote write. Foreign references
   have to be allowed to dangle, which the existing read path already tolerates: edges to missing
   objects are dropped at read time, and a maintained count still counts them.

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hlekk.dev/spec/schemas/hint-response.json",
+  "title": "POST {db}/hint \u2014 the answer, with status 202",
+  "description": "Received, and nothing more. It carries nothing about the target, about whether the responder will look, or about what it would record \u2014 so it is the same body for every hint that was taken.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    }
+  },
+  "required": [
+    "v"
+  ],
+  "additionalProperties": false
+}

@@ -23,6 +23,23 @@ query crosses the boundary over HTTP, and the wiki decides what the notes databa
 
 Try the [incident-to-release experiment](examples/incident-release/README.md). Give an agent one incident reference, let it follow the link to a maintainer’s Postgres release record, then repeat with the maintainer offline.
 
+And the wiki can answer who links to it, without anyone having written into it:
+
+```ts
+// The wiki takes hints, and records what they turn out to be true of.
+const wiki = await open({ dir, lock, backlinks: { edge: "wiki.page_cited_by" } });
+
+// Notes, after drawing its edge, says where to look.
+await notes.hint("notes.note_about", note, "https://wiki.example/db#281474976710691");
+
+// The wiki reads notes itself, and draws an edge of its own back. Nothing it was told is stored.
+await wiki.confirm();
+```
+
+A backlink is an ordinary edge out of the wiki, read like any other. The hint is signed, checked by
+a read, and may be dropped — [`docs/protocol.md`](docs/protocol.md) has the threat model, which is
+most of it.
+
 ## Where things are
 
 | | |
@@ -54,7 +71,13 @@ a published shard map — become files, and everything above them is the same co
 ```bash
 curl http://127.0.0.1:8080/db            # the descriptor: versions, keys, limits
 curl http://127.0.0.1:8080/db/vocabulary # the types and edges it exposes
+curl http://127.0.0.1:8080/.well-known/api-catalog  # what this origin serves
+curl http://127.0.0.1:8080/db/objects/<id>           # one object, by URL: a 404 until there is one
+curl http://127.0.0.1:8080/db/objects/<id>/<edge>    # one page of one of its lists
 ```
+
+The two under `objects/` are exactly the reads a `POST` to `/read` would make, for whatever can only
+fetch a URL. Anything deeper is a request: `POST` or `QUERY` a tree of hops to `/db/read`.
 
 A second one of these, on another machine, with an edge drawn at its URI, is a federation.
 
@@ -79,9 +102,12 @@ implementation under test would be checking that the implementation agrees with 
 - **Cross-database writes, inverses and cascades.** Reads only, and that is a decision rather than a
   gap: delivery routes through a host's own client, which is scoped to one database and never gives
   up, so writing the other half of a cross-database edge would mean holding credentials to write into
-  someone else's database inside a path with no give-up. A target database that wants a backlink
-  subscribes; it does not get written into.
-- **Backlinks across databases.** A subscription protocol with its own threat model.
+  someone else's database inside a path with no give-up. A target database that wants a backlink is
+  told where to look and reads for itself; it does not get written into.
+- **Backlinks nobody told it about.** A database records an edge back only after the database that
+  drew the edge sends a hint, and sending one is the application's call — nothing hints
+  automatically, and nothing retries. "Who anywhere links to this?" is an index built by something
+  that crawls, and is not here.
 - **A global directory of databases.** A URI is the name and DNS arbitrates it. Discovery is not
   identity.
 - **Many databases in one deployment.** One deployment serves one database, by decision rather than
@@ -94,7 +120,7 @@ implementation under test would be checking that the implementation agrees with 
   says so plainly; it is the principle the design would actually break, and the answer here is not to
   break it.
 
-## Two defaults worth knowing
+## Three defaults worth knowing
 
 - **A mounted database is publicly readable.** The protocol exists so a database can be read by
   another, and one that answers nothing is not participating in it, so that is where a responder
@@ -102,6 +128,10 @@ implementation under test would be checking that the implementation agrees with 
   all. What makes it safe is that **mounting the handler is the act of exposure**: a database that
   exists and is not mounted is reachable by nobody. `src/query/serve.ts` records the one thing that
   would invert that argument.
+- **A page in a browser may read it, unless it is on loopback.** For the same reason reads are
+  public: an answer depends on the request and on nothing a browser adds. That stops being true
+  wherever the network is the gate, so a database at a loopback URI sends no CORS headers until
+  asked (`--cors`), and one that is protected by where it sits has to say `--no-cors`.
 - **Writes are nobody's but yours.** There is no write operation in the protocol and there is not
   going to be one. Writing is your own client, inside your own deployment, behind whatever you
   already have.

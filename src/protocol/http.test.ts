@@ -35,10 +35,14 @@ describe("the protocol over HTTP", () => {
     assert.equal(d.limits.maxBody, MAX_BODY);
     // Empty rather than absent: step 5 fills it, and "authenticates nobody" has to be sayable.
     assert.deepEqual(d.keys, []);
+    // No `hint`: this database takes none, and says so by not stating the route. The last two are
+    // URI Templates, because the id in them is the caller's to fill in.
     assert.deepEqual(d.routes, {
       read: "https://issues.example/db/read",
       price: "https://issues.example/db/price",
       vocabulary: "https://issues.example/db/vocabulary",
+      object: "https://issues.example/db/objects/{id}",
+      list: "https://issues.example/db/objects/{id}/{edge}{?limit,after}",
     });
   });
 
@@ -255,11 +259,11 @@ describe("the protocol over HTTP", () => {
 
     const wrong = await at(binding, "/read", { method: "GET" });
     assert.equal(wrong.status, 405);
-    assert.equal(wrong.headers.get("allow"), "POST");
+    assert.equal(wrong.headers.get("allow"), "POST, QUERY, OPTIONS");
 
     const alsoWrong = await at(binding, "/vocabulary", { method: "POST", body: "{}" });
     assert.equal(alsoWrong.status, 405);
-    assert.equal(alsoWrong.headers.get("allow"), "GET");
+    assert.equal(alsoWrong.headers.get("allow"), "GET, HEAD, OPTIONS");
   });
 
   it("falls through on a route that is not its own, so a deployment can mount it beside others", async () => {
@@ -281,7 +285,14 @@ describe("the protocol over HTTP", () => {
     const res = await post(broken, "/read", { ids: [issue] });
     assert.equal(res.status, 500);
     const body = await res.json();
-    assert.deepEqual(body, { error: "internal error" });
+    // The whole of it: a kind a program can branch on, and nothing about what broke.
+    assert.deepEqual(body, {
+      type: "https://hlekk.dev/spec/problems/fault",
+      title: "This database failed",
+      status: 500,
+      detail: "internal error",
+      error: "internal error",
+    });
     assert.doesNotMatch(JSON.stringify(body), /fire|vshard|host/);
   });
 

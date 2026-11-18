@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hlekk.dev/spec/schemas/hint-request.json",
+  "title": "POST {db}/hint \u2014 the hint",
+  "description": "\"My object `source` may have an edge `edge` to your object `target`. A read of me will say.\" Not a write: nothing in it is recorded, and what the answering database does about one is read. It says LOOK and not THIS EXISTS, so the same hint is sent when the edge is drawn and when it is withdrawn.",
+  "type": "object",
+  "properties": {
+    "source": {
+      "description": "A bare id of the CALLING database. Bare on purpose: a database may speak only about its own objects, and a hint is an instruction to go and read whoever it names.",
+      "$ref": "common.json#/$defs/id"
+    },
+    "edge": {
+      "description": "The edge type's name in the calling database's vocabulary: what a read of `source` hops to reach the reference.",
+      "$ref": "common.json#/$defs/typeName"
+    },
+    "target": {
+      "description": "A bare id of the ANSWERING database.",
+      "$ref": "common.json#/$defs/id"
+    }
+  },
+  "required": [
+    "source",
+    "edge",
+    "target"
+  ],
+  "additionalProperties": false
+}

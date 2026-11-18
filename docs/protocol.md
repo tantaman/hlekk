@@ -240,9 +240,338 @@ database, and retries forever, so writing the other half would mean a host in A 
 write into B.
 
 The global graph is therefore a web of **outbound** links, like the actual web, and not a symmetric
-graph. There is no way to ask B who links to it. If backlinks are ever wanted they are a separate
-subscription protocol — B advertises an inbox, A notifies it, B decides whether to store anything —
-and that is a different document with a different threat model.
+graph. There is no way to ask B who links to it — unless B has been told and has gone and looked,
+which is the next section, and which leaves this one exactly as it stands.
+
+## Backlinks: a hint, and then a read
+
+Nov 18, 2026. **Built**: `src/protocol/hint.ts` and `backlinks.ts`, [`spec/protocol.md`](../spec/protocol.md)
+§11, and the conformance suite acting as a hinting database of its own.
+
+This section used to be one sentence saying backlinks would be "a separate subscription protocol …
+with a different threat model". The threat model is most of what follows. The protocol turned out to
+be one route, because the hard part already existed.
+
+**A backlink is not a new kind of edge.** When notes draws `note --about--> wiki#281`, the wiki can
+hold `page --cited_by--> notes#7`: an ordinary foreign edge, stored in the wiki, written by the
+wiki's own client, read with §5 exactly as it stood. Nothing about the graph changes. It is still
+made of outbound links only; a backlink is one of them, drawn by the database it points back from.
+So nothing had to be added to reading, to storage, to the vocabulary or to the answer.
+
+What was missing is how the wiki finds out. That is the hint: *my object 7 may have an edge
+`notes.note_about` to your object 281; a read of me will say*.
+
+**It is not a write, and the difference is not a matter of wording.** Nothing in a hint is recorded.
+The wiki reads notes — the source object, one hop over the named edge — and records what the READ
+showed. A hint that lies is a read that finds nothing. So "there is no operation by which one
+database changes another" is still true in the sense it was meant: the only thing a stranger can do
+to this database is ask to be looked at, and what is stored afterwards is what this database saw
+with its own request, under the other database's own policy.
+
+It also says *look* rather than *this exists*, which is why there is no second message. The same
+hint is sent when the edge is drawn and when it is withdrawn; a duplicate, a replay and a lie are
+all the same event, a read that finds what is there.
+
+### The threat model, as the rule each attack produced
+
+**Being aimed at a third party.** A hint makes the wiki send a request. If the hint could say where,
+any database could point the wiki at a victim: the reflection that pingback was used for. Two rules
+remove it and neither is a check. The hint **must be signed** (§7.2, unchanged), so the request goes
+to the database that asked for it. And `source` is a **bare id of the caller**, not a reference — a
+database may speak only about its own objects, and a field that cannot name another database's is a
+rule nobody has to remember to enforce. This is the own-namespace rule from *Per-user policy* above,
+arrived at a second time.
+
+This is also why the anonymous caller, who is a perfectly good caller for a read, is not one here.
+A read is answered and that is the end of it. A hint is answered and then acted on, so who sent it
+is not a question for policy; it is the address of the next request.
+
+**Being made to wait.** The claim is never looked at on the request path. Checking it means reading
+the caller's database, and a route that makes this database wait on a stranger's server has a
+latency the stranger sets. So the handler decides from the request alone and the read happens later,
+from a bounded queue with a quota per caller — and the first thing `settleHint` does is ask this
+database's own policy whether it would keep anything, *before* it spends a request finding out
+whether there is anything to keep.
+
+**Being asked what a read would not say.** The answer is `202` and the same bytes for every hint
+that was taken: for a target that exists, one that does not, and one the caller may not see. Forbidden
+is indistinguishable from absent on `/read`, and a hint that answered "no such object" would be the
+way around that. It also does not say whether anything will be recorded, because that is this
+database's policy and nobody is owed a backlink.
+
+**Being watched while it looks.** The status is not the only answer a hint gets. The checking read
+arrives at the caller's own server, so a wiki that reads notes only for targets that exist is telling
+notes which ids do: the `404` beside the `403` again, spelled as a request and the lack of one. A
+review found exactly that, by counting — one read of the caller for a page the policy hid, none for
+an id nothing had. So `settleHint` puts the target to the policy a read by the hinting database
+would have been answered under, and a target that read would have hidden is declined as one that is
+not there is: no request. `SettleOptions.policy` and `exposes` are `ServeOptions`' own, and a
+deployment that serves under a policy hands the same one to both. The conformance suite checks it
+from the only side that can, by being the database that would have been read.
+
+**Being made to remember.** Pinning a database interns it, and the checking read is a first contact.
+Done the obvious way, every domain that ever sent a hint about an existing page became a row in the
+registry and an alias, whether or not its edge was there — the thing "strangers do not grow the
+registry" exists to stop, by another door. So the check looks without remembering
+(`discoverPinned`'s `remember: false`): a pin already held is still checked and advanced, and a
+first contact writes nothing. The hinting database is interned and pinned only when an edge into it
+is actually recorded, at the key its descriptor showed when it was read. And a removal that finds
+no alias removes nothing and allocates nothing — `assocRemove` no longer interns a database in
+order to learn that it holds no edge into it.
+
+**Being made to look twice at once.** A look takes the whole queue and then waits on other people's
+servers. Started again beside itself — by a timer with a period shorter than a slow source — it
+stops being bounded by the queue, since the quota frees the moment a hint is taken; and it settles
+out of order, the look that read *present* before an edge was withdrawn writing after the look that
+read *absent*, which leaves a backlink nobody will ever hint about again. So `confirm()` is one look
+at a time: a call made during a look waits and looks again, and every call made meanwhile shares
+that second look.
+
+**Passing on a privileged view.** If the wiki reads notes *as the wiki*, notes may show it an edge
+the public cannot see, and the wiki would then be serving that edge to everybody. So the checking
+read is anonymous by default: what gets recorded is exactly what anyone could have read from notes
+themselves. A database can read as itself instead, and then holds something it must not pass on —
+which, as *What authentication does not buy* already says, nothing here can enforce.
+
+**Being erased by an outage.** The read has three outcomes and only two of them are answers. *Present*
+records; *absent* removes; and everything else — unreachable, refused, repudiated, malformed, a list
+longer than this database will page through — is *unknown* and changes nothing. Removing on "I could
+not tell" would let anyone who can make a database unreachable delete its backlinks.
+
+**Being spammed, and what the list is worth.** Verification establishes that an edge is *true*, not
+that it is *wanted*: anyone can run a database and link to you. Three things follow. Whether to keep
+one is the target's policy, asked per hint with who is hinting and what at. A recorded edge should
+sit under an edge type of its own, distinct from the edges the database authored, so its vocabulary
+says which of its links it chose and which were only confirmed — for an agent this is the one list
+on someone's object where a stranger picked what gets read next. And a recorded edge keeps the time
+it was FIRST confirmed: an add is an upsert that moves an edge to the head of its list, a source can
+hint as often as it likes, and with a plain add the newest entry in anyone's backlinks would be
+whoever repeated themselves last. That is `assocAddIfAbsent`, and it is the only change the engine
+needed.
+
+### One ruling: a recorded edge is a kept answer
+
+§5.6 lets a caller keep an answer for the seconds its responder states, and a backlink is kept for
+longer than that — indefinitely, from an answer that may well have said `reuse: never`. So either a
+backlink is a cache entry that has to be revalidated every sixty seconds, which makes it useless, or
+something permits it. **Sending a hint is consent**: the source permits the target to keep the one
+fact the hint is about, that this edge exists, until a later read says otherwise. It permits nothing
+else from that read. The conformance suite's own database answers `reuse: never` for exactly this
+reason.
+
+It is also why a hint is never sent automatically. Sending one discloses the edge to the database it
+points at and lets that database record it, and that is the application's to decide per edge, not a
+side effect of writing one.
+
+### What was considered and is not this
+
+- **Webmention's wire format.** The shape is Webmention's — notify, then the receiver fetches the
+  source and checks — and that is deliberate; it is a W3C Recommendation and the verification step is
+  the good idea in it. The format is not usable. It verifies by a `GET` of the source URL, and a
+  reference's `#id` is a fragment that never reaches a server. It is also unsigned, which is the
+  reflection above.
+- **An inbox that is believed.** The other federated design: the sender delivers the content and the
+  receiver stores it, on the strength of a signature. Everything hard about it comes from believing
+  the payload — whose signature covers what, what to do with an activity about a third party. Here
+  the payload is three strings and none of them is trusted for anything but where to look.
+- **An inverse through the outbox.** Already refused in `global-ids.md`, and the hint is that refusal
+  read backwards: delivery there needs credentials for another database and never gives up, and a
+  hint needs neither. **A hint may be dropped**, and that is the property that lets it exist. If this
+  process dies with fifty queued, fifty edges go unrecorded until their sources say so again, and
+  nothing that was true has become false. So the queue is in memory, on purpose.
+- **A request member that asks "is this edge there".** The checking read has to page through the
+  source's list looking for one reference, because a request has no way to ask about a single edge.
+  Adding one is a new request member, which is a new wire version (§9), which this does not justify.
+  The cost is real and bounded: a hint about an edge deeper than the pages this database will read
+  comes back *unknown*.
+- **A feed per database instead of a hint per edge.** "Everything I link to in you, since this
+  cursor" is the better protocol for a busy pair: one notification, then pulls, idempotent and
+  self-healing. It needs the source to keep an index of its foreign edges by target database, which
+  it does not have. Additive later, and it would replace nothing here.
+- **Backlinks from databases that never said so.** Not a protocol feature at all: an index, built by
+  something that crawls. An indexer is an ordinary hlekk database holding edges it drew. What it
+  lacks is an entry by key — reference to local id — which *Open* below records as a separate
+  decision, and it still is one.
+
+### What is not built
+
+- **Sending is the application's call**, one `hint()` after the write and one after the remove.
+  Nothing retries. A source that wants every hint delivered needs a durable queue with a give-up,
+  which is a different thing from the outbox and is not written.
+- **Nothing re-checks on a schedule.** A recorded edge is looked at again only when its source hints
+  again. A source that withdraws an edge and does not say so leaves a link that leads nowhere, found
+  when someone follows it — which is what a dead link is, and what the read path already does with
+  an edge to a missing object.
+- **One edge type recording several of a caller's.** A policy may map two of a source's edge types to
+  one of its own. A hint for one that finds it absent then removes the record while the other still
+  stands, until that one is hinted again. Record under separate types where that matters.
+- **Only the Node adapter looks at its queue.** The protocol layer is platform-free, and `open()`
+  wires it; a Durable Object would settle hints from its alarm, and that wiring is not written.
+- **One slow source holds the line.** Hints are settled one at a time and in order, which is what
+  keeps two looks from racing. A caller whose server answers at the deadline therefore delays every
+  hint queued behind its own, by up to its quota times the pages read times the deadline. Nothing
+  that was true becomes false, and a full queue answers `503`; a budget per caller per look would
+  bound it, and is not written.
+- **A hint carries who signed it, not the key.** So a database whose policy differs by caller
+  decides a target's visibility from the caller's URI (`SettleOptions.policy` as a function). The
+  Node adapter has one policy for everyone and hands that over.
+- **A policy still cannot hide a reference** (PLAN.md, *Open*). It decides objects and counts, and a
+  recorded edge is neither. A database serves its backlinks to everyone who may see the object they
+  hang off, or does not expose the edge type at all.
+
+## What HTTP is for here, and what it is not
+
+Nov 18, 2026. **Built**: `src/protocol/http.ts`, `wellknown.ts`, the descriptor cache in
+`client.ts`, and [`spec/protocol.md`](../spec/protocol.md) §3.1–3.4, §8.1 and §12.
+
+The protocol was already on HTTP and used very little of it: two methods, seven status codes, and a
+`Cache-Control` on the one response nothing would ever cache. That was not an oversight so much as a
+suspicion, and the suspicion is right about half of HTTP. Its defaults are permissive — follow the
+redirect, ignore the unknown field, guess a freshness lifetime — and this protocol's whole value is
+the places where it refuses to be. So the question was never "how much HTTP" but which parts, and
+one test answers it:
+
+> Adopt a mechanism when a party that does **not** speak this protocol benefits from it, and when
+> nothing breaks if it is stripped on the way.
+
+A cache, a browser and a client with nothing but a way to fetch a URL are the three such parties.
+Everything below is for one of them. And `§5.6` already had the second half of the test in it — "the
+body is normative" — so that became the rule for every header rather than for one: a header restates
+the body. The single exception is `Retry-After`, which is the only thing a `429` says that its body
+does not.
+
+### What reading the code against that test found
+
+- **The two most-fetched documents said nothing about themselves.** The descriptor and the
+  vocabulary went out with no `Cache-Control` and no validator, and the client read a database's
+  descriptor before *every* batch — while a signed read made the responder fetch the caller's
+  descriptor in the middle of answering it.
+- **The one `Cache-Control` there was could not work.** A read's answer says `public, max-age=60`,
+  on a `POST`. Nothing between a caller and a database keeps a `POST`'s answer however plainly it is
+  invited to.
+- **A browser could not ask anything.** A read with a JSON body is preflighted, the preflight is an
+  `OPTIONS`, and `OPTIONS` got a `405`. A database that is public by default was unreadable from
+  every page on the web.
+- **There was no way to say "later".** A request was right or wrong. A responder that had simply
+  had enough had `400` to reach for, which teaches a caller to retry at once.
+- **A client that can only `GET` could read the vocabulary and no object.** Which is a strange
+  place to leave something described as a structured internet for agents, when a fetch tool is the
+  one thing every agent has.
+- **A refusal's kind was a sentence.** `error` is English, and a program that wants to know whether
+  to re-read the vocabulary or shrink its request was parsing it.
+
+### What was taken, and the catch in each
+
+**A validator that is a digest of the bytes.** `ETag` on every `200` to a safe method, `304` to a
+match. The tempting tag is the object's `version`, which is already in the answer and costs nothing
+— and is wrong, because what a caller is shown also depends on the projection, the catalog version
+and the policy for that caller, none of which move the version. A digest is a fact about the bytes
+and cannot be wrong about any of them. It costs a hash of an answer that has already been built, and
+saves bytes rather than work, which is the honest size of it.
+
+**A lifetime on the descriptor, and what it does to a pin.** `Cache-Control: public, max-age=60` on
+the descriptor and the vocabulary, and a client that believes it: three reads, one descriptor, and
+after the minute a conditional request that is answered in headers. This is the one adoption that
+touches the security model, so it is stated rather than slipped in. A caller reusing a descriptor
+has, for the purposes of §7.3, not contacted the database — it will not notice a changed key until
+the lifetime runs out. That is the same exposure an answer's `seconds` already was, it is opt-in on
+the asking side, and the client caps it at 300 seconds whatever the responder claims, because a
+responder may say a year and a caller that believed it would not look at that database's keys for a
+year.
+
+Two things follow from it that were not obvious. A responder verifying a caller against a kept
+descriptor will meet a key id that descriptor does not list, and a rotation it has not seen looks
+exactly like a key nobody published — so it looks once more before refusing, and only when its first
+answer came from memory, so that a stranger inventing key ids buys one request and not two. And
+PLAN.md's open question of how long a retired key's grace window should be gets a floor it did not
+have: **at least the lifetime the descriptor states**, or a caller holding yesterday's copy meets a
+signature it cannot place.
+
+**`QUERY`, beside `POST` and not instead of it.** RFC 10008 was published in June 2026 and is the
+method this protocol wanted from the start: a body, and the promise that the request is safe and
+idempotent. A responder may take it on `/read` and `/price` as the same request, says so in `Allow`,
+and a caller that never looks is unaffected. `POST` stays required because it is what version 1
+named and what every client can send. The catch is one a cache finds for you if you do not: identity
+here is in `Hlekk-Caller` and not in `Authorization`, which is the only header a shared cache knows
+to distrust. Without `Vary: Hlekk-Caller`, an answer kept for the anonymous caller is handed to a
+signed one who was owed more. It is the house failure — a wrong answer that looks like a right one —
+arriving through an intermediary.
+
+**Two reads by URL.** `GET {db}/objects/{id}` and `GET {db}/objects/{id}/{edge}`, stated in the
+descriptor as templates. Each is *exactly* a read — the same price, the same policy, the same body,
+a refusal's `at` a path into the request it stands for — because a second way to spell a request is
+a second thing for a price and a cache key to disagree about. That is also why there is one hop and
+no more: these are two fixed shapes, so there is nothing to spell. An object that is not there is a
+`404`, and it is the same `404`, headers included, for one the policy hides. A `200` with an empty
+answer was the alternative and is closer to what `/read` does; `404` won because the party this
+route exists for is one that reads a status and may never be shown a body.
+
+**CORS, on by default, off on loopback.** The argument for `Access-Control-Allow-Origin: *` is the
+argument for public reads: an answer depends on the request and on nothing a browser adds, so a page
+learns nothing through a visitor's browser that it could not have fetched itself. That argument is
+about the request, and it is false wherever the *network* is the gate. A database on an intranet, or
+one a developer started on `127.0.0.1`, is readable through the browser of anyone who can reach it,
+by any page they open. So the default follows the same line `canonicalDb` draws: on, except for a
+loopback URI, which is the one place `http` is allowed and for the same reason. The hazard is
+recorded beside the default, as with `PUBLIC`, and a database whose protection is where it sits must
+turn it off.
+
+**`429` and `503`, and no limiter.** `Backoff` is thrown by whatever a deployment plugs in and the
+handler turns it into a status and a `Retry-After`. `Binding.admit` is where a deployment plugs it
+in, called after the price and before any storage is read, with the cost in hand — so "answer nodes
+per caller per minute" is arithmetic over something already computed. Nothing here supplies the
+limiter itself. Who an anonymous caller *is* is an address, and an address is something only the
+platform in front of this handler has.
+
+**A refusal with a kind.** RFC 9457's `type`, `title`, `status` and `detail`, beside `error`, `at`
+and `offset`. Twelve kinds, of which three matter: a `400` is `malformed`, `vocabulary` or `limit`,
+named for which document the caller should go back to — none, the vocabulary, or the limits. Three
+and not thirty, because that is the distinction a program acts on.
+
+*I said, before building this, that it needed a new wire version because the refusal schema is
+closed. That was wrong, and the spec says why: §9 makes an optional member of a response additive.
+The schema changes with the spec, in the same commit, which is what CONTRIBUTING asks.* What would
+have needed a new version is the media type, and so that is the part not taken: a refusal is still
+`application/json`, because §3 said every body is before §8.1 existed, and a caller built against
+that is owed the header it was promised.
+
+**A catalog at the origin.** RFC 9727's `/.well-known/api-catalog`, listing each database with a
+link to its descriptor and its vocabulary. It answers the one question a URI cannot: what is on this
+host. PLAN.md leaves a global directory of databases out on purpose, and this is not one — it is
+the origin DNS already arbitrated, saying what it serves. It names nothing else, it is never
+consulted to follow a reference, and nothing it says is about identity.
+
+### What was considered and is not this
+
+- **`application/problem+json`**, and negotiating for it with `Accept`. The first changes a `MUST`
+  for callers already built; the second puts `Vary: Accept` on every refusal for the benefit of
+  tooling that keys on a label.
+- **A request tree in a query string**, or a hash of one. It would make every read cacheable by
+  `GET`, and give every request two spellings. `QUERY` is the standard's answer to the same wish.
+- **`RateLimit` headers.** Still an Internet-Draft, with a "not ready" directorate review in January
+  2026. `Retry-After` is the part that is settled, and it is the part a caller acts on.
+- **Web Bot Auth as a second signature profile.** A working-group draft on the same RFC 9421 base
+  as §7.2, and how agents that are not databases are starting to say who they are. Worth taking when
+  it is a standard, since such a caller can only be anonymous here today; not worth a second profile
+  on the strength of a draft, given what §7.2 says about every algorithm a verifier accepts.
+- **Redirects, and `403` or `410` for an object.** Each is HTTP being more informative than this
+  protocol permits itself to be.
+- **Signing responses.** It would make a kept or mirrored answer checkable without trusting whoever
+  kept it, which is worth having. It is also a change to who §7.2 binds, and belongs to a version.
+- **Edges in `Link` headers.** The answer already has a form for a list, with a cursor.
+- **JSON-LD.** The names are already URIs where it matters, and the half of the semantic web this
+  would import is the half with no price on a query.
+
+### Not built
+
+- **The asking half does not send `QUERY`.** The client still `POST`s, which every responder takes.
+  It gains nothing until there is a shared cache in the path, and choosing the method per responder
+  is a little machinery that nothing yet needs.
+- **Nothing limits.** `admit` is a hook. The Node adapter and the Workers ship with none.
+- **The vocabulary is not kept.** The client still reads it once per isolate and never again, which
+  predates this and is not changed by it.
+- **The Cloudflare example does not serve the catalog.** `serveCatalog` is a function for whoever
+  owns the origin, and only the Node adapter calls it.
 
 ## Type agreement, not type naming
 
@@ -268,6 +597,10 @@ would make permanent, and so only these need to be right before it is published.
 | Cacheability stated in the response | A caller that cached on a guess is already serving stale answers |
 | The identity scheme and the rotation story | Changing how a key is discovered or rotated invalidates every pin in existence |
 | That the request is a tree and not a plan | Accepting a plan later is easy; refusing one after people send them is not |
+| That a hint's `source` is a bare id of its sender | A responder that took a reference there is one any database can aim at a third, and senders would be relying on it |
+| That a hint is signed, and its answer says nothing | A caller that once learned "recorded" from a `202` reads it into every one; an unsigned hint cannot be made safe afterwards |
+| That a read by URL is exactly a read, one hop deep | Every parameter added to it later is a second spelling of a request, and URLs get written down |
+| The problem `type` URIs | A program branches on the string. Renaming one breaks every caller that does |
 
 Everything else — the limits, the vocabulary, the enforcement model, the alias column, the registry's
 columns — is an implementation's own and can move.

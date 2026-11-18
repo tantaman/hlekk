@@ -4,7 +4,7 @@
 // the platform it was designed on. See `database.ts` for what it swaps and what it does not.
 
 export { open } from "./database.ts";
-export type { NodeHlekk, OpenOptions } from "./database.ts";
+export type { BacklinkOptions, NodeHlekk, OpenOptions } from "./database.ts";
 export { listen } from "./http.ts";
 export type { ListenOptions, NodeDatabase } from "./http.ts";
 export { PrivateAddress, isPublicAddress, privateAddressGuard } from "./guard.ts";

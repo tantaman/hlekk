@@ -341,7 +341,7 @@ export function price(req: ReadRequest, opts: ServeOptions): Cost {
   }
   const ids = req?.ids;
   if (!Array.isArray(ids) || ids.length === 0) throw new Refused("ids", "at least one id is required");
-  if (ids.length > maxIds) throw new Refused("ids", `${ids.length} ids, the maximum is ${maxIds}`);
+  if (ids.length > maxIds) throw new Refused("ids", `${ids.length} ids, the maximum is ${maxIds}`, undefined, "limit");
   for (const [i, id] of ids.entries()) {
     if (typeof id !== "string") throw new Refused("ids", `ids[${i}] must be a decimal string`);
     // Parsed, not merely typed. The entry is the one part of a request that is not a name from the

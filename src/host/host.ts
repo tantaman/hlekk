@@ -155,6 +155,15 @@ export interface AssocAddOp extends RoutedAt {
   id2: Id;
   time?: number;
   data?: Fields | null;
+  /**
+   * Leaves an edge that is already there exactly as it is, `time` included.
+   *
+   * An add is an upsert, and an upsert moves the edge to the head of its list — which is right for an
+   * application re-stating its own edge and wrong for an edge somebody else can cause to be re-stated.
+   * A confirmed backlink (`protocol/backlinks.ts`) is written again every time its source hints again,
+   * so without this a source could keep itself first in another database's list by repeating itself.
+   */
+  keep?: boolean;
 }
 
 /** One edge in a batched add. Identical to `AssocAddOp` minus the epoch, which the batch carries
@@ -450,6 +459,10 @@ export class Host {
     return this.#write(() => {
       this.#own(op.atype);
       this.#claim(vshardOf(op.id1), op.epoch);
+      // Checked inside the transaction, so nothing can add the edge between the look and the write.
+      // Nothing else is owed for an edge that is already there: its count was moved and its inverse
+      // was dispatched by the add that created it.
+      if (op.keep === true && this.#hasEdge(toKey(op.id1), op.atype, db, toKey(op.id2))) return;
       this.#putEdge(op.atype, op.id1, db, op.id2, time, data);
       const inverse = this.#catalog.inverseOf(op.atype);
       // The inverse runs the other way, so it lives on id2's vshard. `localTarget` is the audit: an

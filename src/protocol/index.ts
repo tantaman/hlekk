@@ -3,8 +3,8 @@
 // `spec/protocol.md` is the normative specification and `spec/schemas/` the normative shapes. This
 // is one implementation of them.
 
-export { DESCRIPTOR_VERSION, MAX_BODY, descriptorOf, handle, mountOf } from "./http.ts";
-export type { Binding, Descriptor, DescriptorKey } from "./http.ts";
+export { DESCRIBED_FOR, DESCRIPTOR_VERSION, MAX_BODY, PROBLEMS, descriptorOf, handle, mountOf, refusal } from "./http.ts";
+export type { Admission, Binding, Descriptor, DescriptorKey, ProblemKind, RefusalBody } from "./http.ts";
 
 export { WIRE_VERSION, WireError, decodePrice, decodeRead, encodeRead } from "./wire.ts";
 export type { Decoded, PriceResponse, ReadResponse, WireObject } from "./wire.ts";
@@ -20,11 +20,26 @@ export {
   MAX_RESPONSE_BYTES,
   NotFollowed,
   Repudiated,
+  DescriptorCache,
+  MAX_DESCRIPTOR_SECONDS,
   ResponseCache,
+  discover,
+  discoverPinned,
   foreignClient,
   foreignClients,
 } from "./client.ts";
-export type { ForeignOptions, Omitted, Pins } from "./client.ts";
+export type { ForeignOptions, Omitted, Pins, TransportOptions } from "./client.ts";
+
+// Being listed where an origin says what it serves (RFC 9727).
+export { CATALOG_PROFILE, CATALOG_TYPE, WELL_KNOWN, apiCatalog, serveCatalog } from "./wellknown.ts";
+export type { CatalogEntry } from "./wellknown.ts";
+
+// Backlinks: a hint received, a read that checks it, and an edge of this database's own.
+export { Backoff, retryAfterOf } from "./backoff.ts";
+export { HINT_MEMBERS, HintQueue, parseHint } from "./hint.ts";
+export type { Hint, HintQueueOptions, HintSink, ReceivedHint } from "./hint.ts";
+export { DEFAULT_CHECK_PAGES, checkHint, sendHint, settleHint } from "./backlinks.ts";
+export type { CheckOptions, HintSent, Reach, Settled, SettleOptions, Verdict } from "./backlinks.ts";
 
 export {
   ALG,

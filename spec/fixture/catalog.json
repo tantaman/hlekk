@@ -16,6 +16,10 @@
       "fields": {
         "label": "string"
       }
+    },
+    "conf.citation": {
+      "otype": 3,
+      "fields": {}
     }
   },
   "edges": {
@@ -34,8 +38,14 @@
       "to": "conf.page",
       "foreign": true,
       "atype": 3
+    },
+    "conf.page_cited_by": {
+      "from": "conf.page",
+      "to": "conf.citation",
+      "foreign": true,
+      "atype": 4
     }
   },
   "tombstones": [],
-  "sum": "7b2ae57d208b8669"
+  "sum": "4c106f7d2423ac30"
 }

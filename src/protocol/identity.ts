@@ -288,8 +288,10 @@ export interface VerifyOptions {
   now: number;
   maxSkewSeconds?: number;
   /** The caller's published keys. Fetched by the responder from the caller's own descriptor, with
-   *  the same defences a read of it gets — see `protocol/client.ts`. */
-  keysOf: (database: string) => Promise<readonly PublicKey[]>;
+   *  the same defences a read of it gets — see `protocol/client.ts`. `wanted` is the id of the key
+   *  the request claims, so that whoever keeps descriptors for a while can tell a key it has never
+   *  seen from a rotation it has not caught up with, and look again only for the second. */
+  keysOf: (database: string, wanted: string) => Promise<readonly PublicKey[]>;
 }
 
 /**
@@ -331,7 +333,7 @@ export async function verifyRequest(opts: VerifyOptions): Promise<Caller | null>
   const sent = opts.headers.get("content-digest");
   if (sent !== digest) throw new SignatureRefused("content-digest does not match the body");
 
-  const keys = await opts.keysOf(database);
+  const keys = await opts.keysOf(database, parsed.keyId);
   if (!(await wellFormed(keys))) throw new SignatureRefused("the caller published malformed keys");
   const key = keys.find((k) => k.id === parsed.keyId);
   if (key === undefined) throw new SignatureRefused(`${database} publishes no key ${parsed.keyId}`);

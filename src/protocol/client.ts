@@ -39,6 +39,7 @@ import type { ReadRequest } from "../query/serve.ts";
 import { DESCRIPTOR_VERSION } from "./http.ts";
 import { WIRE_VERSION, decodeRead } from "./wire.ts";
 import { reachable, signRequest, wellFormed } from "./identity.ts";
+import { retryAfterOf } from "./backoff.ts";
 import type { KeyPair, SignedHeaders } from "./identity.ts";
 import type { Descriptor } from "./http.ts";
 
@@ -60,10 +61,14 @@ export class ForeignRefused extends Error {
 
 export class ForeignUnreachable extends Error {
   readonly database: string;
-  constructor(database: string, why: string) {
+  /** Seconds the database asked to be left alone for, when what it said was "not now" — a 429 or a
+   *  503 with `Retry-After`. Absent for every other way of not being readable. */
+  readonly retryAfter?: number;
+  constructor(database: string, why: string, retryAfter?: number | null) {
     super(`${database} could not be read: ${why}`);
     this.name = "ForeignUnreachable";
     this.database = database;
+    if (retryAfter !== undefined && retryAfter !== null) this.retryAfter = retryAfter;
   }
 }
 
@@ -149,6 +154,17 @@ export interface ForeignOptions {
    */
   cache?: ResponseCache;
   /**
+   * Keeps a database's descriptor for as long as that database said it may be kept, and asks again
+   * with its validator after that.
+   *
+   * Absent, the descriptor is read before every batch, which is what this did before a responder
+   * said anything about how long one is good for. Present, a caller goes up to that long — and never
+   * more than `MAX_DESCRIPTOR_SECONDS` — without re-checking the database's keys against its pin.
+   * That is the same trade an answer's `seconds` already is: what this database knows about another
+   * is as old as the other said it may be.
+   */
+  descriptors?: DescriptorCache;
+  /**
    * Checks that the two catalogs mean the same thing by a type name, once per database and type.
    *
    * A globally unique name says nothing about whether the reader knows the shape behind it, so a
@@ -192,6 +208,49 @@ export class ResponseCache {
     if (this.#held.size >= 128) this.#held.delete(this.#held.keys().next().value!);
     this.#held.set(key, { body, until: now + seconds * 1000 });
   }
+}
+
+/** The longest a descriptor is kept without asking again, whatever its database claims. A
+ *  responder may say a year; a caller that believed it would not look at that database's keys for a
+ *  year. Five minutes is the signature window, which is already how stale two databases' views of
+ *  each other are allowed to be. */
+export const MAX_DESCRIPTOR_SECONDS = 300;
+
+/** Descriptors, each kept for as long as its database permitted and revalidated after. One per
+ *  asking database, held for the life of an isolate. */
+export class DescriptorCache {
+  readonly #held = new Map<string, { descriptor: Descriptor; etag: string | null; until: number }>();
+  /** Descriptors answered from here without a request, for a test that counts them. */
+  hits = 0;
+  /** Descriptors a responder confirmed unchanged with a 304. */
+  confirmed = 0;
+
+  peek(db: string): { descriptor: Descriptor; etag: string | null; until: number } | undefined {
+    return this.#held.get(db);
+  }
+
+  /** Whether a descriptor for this database would be answered from here right now. */
+  fresh(db: string, now: number = Date.now()): boolean {
+    const held = this.#held.get(db);
+    return held !== undefined && held.until > now;
+  }
+
+  /** `seconds` below zero is "do not keep this at all"; zero keeps it only to ask "has it changed". */
+  put(db: string, descriptor: Descriptor, etag: string | null, seconds: number, now: number): void {
+    this.#held.delete(db);
+    if (seconds < 0 || (seconds === 0 && etag === null)) return;
+    if (this.#held.size >= 256) this.#held.delete(this.#held.keys().next().value!);
+    this.#held.set(db, { descriptor, etag, until: now + Math.min(seconds, MAX_DESCRIPTOR_SECONDS) * 1000 });
+  }
+}
+
+/** How long a response says it may be reused, from `Cache-Control`: -1 for `no-store`, 0 where it
+ *  says nothing a cache can act on, otherwise `max-age`. */
+function freshFor(headers: Headers): number {
+  const control = (headers.get("cache-control") ?? "").toLowerCase();
+  if (control.includes("no-store")) return -1;
+  const age = /(?:^|[\s,])max-age=(\d{1,9})/.exec(control);
+  return age === null ? 0 : Number(age[1]);
 }
 
 /** The registry's pin columns, as the asking half needs them. */
@@ -257,42 +316,6 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     });
   }
 
-  async function discoverPeer(spend?: () => AbortSignal): Promise<Descriptor> {
-    const pins = opts.pins;
-    if (!pins) return discover(db, opts, spend);
-    const held = await pins.pinOf(db);
-    if (held.state === "repudiated") {
-      throw new Repudiated(db, "an operator has to clear this before a read through it can run again");
-    }
-    const descriptor = await discover(db, opts, spend);
-    const keys = descriptor.keys;
-    if (keys.length === 0) {
-      // A database that publishes no key cannot be pinned, and a pin held against one that used to
-      // publish keys is not something to quietly forget.
-      if (held.pinned !== null) {
-        await pins.repudiate(db);
-        throw new Repudiated(db, "it published a key before and publishes none now");
-      }
-      return descriptor;
-    }
-    const current = keys.find((k) => k.retired === undefined)!;
-
-    if (held.pinned === null) {
-      // First contact. The current key — the one it has not retired — is what gets pinned.
-      await pins.pin(db, current.id);
-      return descriptor;
-    }
-    const reached = await reachable(keys, held.pinned);
-    if (reached?.id !== current.id) {
-      await pins.repudiate(db);
-      throw new Repudiated(db, `it publishes no key reachable from the pinned ${held.pinned}`);
-    }
-    // The pin advances along the rotation chain, so the next contact starts from the newest key it
-    // has proved rather than from one that may fall out of the grace window.
-    if (reached.id !== held.pinned) await pins.pin(db, reached.id);
-    return descriptor;
-  }
-
   let agreed: ReadonlySet<string> | undefined;
 
   return {
@@ -300,7 +323,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     async exec(plan, tasks, spend): Promise<HostReply> {
       const gathered: Gathered = { objects: new Map(), lists: [], counts: new Map() };
       try {
-        const descriptor = await discoverPeer(spend);
+        const descriptor = await discoverPinned(db, opts, spend);
         const advertised = descriptor.limits;
         const max = advertised.maxIds;
         for (const batch of group(tasks, plan, opts.catalog, max, advertised)) {
@@ -698,32 +721,48 @@ function fieldEdge(catalog: Catalog, field: string): string | undefined {
   return matches.length === 1 ? matches[0].name : undefined;
 }
 
-type TransportOptions = Pick<ForeignOptions, "fetch" | "guard" | "maxResponseBytes" | "deadlineMs">;
+export type TransportOptions = Pick<ForeignOptions, "fetch" | "guard" | "maxResponseBytes" | "deadlineMs" | "descriptors" | "now">;
 
-async function readJson(db: string, url: string, opts: TransportOptions, init: RequestInit, spend?: () => AbortSignal): Promise<unknown> {
+/** What came back, before anyone has decided what it means. */
+export interface Exchanged {
+  status: number;
+  headers: Headers;
+  body: string;
+}
+
+/** How much of a body is read when the status already says the request did not succeed. A refusal is
+ *  a sentence and a path; a megabyte of one is a stranger spending this isolate's memory. */
+const MAX_REFUSAL_BYTES = 64 * 1024;
+
+/**
+ * One request to another database, behind every defence a stranger's server needs: the address
+ * guard, a deadline, the query's own budget, a cap on the bytes read, and no redirects.
+ *
+ * Returns whatever status came back, because what a status means depends on who asked — a 404 is a
+ * failure to a read and an answer to "do you take hints". Throws `ForeignUnreachable` for everything
+ * that is not an answer at all: a refused connection, a timeout, a body over the cap.
+ */
+export async function exchange(
+  db: string,
+  url: string,
+  opts: TransportOptions,
+  init: RequestInit,
+  spend?: () => AbortSignal,
+): Promise<Exchanged> {
   const budget = spend?.();
   const timeout = AbortSignal.timeout(opts.deadlineMs ?? DEADLINE_MS);
   const signal = budget ? AbortSignal.any([budget, timeout]) : timeout;
   const cap = opts.maxResponseBytes ?? MAX_RESPONSE_BYTES;
   const call = opts.fetch ?? opts.guard?.fetch ?? fetch;
-  async function exchange() {
+  async function once(): Promise<Exchanged> {
     if (opts.guard && call !== opts.guard.fetch) await opts.guard(db);
     signal.throwIfAborted();
     const res = await call(url, { ...init, signal, redirect: "error", cache: "no-store" });
-    if ([400, 401, 403].includes(res.status)) {
-      const refusal = await text(res, cap).then(parse).catch(() => null) as { error?: string; at?: string } | null;
-      throw new ForeignRefused(db, `${refusal?.at ?? "?"}: ${refusal?.error ?? `status ${res.status}`}`);
-    }
-    if (!res.ok) {
-      void res.body?.cancel().catch(() => {});
-      throw new ForeignUnreachable(db, `status ${res.status}`);
-    }
-    const raw = await text(res, cap);
-    try {
-      return parse(raw);
-    } catch {
-      throw new ForeignUnreachable(db, "the answer is not JSON");
-    }
+    if (res.ok) return { status: res.status, headers: res.headers, body: await text(res, cap) };
+    // Not an answer to what was asked, so what it says is read only as far as a refusal runs. One
+    // that is longer than that is dropped rather than failed on: the status is the information.
+    const body = await text(res, Math.min(cap, MAX_REFUSAL_BYTES)).catch(() => "");
+    return { status: res.status, headers: res.headers, body };
   }
   let abort!: () => void;
   const aborted = new Promise<never>((_, reject) => {
@@ -731,19 +770,137 @@ async function readJson(db: string, url: string, opts: TransportOptions, init: R
     signal.addEventListener("abort", abort, { once: true });
   });
   try {
-    return await Promise.race([exchange(), aborted]);
+    return await Promise.race([once(), aborted]);
   } catch (e) {
     if (budget?.aborted) throw budget.reason;
-    if (e instanceof ForeignRefused || e instanceof ForeignUnreachable || (e as Error).name === "PrivateAddress") throw e;
+    if (e instanceof ForeignUnreachable || (e as Error).name === "PrivateAddress") throw e;
     throw new ForeignUnreachable(db, (e as Error).message);
   } finally {
     signal.removeEventListener("abort", abort);
   }
 }
 
-export async function discover(database: string, opts: TransportOptions, spend?: () => AbortSignal): Promise<Descriptor> {
+/** A request whose only acceptable answer is a JSON body. A refusal is named as one, with the path
+ *  the responder gave; anything else that is not a success is the database not being readable. */
+export async function readJson(db: string, url: string, opts: TransportOptions, init: RequestInit, spend?: () => AbortSignal): Promise<unknown> {
+  return jsonOf(db, await exchange(db, url, opts, init, spend));
+}
+
+/** The JSON a successful answer carries, or the error its status is. */
+function jsonOf(db: string, res: Exchanged): unknown {
+  if ([400, 401, 403].includes(res.status)) {
+    const refusal = refusalOf(res.body);
+    throw new ForeignRefused(db, `${refusal?.at ?? "?"}: ${refusal?.error ?? `status ${res.status}`}`);
+  }
+  if (res.status < 200 || res.status > 299) {
+    // "Not now" keeps its number. A caller that retries at once after a 429 is the reason there is
+    // a 429, and the only way it can do otherwise is to be handed how long.
+    throw new ForeignUnreachable(db, `status ${res.status}`, retryAfterOf(res.headers));
+  }
+  try {
+    return parse(res.body);
+  } catch {
+    throw new ForeignUnreachable(db, "the answer is not JSON");
+  }
+}
+
+/** A refusal's body, or null when it is not one. Never throws: a responder that refuses in a shape
+ *  nobody can read has still refused. */
+export function refusalOf(body: string): { error?: string; at?: string } | null {
+  try {
+    const parsed = parse(body);
+    return parsed !== null && typeof parsed === "object" ? (parsed as { error?: string; at?: string }) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A database's descriptor, checked against what this database recorded about it before.
+ *
+ * First contact pins the current key; later contact accepts only that key or one reachable from it
+ * through rotation signatures, and advances the pin to the key reached. Anything else repudiates the
+ * database here, and every read through a reference into it fails by name until an operator clears
+ * it. Without `pins`, the published keys are taken at face value every time.
+ *
+ * `remember: false` is for looking at a database this one has not decided to keep anything about —
+ * the read that checks a stranger's hint. A first contact then writes nothing, because pinning
+ * interns, and a row for every database that ever asked to be looked at is the registry growing at
+ * a stranger's say-so. A pin that is ALREADY held is still checked and still advanced: a database
+ * this one knows does not become a stranger by being looked at this way. It is the asking half's
+ * counterpart of the responder's rule in `http.ts`.
+ */
+export async function discoverPinned(
+  database: string,
+  opts: TransportOptions & Pick<ForeignOptions, "pins"> & { remember?: boolean },
+  spend?: () => AbortSignal,
+): Promise<Descriptor> {
   const db = canonicalDb(database);
-  const d = await readJson(db, db, opts, {}, spend) as Descriptor;
+  const pins = opts.pins;
+  if (!pins) return discover(db, opts, spend);
+  const held = await pins.pinOf(db);
+  if (held.state === "repudiated") {
+    throw new Repudiated(db, "an operator has to clear this before a read through it can run again");
+  }
+  const descriptor = await discover(db, opts, spend);
+  const keys = descriptor.keys;
+  if (keys.length === 0) {
+    // A database that publishes no key cannot be pinned, and a pin held against one that used to
+    // publish keys is not something to quietly forget.
+    if (held.pinned !== null) {
+      await pins.repudiate(db);
+      throw new Repudiated(db, "it published a key before and publishes none now");
+    }
+    return descriptor;
+  }
+  const current = keys.find((k) => k.retired === undefined)!;
+
+  if (held.pinned === null) {
+    // First contact. The current key — the one it has not retired — is what gets pinned.
+    if (opts.remember !== false) await pins.pin(db, current.id);
+    return descriptor;
+  }
+  const reached = await reachable(keys, held.pinned);
+  if (reached?.id !== current.id) {
+    await pins.repudiate(db);
+    throw new Repudiated(db, `it publishes no key reachable from the pinned ${held.pinned}`);
+  }
+  // The pin advances along the rotation chain, so the next contact starts from the newest key it
+  // has proved rather than from one that may fall out of the grace window.
+  if (reached.id !== held.pinned) await pins.pin(db, reached.id);
+  return descriptor;
+}
+
+/**
+ * A database's descriptor, validated.
+ *
+ * With `opts.descriptors`, one that is still inside the lifetime its database gave it is answered
+ * without a request, and one past it is asked for with its validator — so a database whose
+ * descriptor has not changed says so in a 304 and sends nothing. `fresh` skips the first of those
+ * and still does the second: it is for the one caller with a reason to doubt what it holds, which
+ * is a responder shown a key id its copy of the caller's descriptor does not list.
+ */
+export async function discover(
+  database: string,
+  opts: TransportOptions & { fresh?: boolean },
+  spend?: () => AbortSignal,
+): Promise<Descriptor> {
+  const db = canonicalDb(database);
+  const cache = opts.descriptors;
+  const now = opts.now?.() ?? Date.now();
+  const held = cache?.peek(db);
+  if (cache !== undefined && held !== undefined && held.until > now && opts.fresh !== true) {
+    cache.hits++;
+    return held.descriptor;
+  }
+  const res = await exchange(db, db, opts, held?.etag ? { headers: { "if-none-match": held.etag } } : {}, spend);
+  if (res.status === 304 && cache !== undefined && held !== undefined) {
+    // Unchanged, on the database's own word, and good for however long it now says.
+    cache.confirmed++;
+    cache.put(db, held.descriptor, held.etag, freshFor(res.headers), now);
+    return held.descriptor;
+  }
+  const d = jsonOf(db, res) as Descriptor;
   if (!d || d.protocol !== "hlekk" || d.v !== DESCRIPTOR_VERSION || d.database !== db ||
       !Array.isArray(d.wire) || !d.wire.includes(WIRE_VERSION) || d.wire.some(v => !Number.isSafeInteger(v) || v < 1) ||
       !Number.isSafeInteger(d.catalog) || d.catalog < 0 ||
@@ -759,6 +916,19 @@ export async function discover(database: string, opts: TransportOptions, spend?:
   for (const route of ["read", "price", "vocabulary"] as const) {
     if (d.routes?.[route] !== db + "/" + route) throw new ForeignUnreachable(db, `invalid descriptor route ${route}`);
   }
+  // Optional, and exactly one spelling when stated. A route somewhere else is a request this side
+  // would be signing to a URI the database's own identity does not cover.
+  if (d.routes.hint !== undefined && d.routes.hint !== db + "/hint") {
+    throw new ForeignUnreachable(db, "invalid descriptor route hint");
+  }
+  if (d.routes.object !== undefined && d.routes.object !== db + "/objects/{id}") {
+    throw new ForeignUnreachable(db, "invalid descriptor route object");
+  }
+  if (d.routes.list !== undefined && d.routes.list !== db + "/objects/{id}/{edge}{?limit,after}") {
+    throw new ForeignUnreachable(db, "invalid descriptor route list");
+  }
+  // Kept only once it has passed everything above: a descriptor that is not one is not remembered.
+  cache?.put(db, d, res.headers.get("etag"), freshFor(res.headers), now);
   return d;
 }
 

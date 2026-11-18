@@ -24,9 +24,9 @@ Figures marked **measured** were read off a real artifact and say how.
 
 ## Where this stands
 
-Built, with typecheck clean and **585 of 585 tests passing under both storage formats**
-(`npm run test:formats`), **42 of 42** conformance checks against the published fixture
-(`npm run conformance:fixture`) and **30 of 30** without one (`npm run conformance:node`):
+Built, with typecheck clean and **686 of 686 tests passing under both storage formats**
+(`npm run test:formats`), **85 of 85** conformance checks against the published fixture
+(`npm run conformance:fixture`) and **55 of 55** without one (`npm run conformance:node`):
 
 - **Step 1.** `src/query/ref.ts`. A reference is a local id or `<database URI>#<id>`, with one
   canonical spelling for the URI, refused rather than repaired.
@@ -50,6 +50,21 @@ Built, with typecheck clean and **585 of 585 tests passing under both storage fo
 - **Step 7.** `spec/protocol.md`, `spec/schemas/`, `spec/fixture/`, the Node adapter as a whole
   database over files with a `serve` command, the package's exports map and build, README, LICENSE
   (Apache-2.0), CONTRIBUTING and CI.
+- **Step 9.** Backlinks, which this plan had under *Deliberately not*. `src/protocol/hint.ts` and
+  `backlinks.ts`, `spec/protocol.md` §11, and `POST {db}/hint`. A database that draws an edge at
+  another says so in a signed hint; the other reads the first over the protocol as it stood and
+  records an outbound edge of its own for what that read showed. Nothing sent is stored, the graph is
+  still outbound links only, and the conformance suite checks it by being a hinting database itself.
+  [`docs/protocol.md`](docs/protocol.md), *Backlinks*, has the threat model and what was rejected.
+- **Step 10.** The parts of HTTP that somebody who does not speak this protocol can use, and none of
+  the parts that would make it less strict. A lifetime and a digest validator on the descriptor and
+  the vocabulary, with a client that keeps one for as long as it was told and no longer than five
+  minutes; `QUERY` beside `POST`; two reads by URL, `GET {db}/objects/{id}` and
+  `GET {db}/objects/{id}/{edge}`, each exactly a read; `OPTIONS` and CORS, off for a loopback URI;
+  `429` and `503` with `Retry-After` behind an admission hook; RFC 9457 kinds on every refusal; and
+  the origin's RFC 9727 catalog. All additive under §9: a caller that never looks is answered as it
+  was. [`docs/protocol.md`](docs/protocol.md), *What HTTP is for here*, has the test each was held
+  to and what failed it.
 
 Not built: step 8, below.
 
@@ -164,7 +179,9 @@ and needs an account rather than a decision.
 
 - **Cross-database writes, inverses and cascades.** Reads only, as `docs/protocol.md` decides. The
   global graph is outbound links.
-- **Backlinks.** A subscription protocol with its own threat model.
+- **Backlinks nobody hinted at.** Step 9 records an edge a database was told about. "Who anywhere
+  links to this" is an index, built by something that crawls; it needs entry by a key rather than by
+  an id, which is a separate decision with its own authorization question.
 - **A global directory of databases.** A URI is the name and DNS arbitrates it. Discovery is not
   identity and can come later without touching anything here.
 - **Subject claims**, where a caller speaks for one of its own users. `docs/protocol.md` shows it is
@@ -203,6 +220,32 @@ steps above, so that nothing reads as finished that is not.
   root hop against, and pricing happens before any I/O that could find out. Closing it means a caller
   optionally stating the root's type, which is a new request member and so a new wire version.
 
+### Left out of step 9, with the reason
+
+- **Sending a hint automatically, and retrying one.** A hint is sent by the application, once, after
+  the write. Automatic sending is consent given by a side effect, and a retry needs a durable queue
+  with a give-up — which is not the outbox, whose whole property is that it has none.
+- **Re-checking a recorded edge on a schedule.** It is read again only when its source hints again,
+  so an edge withdrawn without a hint is a dead link until someone follows it.
+- **Settling hints on Durable Objects.** `protocol/` is platform-free and the Node adapter wires it;
+  the Cloudflare adapter would settle from an alarm, and that is not written.
+- **A point query for one edge.** The checking read pages the source's list to find one reference,
+  and gives up as *unknown* past four pages. Asking for one edge is a new request member, and so a
+  new wire version.
+
+### Left out of step 10, with the reason
+
+- **A limiter.** `Binding.admit` is where one goes and nothing ships with one, because what
+  identifies a caller that does not sign is an address, and only the platform in front of the
+  handler has it.
+- **`QUERY` from the asking half.** The client still `POST`s. It gains nothing until there is a
+  shared cache between two databases, and until then choosing a method per responder is machinery
+  for nobody.
+- **The catalog on Workers.** `serveCatalog` is for whoever owns the origin. The Node adapter calls
+  it; the wiki Worker has routes of its own at its root and does not.
+- **`application/problem+json`.** A refusal carries RFC 9457's members and is still served as
+  `application/json`, which is what §3 promised every caller. The media type is for a wire version.
+
 ## Open
 
 - [x] Whether a failed foreign hop fails the query by default. **It does**, and a caller opts into an
@@ -231,6 +274,8 @@ steps above, so that nothing reads as finished that is not.
       format 2.
 - [ ] How long a retired key's grace window is. `pruneKeys` takes one and nothing chooses it; a
       caller pinned on a pruned key is repudiated on next contact, which is the cost of the window
-      being finite.
+      being finite. Step 10 gave it a floor and not a value: at least the lifetime the descriptor
+      states (`Binding.describedFor`, a minute by default), since a caller may be holding a copy
+      that old.
 - [ ] Whether a responder should refuse a repeated signature. A read applies nothing, so replay
       inside the skew window is harmless to correctness and not to cost.

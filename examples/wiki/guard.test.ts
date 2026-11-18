@@ -195,7 +195,14 @@ describe("the wiki Worker's routes", () => {
     // point of it.
     const touched = await read({ ids: ["1"] }, sealed());
     assert.equal(touched.status, 500);
-    assert.deepEqual(await touched.json(), { error: "internal error" });
+    // The whole of it: a kind a program can branch on, and nothing about what broke.
+    assert.deepEqual(await touched.json(), {
+      type: "https://hlekk.dev/spec/problems/fault",
+      title: "This database failed",
+      status: 500,
+      detail: "internal error",
+      error: "internal error",
+    });
   });
 
   it("are each either public by name or behind the guard", () => {

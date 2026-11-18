@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { Catalog, CatalogError, plan as planLock } from "../catalog/catalog.ts";
+import { Hlekk } from "../client/client.ts";
 import { LocalCluster } from "../client/local.ts";
 import { assertSound } from "../testkit/invariants.ts";
 import { ForeignEdge, targetOf } from "../query/types.ts";
@@ -147,6 +148,29 @@ describe("an edge into another database", () => {
     assert.ok(typeof page === "object");
     assert.deepEqual(page.rows.map((e) => [e.db, e.id2]), [[0, local]]);
     assert.deepEqual(c.directory.aliases(), []);
+  });
+
+  it("is not what a removal interns a database for", async () => {
+    const { c, db, note } = await database();
+    // Nothing was ever written into OTHER, so there is nothing to remove — and finding that out
+    // must not cost an alias, or whoever can cause a removal can add a row to the registry. A hint
+    // about an edge that is not there causes exactly one.
+    await db.assocRemove(ABOUT, note, `${OTHER}#5`);
+    assert.deepEqual(c.directory.aliases(), []);
+
+    // An edge another isolate wrote, under an alias this client has not seen, is still removed: the
+    // registry is read again before "no alias" is taken to mean "no edge".
+    Hlekk.forget(c.transport);
+    const elsewhere = c.client();
+    assert.notEqual(elsewhere, db);
+    await elsewhere.assocAdd(ABOUT, note, `${OTHER}#5`, 1);
+    const host = c.host(c.holderOf(7n)!);
+    assert.equal(await host.store().count(note, ABOUT), 1);
+    await db.assocRemove(ABOUT, note, `${OTHER}#5`);
+    assert.equal(await host.store().count(note, ABOUT), 0);
+
+    // And a type that cannot hold a foreign target still says so, rather than removing nothing.
+    await assert.rejects(db.assocRemove(NEXT, note, `${THIRD}#5`), /does not permit a foreign target/);
   });
 
   it("is a reference the read path will not guess at", async () => {

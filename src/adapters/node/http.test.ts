@@ -91,7 +91,7 @@ describe("the protocol over node:http", () => {
 
     const wrong = await fetch(`${node.database}/read`);
     assert.equal(wrong.status, 405);
-    assert.equal(wrong.headers.get("allow"), "POST");
+    assert.equal(wrong.headers.get("allow"), "POST, QUERY, OPTIONS");
 
     assert.equal((await fetch(`${node.origin}/nope`)).status, 404);
   });

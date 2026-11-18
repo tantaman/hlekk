@@ -15,9 +15,10 @@ import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { MAX_BODY, handle } from "../../protocol/http.ts";
+import { MAX_BODY, handle, refusal } from "../../protocol/http.ts";
 import type { Binding } from "../../protocol/http.ts";
-import { canonicalDb } from "../../query/ref.ts";
+import { canonicalDb, isLoopbackDb } from "../../query/ref.ts";
+import { serveCatalog } from "../../protocol/wellknown.ts";
 
 export interface ListenOptions {
   /** The path the database is served at: `/db`, or `""` for the origin root. */
@@ -28,6 +29,17 @@ export interface ListenOptions {
   host?: string;
   /** Canonical public identity, including its public path. */
   database?: string;
+  /**
+   * Whether a page in a browser may read this database. Left unset, the handler's own default
+   * applies: yes, unless the database URI is a loopback one — see `Binding.cors` for why the one
+   * place this must not be on by accident is a database only this machine can reach.
+   */
+  cors?: boolean;
+  /**
+   * Whether to list this database at the origin's `/.well-known/api-catalog` (RFC 9727). On by
+   * default: this server owns its whole origin, and the catalog names nothing but what it serves.
+   */
+  catalog?: boolean;
 }
 
 export interface ListenBinding extends Omit<Binding, "database"> {
@@ -63,7 +75,7 @@ export function listen(parts: ListenBinding, opts: ListenOptions = {}): Promise<
   let binding: Binding | null = null;
 
   const server = createServer((req, res) => {
-    void answer(req, res, () => binding, maxBody);
+    void answer(req, res, () => binding, maxBody, opts.catalog ?? true);
   });
 
   return new Promise<NodeDatabase>((done, fail) => {
@@ -81,7 +93,7 @@ export function listen(parts: ListenBinding, opts: ListenOptions = {}): Promise<
         fail(error);
         return;
       }
-      binding = { ...parts, database, prefix: path };
+      binding = { ...parts, database, prefix: path, ...(opts.cors === undefined ? {} : { cors: opts.cors }) };
       done({ origin, database, binding, close: () => close(server) });
     });
   });
@@ -98,11 +110,14 @@ async function answer(
   res: ServerResponse,
   binding: () => Binding | null,
   maxBody: number,
+  catalog: boolean,
 ): Promise<void> {
   const bound = binding();
   if (bound === null) {
     // Unreachable: the server answers nothing before `listening` resolves it.
-    res.writeHead(503, { "content-type": "application/json" }).end(JSON.stringify({ error: "not ready" }));
+    res
+      .writeHead(503, { "content-type": "application/json; charset=utf-8", "retry-after": "1" })
+      .end(JSON.stringify(refusal(503, "unavailable", "not ready")));
     return;
   }
 
@@ -111,12 +126,18 @@ async function answer(
     if (body === OVER) {
       // Refused at the socket, before a `Request` is built: the handler caps the body too, but
       // reading it all into one in order to tell it so is the work a 413 exists to refuse.
-      res.writeHead(413, { "content-type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ error: `body over ${maxBody} bytes` }));
+      res.writeHead(413, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify(refusal(413, "too-large", `body over ${maxBody} bytes`)));
       return;
     }
 
-    const response = await handle(request(req, bound, body), bound);
+    const asked = request(req, bound, body);
+    // The origin's own page, before the database's: it is not under the database's prefix unless
+    // the database is mounted at the root, and then this path is not one of its routes anyway.
+    const listed = catalog
+      ? serveCatalog(asked, [bound.database], { cors: bound.cors ?? !isLoopbackDb(bound.database) })
+      : null;
+    const response = listed ?? (await handle(asked, bound));
     const headers: Record<string, string> = {};
     response.headers.forEach((value, key) => {
       headers[key] = value;
@@ -126,8 +147,8 @@ async function answer(
   } catch {
     // Says nothing, for the reason `protocol/http.ts` gives: a stranger learns that this database
     // broke, not how.
-    if (!res.headersSent) res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ error: "internal error" }));
+    if (!res.headersSent) res.writeHead(500, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+    res.end(JSON.stringify(refusal(500, "fault", "internal error")));
   }
 }
 
@@ -143,7 +164,7 @@ function request(req: IncomingMessage, binding: Binding, body: Buffer): Request 
     for (const one of Array.isArray(value) ? value : [value]) headers.append(name, one);
   }
   const method = req.method ?? "GET";
-  const hasBody = method !== "GET" && method !== "HEAD";
+  const hasBody = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
   // An `ArrayBuffer` rather than the Buffer itself: both are BufferSource at runtime, but only one
   // of them is one to `BodyInit`. A copy, which a body capped at 64 KiB can afford.
   const bytes = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer;
