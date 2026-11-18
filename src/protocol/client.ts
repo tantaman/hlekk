@@ -257,42 +257,6 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     });
   }
 
-  async function discoverPeer(spend?: () => AbortSignal): Promise<Descriptor> {
-    const pins = opts.pins;
-    if (!pins) return discover(db, opts, spend);
-    const held = await pins.pinOf(db);
-    if (held.state === "repudiated") {
-      throw new Repudiated(db, "an operator has to clear this before a read through it can run again");
-    }
-    const descriptor = await discover(db, opts, spend);
-    const keys = descriptor.keys;
-    if (keys.length === 0) {
-      // A database that publishes no key cannot be pinned, and a pin held against one that used to
-      // publish keys is not something to quietly forget.
-      if (held.pinned !== null) {
-        await pins.repudiate(db);
-        throw new Repudiated(db, "it published a key before and publishes none now");
-      }
-      return descriptor;
-    }
-    const current = keys.find((k) => k.retired === undefined)!;
-
-    if (held.pinned === null) {
-      // First contact. The current key — the one it has not retired — is what gets pinned.
-      await pins.pin(db, current.id);
-      return descriptor;
-    }
-    const reached = await reachable(keys, held.pinned);
-    if (reached?.id !== current.id) {
-      await pins.repudiate(db);
-      throw new Repudiated(db, `it publishes no key reachable from the pinned ${held.pinned}`);
-    }
-    // The pin advances along the rotation chain, so the next contact starts from the newest key it
-    // has proved rather than from one that may fall out of the grace window.
-    if (reached.id !== held.pinned) await pins.pin(db, reached.id);
-    return descriptor;
-  }
-
   let agreed: ReadonlySet<string> | undefined;
 
   return {
@@ -300,7 +264,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     async exec(plan, tasks, spend): Promise<HostReply> {
       const gathered: Gathered = { objects: new Map(), lists: [], counts: new Map() };
       try {
-        const descriptor = await discoverPeer(spend);
+        const descriptor = await discoverPinned(db, opts, spend);
         const advertised = descriptor.limits;
         const max = advertised.maxIds;
         for (const batch of group(tasks, plan, opts.catalog, max, advertised)) {
@@ -698,32 +662,48 @@ function fieldEdge(catalog: Catalog, field: string): string | undefined {
   return matches.length === 1 ? matches[0].name : undefined;
 }
 
-type TransportOptions = Pick<ForeignOptions, "fetch" | "guard" | "maxResponseBytes" | "deadlineMs">;
+export type TransportOptions = Pick<ForeignOptions, "fetch" | "guard" | "maxResponseBytes" | "deadlineMs">;
 
-async function readJson(db: string, url: string, opts: TransportOptions, init: RequestInit, spend?: () => AbortSignal): Promise<unknown> {
+/** What came back, before anyone has decided what it means. */
+export interface Exchanged {
+  status: number;
+  headers: Headers;
+  body: string;
+}
+
+/** How much of a body is read when the status already says the request did not succeed. A refusal is
+ *  a sentence and a path; a megabyte of one is a stranger spending this isolate's memory. */
+const MAX_REFUSAL_BYTES = 64 * 1024;
+
+/**
+ * One request to another database, behind every defence a stranger's server needs: the address
+ * guard, a deadline, the query's own budget, a cap on the bytes read, and no redirects.
+ *
+ * Returns whatever status came back, because what a status means depends on who asked — a 404 is a
+ * failure to a read and an answer to "do you take hints". Throws `ForeignUnreachable` for everything
+ * that is not an answer at all: a refused connection, a timeout, a body over the cap.
+ */
+export async function exchange(
+  db: string,
+  url: string,
+  opts: TransportOptions,
+  init: RequestInit,
+  spend?: () => AbortSignal,
+): Promise<Exchanged> {
   const budget = spend?.();
   const timeout = AbortSignal.timeout(opts.deadlineMs ?? DEADLINE_MS);
   const signal = budget ? AbortSignal.any([budget, timeout]) : timeout;
   const cap = opts.maxResponseBytes ?? MAX_RESPONSE_BYTES;
   const call = opts.fetch ?? opts.guard?.fetch ?? fetch;
-  async function exchange() {
+  async function once(): Promise<Exchanged> {
     if (opts.guard && call !== opts.guard.fetch) await opts.guard(db);
     signal.throwIfAborted();
     const res = await call(url, { ...init, signal, redirect: "error", cache: "no-store" });
-    if ([400, 401, 403].includes(res.status)) {
-      const refusal = await text(res, cap).then(parse).catch(() => null) as { error?: string; at?: string } | null;
-      throw new ForeignRefused(db, `${refusal?.at ?? "?"}: ${refusal?.error ?? `status ${res.status}`}`);
-    }
-    if (!res.ok) {
-      void res.body?.cancel().catch(() => {});
-      throw new ForeignUnreachable(db, `status ${res.status}`);
-    }
-    const raw = await text(res, cap);
-    try {
-      return parse(raw);
-    } catch {
-      throw new ForeignUnreachable(db, "the answer is not JSON");
-    }
+    if (res.ok) return { status: res.status, headers: res.headers, body: await text(res, cap) };
+    // Not an answer to what was asked, so what it says is read only as far as a refusal runs. One
+    // that is longer than that is dropped rather than failed on: the status is the information.
+    const body = await text(res, Math.min(cap, MAX_REFUSAL_BYTES)).catch(() => "");
+    return { status: res.status, headers: res.headers, body };
   }
   let abort!: () => void;
   const aborted = new Promise<never>((_, reject) => {
@@ -731,14 +711,90 @@ async function readJson(db: string, url: string, opts: TransportOptions, init: R
     signal.addEventListener("abort", abort, { once: true });
   });
   try {
-    return await Promise.race([exchange(), aborted]);
+    return await Promise.race([once(), aborted]);
   } catch (e) {
     if (budget?.aborted) throw budget.reason;
-    if (e instanceof ForeignRefused || e instanceof ForeignUnreachable || (e as Error).name === "PrivateAddress") throw e;
+    if (e instanceof ForeignUnreachable || (e as Error).name === "PrivateAddress") throw e;
     throw new ForeignUnreachable(db, (e as Error).message);
   } finally {
     signal.removeEventListener("abort", abort);
   }
+}
+
+/** A request whose only acceptable answer is a JSON body. A refusal is named as one, with the path
+ *  the responder gave; anything else that is not a success is the database not being readable. */
+export async function readJson(db: string, url: string, opts: TransportOptions, init: RequestInit, spend?: () => AbortSignal): Promise<unknown> {
+  const res = await exchange(db, url, opts, init, spend);
+  if ([400, 401, 403].includes(res.status)) {
+    const refusal = refusalOf(res.body);
+    throw new ForeignRefused(db, `${refusal?.at ?? "?"}: ${refusal?.error ?? `status ${res.status}`}`);
+  }
+  if (res.status < 200 || res.status > 299) throw new ForeignUnreachable(db, `status ${res.status}`);
+  try {
+    return parse(res.body);
+  } catch {
+    throw new ForeignUnreachable(db, "the answer is not JSON");
+  }
+}
+
+/** A refusal's body, or null when it is not one. Never throws: a responder that refuses in a shape
+ *  nobody can read has still refused. */
+export function refusalOf(body: string): { error?: string; at?: string } | null {
+  try {
+    const parsed = parse(body);
+    return parsed !== null && typeof parsed === "object" ? (parsed as { error?: string; at?: string }) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A database's descriptor, checked against what this database recorded about it before.
+ *
+ * First contact pins the current key; later contact accepts only that key or one reachable from it
+ * through rotation signatures, and advances the pin to the key reached. Anything else repudiates the
+ * database here, and every read through a reference into it fails by name until an operator clears
+ * it. Without `pins`, the published keys are taken at face value every time.
+ */
+export async function discoverPinned(
+  database: string,
+  opts: TransportOptions & Pick<ForeignOptions, "pins">,
+  spend?: () => AbortSignal,
+): Promise<Descriptor> {
+  const db = canonicalDb(database);
+  const pins = opts.pins;
+  if (!pins) return discover(db, opts, spend);
+  const held = await pins.pinOf(db);
+  if (held.state === "repudiated") {
+    throw new Repudiated(db, "an operator has to clear this before a read through it can run again");
+  }
+  const descriptor = await discover(db, opts, spend);
+  const keys = descriptor.keys;
+  if (keys.length === 0) {
+    // A database that publishes no key cannot be pinned, and a pin held against one that used to
+    // publish keys is not something to quietly forget.
+    if (held.pinned !== null) {
+      await pins.repudiate(db);
+      throw new Repudiated(db, "it published a key before and publishes none now");
+    }
+    return descriptor;
+  }
+  const current = keys.find((k) => k.retired === undefined)!;
+
+  if (held.pinned === null) {
+    // First contact. The current key — the one it has not retired — is what gets pinned.
+    await pins.pin(db, current.id);
+    return descriptor;
+  }
+  const reached = await reachable(keys, held.pinned);
+  if (reached?.id !== current.id) {
+    await pins.repudiate(db);
+    throw new Repudiated(db, `it publishes no key reachable from the pinned ${held.pinned}`);
+  }
+  // The pin advances along the rotation chain, so the next contact starts from the newest key it
+  // has proved rather than from one that may fall out of the grace window.
+  if (reached.id !== held.pinned) await pins.pin(db, reached.id);
+  return descriptor;
 }
 
 export async function discover(database: string, opts: TransportOptions, spend?: () => AbortSignal): Promise<Descriptor> {
@@ -758,6 +814,11 @@ export async function discover(database: string, opts: TransportOptions, spend?:
   }
   for (const route of ["read", "price", "vocabulary"] as const) {
     if (d.routes?.[route] !== db + "/" + route) throw new ForeignUnreachable(db, `invalid descriptor route ${route}`);
+  }
+  // Optional, and exactly one spelling when stated. A route somewhere else is a request this side
+  // would be signing to a URI the database's own identity does not cover.
+  if (d.routes.hint !== undefined && d.routes.hint !== db + "/hint") {
+    throw new ForeignUnreachable(db, "invalid descriptor route hint");
   }
   return d;
 }

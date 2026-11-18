@@ -74,6 +74,28 @@ async function signed(
 type MemberPolicy = (caller: Caller | null) => Promise<{ policy: Policy; remember?: boolean }>;
 
 describe("a database authenticates a database", () => {
+  it("refuses a signature whose signer cannot be looked up, rather than faulting", async () => {
+    const { f, page } = await signed();
+    // Well formed, and signed as a database nobody runs. The responder goes to read that database's
+    // descriptor and cannot — which is a signature it could not verify, and the caller's to fix.
+    const res = await f.fetch(`${WIKI}/read`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "hlekk-caller": "https://nobody.example/db",
+        "content-digest": "sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:",
+        "signature-input": `hlekk=("@method" "@target-uri" "content-digest" "hlekk-caller");created=${Math.floor(Date.now() / 1000)};keyid="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";alg="ed25519"`,
+        signature: `hlekk=:${"A".repeat(86)}==:`,
+      },
+      body: "",
+    });
+    assert.equal(res.status, 401);
+    const body = (await res.json()) as { error: string; at: string };
+    assert.equal(body.at, "signature");
+    assert.match(body.error, /could not be read from its descriptor/);
+    void page;
+  });
+
   it("signs as itself, is verified, and gets the answer its policy allows", async () => {
     const { f, note, page } = await signed();
     const rows = (await f.member(NOTES).db.query(ABOUT_PLAN, [note])) as { about: { id: string; title: string }[] }[];

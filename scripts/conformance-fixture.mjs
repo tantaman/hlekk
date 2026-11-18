@@ -50,10 +50,14 @@ async function run() {
   const database = await open({
     dir,
     lock,
+    // The suite is itself a calling database for the hint checks, on a loopback port. A deployment
+    // refuses that address, rightly; a test run has to let it through.
     allowLoopback: true,
-    // No identity on the serving side: the suite checks that an UNVERIFIABLE signature is refused,
-    // which needs the responder to try, and trying needs no key of its own.
-    identity: false,
+    // An identity, because taking hints needs one: a hint is signed, and a database that verifies no
+    // signature cannot tell whose database a hint asks it to read.
+    identity: true,
+    // `policy.backlinks`, enforced: any caller, any page, read anonymously.
+    backlinks: { edge: graph.policy.backlinks.edge },
     policy: {
       object: (id) => !hidden.has(id) && !signedOnly.has(id),
       count: (id, atype) => !countless.has(atype),
@@ -96,13 +100,18 @@ async function run() {
   writeFileSync(manifest, JSON.stringify({ database: node.database, ids }, null, 2));
   console.log(`serving ${node.database} with the fixture loaded\n`);
 
+  // No alarm on Node, so a timer looks at the hints that have arrived. The suite waits a few seconds
+  // for what it sent to be settled, which is what any implementation is asked for.
+  const settling = setInterval(() => void database.confirm().catch((e) => console.error(e)), 100);
+
   const status = await new Promise((done) => {
-    const child = spawn(process.execPath, ["scripts/conformance.mjs", node.database, "--fixture", manifest], {
+    const child = spawn(process.execPath, ["scripts/conformance.mjs", node.database, "--fixture", manifest, "--hints"], {
       stdio: "inherit",
     });
     child.on("exit", (code) => done(code ?? 1));
     child.on("error", () => done(1));
   });
+  clearInterval(settling);
 
   await node.close();
   database.close();

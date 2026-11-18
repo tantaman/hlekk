@@ -50,6 +50,12 @@ Built, with typecheck clean and **585 of 585 tests passing under both storage fo
 - **Step 7.** `spec/protocol.md`, `spec/schemas/`, `spec/fixture/`, the Node adapter as a whole
   database over files with a `serve` command, the package's exports map and build, README, LICENSE
   (Apache-2.0), CONTRIBUTING and CI.
+- **Step 9.** Backlinks, which this plan had under *Deliberately not*. `src/protocol/hint.ts` and
+  `backlinks.ts`, `spec/protocol.md` §11, and `POST {db}/hint`. A database that draws an edge at
+  another says so in a signed hint; the other reads the first over the protocol as it stood and
+  records an outbound edge of its own for what that read showed. Nothing sent is stored, the graph is
+  still outbound links only, and the conformance suite checks it by being a hinting database itself.
+  [`docs/protocol.md`](docs/protocol.md), *Backlinks*, has the threat model and what was rejected.
 
 Not built: step 8, below.
 
@@ -164,7 +170,9 @@ and needs an account rather than a decision.
 
 - **Cross-database writes, inverses and cascades.** Reads only, as `docs/protocol.md` decides. The
   global graph is outbound links.
-- **Backlinks.** A subscription protocol with its own threat model.
+- **Backlinks nobody hinted at.** Step 9 records an edge a database was told about. "Who anywhere
+  links to this" is an index, built by something that crawls; it needs entry by a key rather than by
+  an id, which is a separate decision with its own authorization question.
 - **A global directory of databases.** A URI is the name and DNS arbitrates it. Discovery is not
   identity and can come later without touching anything here.
 - **Subject claims**, where a caller speaks for one of its own users. `docs/protocol.md` shows it is
@@ -202,6 +210,19 @@ steps above, so that nothing reads as finished that is not.
   carry its type, and `ids` may hold objects of several types — so there is nothing sound to check a
   root hop against, and pricing happens before any I/O that could find out. Closing it means a caller
   optionally stating the root's type, which is a new request member and so a new wire version.
+
+### Left out of step 9, with the reason
+
+- **Sending a hint automatically, and retrying one.** A hint is sent by the application, once, after
+  the write. Automatic sending is consent given by a side effect, and a retry needs a durable queue
+  with a give-up — which is not the outbox, whose whole property is that it has none.
+- **Re-checking a recorded edge on a schedule.** It is read again only when its source hints again,
+  so an edge withdrawn without a hint is a dead link until someone follows it.
+- **Settling hints on Durable Objects.** `protocol/` is platform-free and the Node adapter wires it;
+  the Cloudflare adapter would settle from an alarm, and that is not written.
+- **A point query for one edge.** The checking read pages the source's list to find one reference,
+  and gives up as *unknown* past four pages. Asking for one edge is a new request member, and so a
+  new wire version.
 
 ## Open
 

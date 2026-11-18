@@ -22,7 +22,9 @@ against both.
 One database answers another database's **read**. That is all of it.
 
 - **Reads only.** There is no operation that writes, and there will not be one in version 1. The
-  cross-database graph is outbound links.
+  cross-database graph is outbound links. A **hint** (§11) asks a database to look at one of the
+  caller's own edges; it writes nothing, and whatever that database then records is an outbound link
+  of its own, made from what it read.
 - **Object-granular.** A caller addresses objects and edges. Where they live — which host, which
   shard, which region — is not the caller's to know, and telling it would also be telling it when
   that changes.
@@ -93,6 +95,9 @@ Every route is served under the database URI.
 | `{db}/vocabulary` | `GET` | — | [vocabulary](schemas/vocabulary.json) |
 | `{db}/read` | `POST` | [read request](schemas/read-request.json) | [read response](schemas/read-response.json) |
 | `{db}/price` | `POST` | [read request](schemas/read-request.json) | [price response](schemas/price-response.json) |
+| `{db}/hint` | `POST` | [hint](schemas/hint-request.json) | [hint response](schemas/hint-response.json), with `202` |
+
+`{db}/hint` is **OPTIONAL** (§11). Every other route is **REQUIRED**.
 
 - Every request and response body **MUST** be JSON, with `Content-Type: application/json`.
 - A responder **MUST** answer `405` with an `Allow` header for a method a route does not take, and
@@ -120,6 +125,9 @@ anything.
   rather than being refused.
 - `keys` **MUST** be present. An empty list means this database authenticates nobody (§7.1), which a
   caller **MUST** be able to tell from a database that does and did not say so.
+- `routes` **MUST** state `read`, `price` and `vocabulary`, each as the route §3 gives it. It
+  **MUST** state `hint` where this database takes hints and **MUST NOT** state it where it does not
+  (§11.1), so that a caller can tell the two apart without sending anything.
 
 ### 4.2 The vocabulary
 
@@ -342,12 +350,22 @@ A refusal body is [`schemas/refusal.json`](schemas/refusal.json).
 | Status | When |
 | --- | --- |
 | `400` | The request is wrong: a name the vocabulary does not have, a cost over budget, a member this specification does not define, a body that is not JSON, a signature presented to a database that verifies none |
-| `401` | A signature was presented and could not be verified |
+| `401` | A signature was presented and could not be verified, or a route that requires one (§11.2) was sent none |
 | `403` | The caller is verified and this database will not serve it, or its pin is repudiated here |
 | `404` | Not one of this database's routes |
 | `405` | Not a method this route takes |
 | `413` | The body is over the stated cap |
+| `429` | The request was acceptable and this caller has sent more than this database will take from it now |
 | `500` | This database failed |
+| `503` | The request was acceptable and this database is not taking requests now, from anyone |
+
+A `429` or `503` **MUST** carry `Retry-After`, as a whole number of seconds and not as a date. A
+caller **SHOULD NOT** repeat the request before then. Every other status in this table is about the
+request, and repeating it unchanged gets the same answer; these two are about the moment.
+
+> Why two: a `429` is a reason for this caller to slow down and a `503` is not a reason for it to
+> think it did anything. A responder with only `400` to reach for teaches its callers to retry at
+> once, because a `400` cannot say "later".
 
 A `400`, `401`, `403` or `413` **SHOULD** carry `at`: a path into the submitted request, so a caller
 can correct the part that was wrong instead of retrying blind.
@@ -395,3 +413,129 @@ it refuses one, the count **MUST** be absent rather than zero.
   It is not harmless to cost, so a responder **MAY** refuse a repeated signature.
 - **The descriptor is unauthenticated** (§3). Its trustworthiness on first contact is TLS and the
   domain's; afterwards it is the pin's (§7.3).
+- **A hint is an instruction to make a request too** (§11). It is bounded by being signed — the
+  request it causes goes to the database that asked for it, and to no database a third party chose —
+  and by being looked at off the request path, under a quota per caller. A responder **SHOULD** ask
+  its own policy whether it would record anything before it reads anybody.
+- **A recorded edge is true, not endorsed.** An edge a database drew says something about what that
+  database thinks; an edge it recorded from a hint says only that a stranger's database linked to
+  it, and anyone can run a database. A reader following one is following a link a stranger chose,
+  into a database a stranger runs, and everything above about a responder's answer applies to what
+  it finds there.
+
+## 11. Hints
+
+A cross-database edge lives in the database that drew it, so the database it points at does not know
+it exists. A **hint** is how it may be told:
+
+> My object `source` may have an edge `edge` to your object `target`. A read of me will say.
+
+It is the one request in this protocol that is not a read, and it is not a write. Nothing in it is
+recorded. What a database does about one is read (§5), and what it records, if anything, is what
+that read showed.
+
+Taking hints is **OPTIONAL**. This section binds a database that takes them and a caller that sends
+them.
+
+### 11.1 The route
+
+A database that takes hints **MUST** state `routes.hint` in its descriptor (§4.1), and its value
+**MUST** be `{db}/hint`. One that does not take them **MUST NOT** state it and **MUST** answer `404`
+there, as for any path that is not one of its routes. A caller **MUST NOT** send a hint to a database
+whose descriptor does not state the route.
+
+A database that verifies no signatures (§7.1) **MUST NOT** take hints.
+
+### 11.2 The request
+
+`POST {db}/hint` carries a [hint](schemas/hint-request.json):
+
+```json
+{ "source": "281474976710691", "edge": "notes.note_about", "target": "562949953421317" }
+```
+
+- `source` **MUST** be a bare local id (§2.2) of the **calling** database.
+- `edge` **MUST** be the name of an edge type in the calling database's vocabulary: the edge a read
+  of `source` hops to reach the reference.
+- `target` **MUST** be a bare local id of the **answering** database.
+
+A hint says *look*, not *this exists*. A caller sends the same hint when it draws the edge and when
+it withdraws it, and the read is what tells them apart.
+
+- A hint **MUST** be signed as §7.2 specifies. A responder **MUST** refuse one that carries no
+  signature, with `401`, and **MUST NOT** read it as the anonymous caller.
+- A responder **MUST** refuse a hint signed as itself.
+- A responder **MUST** refuse a hint carrying a member this specification does not define, for the
+  reason §5.1 gives.
+
+> Why `source` is a bare id and not a reference: a database may speak only about its own objects, and
+> a hint is an instruction to go and read whoever it names. Were `source` a reference, any database
+> could aim the answering one at a third of its choosing, and the rule that it must not would be a
+> check somebody has to remember. As a bare id of the caller, it cannot be said.
+>
+> Why a signature is required here and nowhere else: the anonymous caller is a caller for a read
+> because a read is answered and that is the end of it. A hint is answered and then *acted on* — by a
+> request to the caller's database — so "who is the caller" is not a question about policy but about
+> where that request goes.
+
+### 11.3 The answer
+
+A responder that takes the hint **MUST** answer `202` with a
+[hint response](schemas/hint-response.json).
+
+`202` means *received*. It does not mean the target exists, that the responder will look, or that it
+would record anything if it did.
+
+- The answer **MUST NOT** depend on whether `target` exists, on whether the caller may see it, or on
+  what the responder's policy would do with the hint. It is decided from the request alone: its
+  size, its signature and its shape. A hint that answered differently for an object a read would
+  hide is the way around §8.
+- A responder **MUST NOT** read the calling database before it answers, beyond what verifying the
+  signature requires (§7.2). The claim is looked at afterwards.
+- A responder **MAY** drop a hint it accepted, at any time and without saying so. A caller **MUST
+  NOT** take `202` to mean an edge was recorded.
+- A responder **MAY** answer `429` or `503` (§8), and where it does it **MUST** decide that without
+  regard to `target`.
+
+### 11.4 What a responder does with one
+
+- A responder **MUST NOT** record anything on the strength of a hint. What it records it **MUST**
+  have read from the calling database: a read (§5) entering from `source`, hopping `edge`, whose
+  answer lists the reference `{db}#{target}` — this database's own URI and that id.
+- That read **MUST** go to the database that signed the hint, and to no other.
+- Where the read succeeds and lists the reference, the responder **MAY** record that the edge
+  exists. Where it succeeds and does not — including where `source` is not in the answer at all,
+  which §8 makes the same thing — the responder **MUST NOT** record it, and **SHOULD** stop serving
+  an edge it recorded from an earlier hint for the same `source`, `edge` and `target`.
+- Where the read does **not** succeed — the caller cannot be reached, it refuses, its pin is
+  repudiated (§7.3), or its list is longer than the responder will page through (§5.5) — the
+  responder **MUST NOT** record anything and **SHOULD NOT** remove anything. A failure is not an
+  answer.
+- What a responder records, it serves as it serves any reference it holds (§6): in a list, under an
+  edge its vocabulary states with `foreign` true (§4.3), as the reference `{caller}#{source}`, with
+  no object behind it. A caller reads it with §5 as it stands. **No answer says whether an edge was
+  drawn or recorded**; a responder **SHOULD** therefore record under edge types of its own, distinct
+  from the ones it draws itself, so that its vocabulary says which is which.
+- A responder that will serve a recorded edge to callers other than itself **SHOULD** make the
+  checking read as the anonymous caller (§7.1). It then serves only what anyone could have read from
+  the calling database themselves. One that reads as itself may be shown an edge the public is not,
+  and nothing in this protocol stops it passing that on.
+
+**Sending a hint is consent to record the edge.** §5.6 lets a caller keep an answer for the seconds
+its responder states, and a recorded edge is kept for longer than that. A database that sends a hint
+permits the answering database to keep the one fact the hint is about — that an edge from `source`
+to `target` exists — until a later read says otherwise, whatever the checking read's `reuse` says.
+It permits nothing else: every other part of that read's answer is kept or not as §5.6 says.
+
+### 11.5 Sending one
+
+- A caller **MUST NOT** send a hint except about an edge it holds, or held: a hint tells the
+  answering database that the edge exists, which is the caller's to disclose and nobody else's.
+- A caller **MAY** give up on a hint at any point, and is never required to retry one. A responder
+  that did not hear of an edge does not record it, and nothing that was true has become false.
+- A caller **SHOULD** send the hint again when it withdraws the edge.
+
+> Why a hint may be lost and an edge may not: an edge is written in one database by its own client,
+> and either was or was not. Telling another database about it is a second act, toward a server that
+> may be down for a week, and making the first wait on the second is how one database's outage
+> becomes another's.

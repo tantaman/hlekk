@@ -93,6 +93,10 @@
         },
         "vocabulary": {
           "type": "string"
+        },
+        "hint": {
+          "description": "Stated only by a database that takes hints, and then exactly `{db}/hint`. Its absence is how a caller tells one that does not, without sending anything.",
+          "type": "string"
         }
       },
       "required": [

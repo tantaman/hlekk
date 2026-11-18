@@ -33,6 +33,12 @@ import { surfaceOf } from "../../protocol/surface.ts";
 import type { Binding } from "../../protocol/http.ts";
 import type { Projection } from "../../catalog/projection.ts";
 import type { Policy } from "../../query/serve.ts";
+import type { Ref } from "../../query/ref.ts";
+import type { Id } from "../../query/types.ts";
+import { HintQueue } from "../../protocol/hint.ts";
+import type { HintQueueOptions, ReceivedHint } from "../../protocol/hint.ts";
+import { sendHint, settleHint } from "../../protocol/backlinks.ts";
+import type { HintSent, Settled } from "../../protocol/backlinks.ts";
 import type { ListenBinding } from "./http.ts";
 import { privateAddressGuard } from "./guard.ts";
 
@@ -57,6 +63,31 @@ export interface OpenOptions {
    *  because a stranger's URI must not reach this network. */
   allowLoopback?: boolean;
   foreign?: Partial<ForeignOptions>;
+  /**
+   * Records edges that other databases draw at this one. Absent, this database takes no hints: the
+   * route is a 404 and the descriptor does not state it.
+   *
+   * Needs `identity`, which is on by default — a hint is signed, and a database that verifies no
+   * signature cannot tell whose database a hint asks it to read.
+   */
+  backlinks?: BacklinkOptions;
+}
+
+export interface BacklinkOptions {
+  /**
+   * Which of this database's edge types records a confirmed edge.
+   *
+   * A name records every confirmed hint whose target is of the type that edge starts at, whoever
+   * sent it — the open policy, and the right one only for a database that wants to be cited by
+   * strangers. A function is the policy in full: it is told who is hinting, what they call their
+   * edge and the type of the object it points at, and it answers before anything is read.
+   */
+  edge: string | ((hint: ReceivedHint, targetType: string) => string | undefined);
+  /** Whether the checking read is signed. `"anonymous"`, the default, is what makes a recorded edge
+   *  safe to serve to anyone — see `CheckOptions.as`. */
+  as?: "anonymous" | "self";
+  maxPages?: number;
+  queue?: HintQueueOptions;
 }
 
 export interface NodeHlekk {
@@ -68,6 +99,19 @@ export interface NodeHlekk {
   binding: Binding & ListenBinding;
   /** Drains the outbox until nothing is left to deliver. No alarm here, so somebody has to ask. */
   deliver(): Promise<number>;
+  /**
+   * Tells the database `target` is in that `source` has, or no longer has, an edge `edge` to it.
+   *
+   * Called by the application, after it writes the edge and after it removes it. Not automatic,
+   * because sending one is consent: it discloses the edge to the database it points at and lets that
+   * database record it. Never throws for what the other database did — see `sendHint`.
+   */
+  hint(edge: string, source: Id, target: Ref): Promise<HintSent>;
+  /**
+   * Looks at every hint received so far: reads each one's source and records or removes an edge.
+   * Like `deliver`, there is no alarm, so somebody has to ask. Empty when this database takes none.
+   */
+  confirm(): Promise<Settled[]>;
   close(): void;
 }
 
@@ -135,6 +179,9 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
     pin: async (uri, keyId) => cluster.directory.pin(uri, keyId, Date.now()),
     repudiate: async (uri) => cluster.directory.repudiate(uri),
   };
+  const signAs = identity
+    ? async () => ({ database: own() ?? null, pair: await cluster.directory.identity(Date.now()) })
+    : undefined;
   const openForeign = (database: string): HostClient =>
     foreignClient(database, {
       catalog,
@@ -142,15 +189,31 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
       cache,
       agree: true,
       self: own(),
-      identity: identity ? async () => ({ database: own() ?? null, pair: await cluster.directory.identity(Date.now()) }) : undefined,
+      identity: signAs,
       pins: identity ? pins : undefined,
       ...opts.foreign,
     });
+  /** How this database reaches another outside of a query: to hint, and to check a hint. */
+  const reach = () => ({
+    guard,
+    identity: signAs,
+    pins: identity ? pins : undefined,
+    fetch: opts.foreign?.fetch,
+    deadlineMs: opts.foreign?.deadlineMs,
+    maxResponseBytes: opts.foreign?.maxResponseBytes,
+    now: opts.foreign?.now,
+  });
 
   Hlekk.forget(cluster.transport);
   const db = Hlekk.from(cluster.transport, cluster.runtime.clock, openForeign);
 
   if (identity) await cluster.directory.identity(Date.now());
+  const hints = opts.backlinks === undefined ? undefined : new HintQueue(opts.backlinks.queue);
+  const edgeFor = (hint: ReceivedHint, targetType: string): string | undefined => {
+    const edge = opts.backlinks!.edge;
+    if (typeof edge === "function") return edge(hint, targetType);
+    return catalog.edgeNamed(edge)?.from === targetType ? edge : undefined;
+  };
   const binding: Binding & ListenBinding = {
     // Filled in by whoever listens, which is the only party that knows the port. `adapters/node/http.ts`
     // does it.
@@ -168,6 +231,7 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
     get keys() { return identity ? cluster.directory.publishedKeys() : undefined; },
     pins: identity ? pins : undefined,
     callerKeys: identity ? async (uri) => (await discover(uri, { guard, ...opts.foreign })).keys : undefined,
+    hints,
   };
 
   return {
@@ -176,6 +240,38 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
     catalog,
     binding,
     deliver: () => cluster.deliverAll(),
+    hint: (edge, source, target) => sendHint(target, source, edge, reach()),
+    async confirm() {
+      const settled: Settled[] = [];
+      const self = own();
+      if (hints === undefined || self === undefined) return settled;
+      const failures: unknown[] = [];
+      for (const hint of hints.take()) {
+        try {
+          settled.push(
+            await settleHint(hint, {
+              ...reach(),
+              db,
+              catalog,
+              self,
+              edgeFor,
+              as: opts.backlinks!.as,
+              maxPages: opts.backlinks!.maxPages,
+            }),
+          );
+        } catch (e) {
+          // One hint that cannot be settled must not cost the ones queued behind it, which came
+          // from other databases. It is still reported: a policy naming an edge type that cannot
+          // hold a backlink is the operator's to hear about, not to find in an empty list.
+          failures.push(e);
+          settled.push("unknown");
+        }
+      }
+      if (failures.length > 0) {
+        throw new AggregateError(failures, `${failures.length} of ${settled.length} hints could not be settled`);
+      }
+      return settled;
+    },
     close: () => {
       for (const sql of opened.values()) sql.close();
     },

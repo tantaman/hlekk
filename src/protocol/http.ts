@@ -11,6 +11,7 @@
 //   POST {db}/read         a bounded read
 //   POST {db}/price        what that read would cost, with nothing read
 //   GET  {db}/vocabulary   the exposed types and edges
+//   POST {db}/hint         "look at this edge of mine" — only where the database takes them
 //
 // `{db}` is the database URI, so mounting under a path prefix is what gives a deployment its
 // identity: `https://<host>/<prefix>`. The prefix is derived from the URI rather than configured
@@ -35,6 +36,9 @@ import { CALLER_HEADER, SignatureRefused, reachable, verifyRequest } from "./ide
 import type { Caller, PublicKey } from "./identity.ts";
 import type { Pins } from "./client.ts";
 import type { Surface } from "./surface.ts";
+import { Backoff } from "./backoff.ts";
+import { parseHint } from "./hint.ts";
+import type { HintSink } from "./hint.ts";
 
 /** Bytes a request body may hold. A read with the maximum 100 ids and a full tree of filters is a
  *  few kilobytes; this is two orders of magnitude of headroom and still a bound. */
@@ -58,7 +62,9 @@ export interface Descriptor {
   catalog: number;
   limits: Limits & { maxIds: number; maxBody: number };
   keys: DescriptorKey[];
-  routes: { read: string; price: string; vocabulary: string };
+  /** `hint` is stated only by a database that takes hints, and is how a caller tells one that does
+   *  from one that does not without sending anything. */
+  routes: { read: string; price: string; vocabulary: string; hint?: string };
 }
 
 /** What one database serves. `database` is its canonical URI; everything else is the serving half
@@ -104,6 +110,16 @@ export interface Binding {
   /** Seconds since the epoch, as this database sees it, for the signature's creation window. */
   now?: () => number;
   maxSkewSeconds?: number;
+  /**
+   * Where a received hint goes. Absent, this database takes none: the route is a 404 and the
+   * descriptor does not state it.
+   *
+   * Taking hints needs `callerKeys` as well, and without it the route is equally absent. A hint is
+   * an instruction to make a request — the read that checks it — so the one thing that has to be
+   * known before queueing one is whose database that request will go to. That is the signature, and
+   * a database that verifies none cannot take a hint from anybody.
+   */
+  hints?: HintSink;
 }
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
@@ -138,9 +154,17 @@ export function descriptorOf(binding: Binding): Descriptor {
       maxBody: binding.maxBody ?? MAX_BODY,
     },
     keys: binding.publishedKeys?.() ?? binding.keys ?? [],
-    routes: { read: at("read"), price: at("price"), vocabulary: at("vocabulary") },
+    routes: {
+      read: at("read"),
+      price: at("price"),
+      vocabulary: at("vocabulary"),
+      ...(takesHints(binding) ? { hint: at("hint") } : {}),
+    },
   };
 }
+
+/** Whether this database takes hints at all: somewhere to put one, and a way to know who sent it. */
+const takesHints = (binding: Binding): boolean => binding.hints !== undefined && binding.callerKeys !== undefined;
 
 const serveOptions = (binding: Binding, policy?: Policy): ServeOptions => ({
   catalog: binding.catalog,
@@ -153,15 +177,17 @@ const serveOptions = (binding: Binding, policy?: Policy): ServeOptions => ({
 });
 
 /**
- * Who is calling, and what they may see.
+ * Who is calling: the verified caller, null for the anonymous one, or the response that refuses.
  *
  * The responder reads the caller's keys from the caller's own descriptor, which is an outbound
  * request made during an inbound one — that is what "a URI resolves to a key at a well-known path
  * under it" costs, and it is cached per caller by whatever supplies `callerKeys`.
  */
-async function authorize(request: Request, binding: Binding, body: Uint8Array): Promise<{ policy?: Policy } | Response> {
-  let caller: Caller | null = null;
-  let keys: readonly PublicKey[] = [];
+async function authenticate(
+  request: Request,
+  binding: Binding,
+  body: Uint8Array,
+): Promise<{ caller: Caller | null; keys: readonly PublicKey[] } | Response> {
   if (binding.callerKeys === undefined) {
     // This database verifies nothing, and its descriptor says so by publishing no key. A signature
     // presented anyway is refused rather than ignored: the caller took the trouble to make a claim,
@@ -173,43 +199,79 @@ async function authorize(request: Request, binding: Binding, body: Uint8Array): 
         400,
       );
     }
-  } else {
-    try {
-      caller = await verifyRequest({
-        method: request.method,
-        url: binding.database + new URL(request.url).pathname.slice(mountOf(binding).length) + new URL(request.url).search,
-        body,
-        headers: request.headers,
-        now: binding.now?.() ?? Math.floor(Date.now() / 1000),
-        maxSkewSeconds: binding.maxSkewSeconds,
-        keysOf: async (uri) => (keys = await binding.callerKeys!(uri)),
-      });
-    } catch (e) {
-      if (e instanceof SignatureRefused) return json({ error: e.message, at: "signature" }, 401);
-      throw e;
-    }
+    return { caller: null, keys: [] };
   }
+  let keys: readonly PublicKey[] = [];
+  try {
+    const caller = await verifyRequest({
+      method: request.method,
+      url: binding.database + new URL(request.url).pathname.slice(mountOf(binding).length) + new URL(request.url).search,
+      body,
+      headers: request.headers,
+      now: binding.now?.() ?? Math.floor(Date.now() / 1000),
+      maxSkewSeconds: binding.maxSkewSeconds,
+      keysOf: async (uri) => {
+        try {
+          return (keys = await binding.callerKeys!(uri));
+        } catch {
+          // The caller's descriptor could not be read: no such host, a refused connection, an address
+          // this deployment will not reach. That is a signature this database cannot verify, which
+          // is a 401 and the caller's to fix — not a fault here, which is what letting it propagate
+          // reported. Nothing about why is said: the URI is the caller's own claim, and "that
+          // address is private" is a fact about this network that a stranger did not have before.
+          throw new SignatureRefused("the caller's keys could not be read from its descriptor");
+        }
+      },
+    });
+    return { caller, keys };
+  } catch (e) {
+    if (e instanceof SignatureRefused) return json({ error: e.message, at: "signature" }, 401);
+    throw e;
+  }
+}
+
+/**
+ * Checks a verified caller against what this database recorded about it, or returns the refusal.
+ *
+ * `remember` is the difference between a caller this database distinguishes and a stranger. With it,
+ * a first contact is pinned. Without it, nothing is written — but a pin that is ALREADY held is
+ * still checked, because a caller this database once pinned does not become a stranger by being
+ * asked about on a route that would not have pinned it.
+ */
+async function pinned(binding: Binding, caller: Caller, keys: readonly PublicKey[], remember: boolean): Promise<Response | null> {
+  if (binding.pins === undefined) return null;
+  const held = await binding.pins.pinOf(caller.database);
+  if (held.state === "repudiated") return json({ error: "this caller is repudiated here", at: "signature" }, 403);
+  if (held.pinned === null) {
+    if (remember) await binding.pins.pin(caller.database, caller.key.id);
+    return null;
+  }
+  if (held.pinned === caller.key.id) return null;
+  // The caller signed with a key this database has not seen before. A rotation it has not caught
+  // up with looks exactly like a substitution from here, and the descriptor is what tells them
+  // apart — which is `pinned()` on the asking side. A responder that cannot walk the chain
+  // refuses rather than advancing the pin on the strength of the request itself.
+  const reached = await reachable(keys, held.pinned);
+  if (reached === null || reached.id !== caller.key.id) {
+    await binding.pins.repudiate(caller.database);
+    return json({ error: "this caller's key is not reachable from the one it proved before", at: "signature" }, 403);
+  }
+  await binding.pins.pin(caller.database, reached.id);
+  return null;
+}
+
+/** Who is calling a read, and what they may see. */
+async function authorize(request: Request, binding: Binding, body: Uint8Array): Promise<{ policy?: Policy } | Response> {
+  const who = await authenticate(request, binding, body);
+  if (who instanceof Response) return who;
   if (binding.policyFor === undefined) return {};
-  const decided = await binding.policyFor(caller);
+  const decided = await binding.policyFor(who.caller);
   // Pinned only when the policy said this caller is one it distinguishes. The registry is symmetric
   // — this database pins a caller's key the way it pins one it interns — and only the alias is
   // outbound-only.
-  if (decided.remember === true && caller !== null && binding.pins !== undefined) {
-    const held = await binding.pins.pinOf(caller.database);
-    if (held.state === "repudiated") return json({ error: "this caller is repudiated here", at: "signature" }, 403);
-    if (held.pinned === null) await binding.pins.pin(caller.database, caller.key.id);
-    else if (held.pinned !== caller.key.id) {
-      // The caller signed with a key this database has not seen before. A rotation it has not caught
-      // up with looks exactly like a substitution from here, and the descriptor is what tells them
-      // apart — which is `pinned()` on the asking side. A responder that cannot walk the chain
-      // refuses rather than advancing the pin on the strength of the request itself.
-      const reached = await reachable(keys, held.pinned);
-      if (reached === null || reached.id !== caller.key.id) {
-        await binding.pins.repudiate(caller.database);
-        return json({ error: "this caller's key is not reachable from the one it proved before", at: "signature" }, 403);
-      }
-      await binding.pins.pin(caller.database, reached.id);
-    }
+  if (decided.remember === true && who.caller !== null) {
+    const refusal = await pinned(binding, who.caller, who.keys, true);
+    if (refusal !== null) return refusal;
   }
   return { policy: decided.policy };
 }
@@ -278,8 +340,61 @@ export async function handle(request: Request, binding: Binding): Promise<Respon
     }
   }
 
+  if (route === "hint" && takesHints(binding)) return hint(request, binding);
+
   return json({ error: "no such route" }, 404);
 }
+
+/**
+ * Takes a hint, and answers the same thing whatever it thinks of it.
+ *
+ * `202` means "received" and nothing more. It does not say the target exists, that this database
+ * will look, or that it would keep anything if it did — because each of those is something a read
+ * would not have told this caller. Forbidden is indistinguishable from absent on `/read`, and a hint
+ * that answered differently for an object the caller may not see would be the way around that.
+ *
+ * So everything decided here is decided from the request alone: its size, its signature, its shape.
+ * The claim inside it is not looked at on this path at all. Checking it means reading the caller's
+ * database, and a request that makes this one wait on a stranger's server is a request whose
+ * latency the stranger sets.
+ */
+async function hint(request: Request, binding: Binding): Promise<Response> {
+  const refusal = method(request, "POST");
+  if (refusal !== null) return refusal;
+  const raw = await body(request, binding.maxBody ?? MAX_BODY);
+  if (raw instanceof Response) return raw;
+  const who = await authenticate(request, binding, raw);
+  if (who instanceof Response) return who;
+  if (who.caller === null) {
+    // The one route where the anonymous caller is not a caller. Without a signature there is no
+    // telling whose database the checking read would be sent to, and "whoever the body says" is how
+    // a third party aims this database at one of its choosing.
+    return json({ error: "a hint is signed: it names the database that will be read to check it", at: "signature" }, 401);
+  }
+  const known = await pinned(binding, who.caller, who.keys, false);
+  if (known !== null) return known;
+  if (who.caller.database === canonicalDb(binding.database)) {
+    return json({ error: "a hint is about an edge from another database, and this is signed as this one", at: "signature" }, 400);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+  } catch {
+    return json({ error: "body is not JSON" }, 400);
+  }
+  try {
+    await binding.hints!.offer({ ...parseHint(parsed), caller: who.caller.database });
+  } catch (e) {
+    if (e instanceof Refused) return json({ error: e.message, at: e.at }, 400);
+    if (e instanceof Backoff) return later(e);
+    return fault(e);
+  }
+  return json({ v: WIRE_VERSION }, 202);
+}
+
+/** "Not now", with how long. 429 when it is this caller's doing and 503 when it is nobody's. */
+const later = (e: Backoff): Response =>
+  json({ error: e.message }, e.whose === "caller" ? 429 : 503, { "retry-after": String(e.seconds) });
 
 /** A 500 that says nothing. A stranger learns that this database broke, not how. */
 const fault = (e?: unknown): Response => {

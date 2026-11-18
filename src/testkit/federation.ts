@@ -21,6 +21,10 @@ import type { Binding } from "../protocol/http.ts";
 import { foreignClient } from "../protocol/client.ts";
 import type { ForeignOptions, Omitted, Pins } from "../protocol/client.ts";
 import type { Caller, PublicKey } from "../protocol/identity.ts";
+import { HintQueue } from "../protocol/hint.ts";
+import type { HintQueueOptions, ReceivedHint } from "../protocol/hint.ts";
+import { sendHint, settleHint } from "../protocol/backlinks.ts";
+import type { HintSent, Reach, Settled } from "../protocol/backlinks.ts";
 import { surfaceOf } from "../protocol/surface.ts";
 import type { Projection } from "../catalog/projection.ts";
 import type { Policy } from "../query/serve.ts";
@@ -42,6 +46,15 @@ export interface MemberOptions extends Omit<LocalOptions, "uri"> {
   /** What it exposes over the protocol. Everything in its catalog by default. */
   projection?: Projection;
   policy?: Policy;
+  /**
+   * Takes hints, and records what they turn out to be true of under the edge type this names — the
+   * policy `settleHint` asks before it reads anything. Needs `identity` on the federation, as a
+   * deployment's would: a hint is signed.
+   */
+  backlinks?: (hint: ReceivedHint, targetType: string) => string | undefined;
+  /** Whether the checking read is signed. Anonymous by default. */
+  backlinksAs?: "anonymous" | "self";
+  hintQueue?: HintQueueOptions;
 }
 
 export interface Member {
@@ -52,7 +65,13 @@ export interface Member {
   db: Hlekk;
   binding: Binding;
   /** Requests this database has ANSWERED over the protocol, by route. */
-  served: { read: number; price: number; descriptor: number; vocabulary: number };
+  served: { read: number; price: number; descriptor: number; vocabulary: number; hint: number };
+  /** The hints it has received and not yet looked at, when it takes any. */
+  hints?: HintQueue;
+  /** Tells the database `target` is in to look at this one's `source`. */
+  hint(edge: string, source: Id, target: Ref): Promise<HintSent>;
+  /** Looks at every hint received so far. */
+  confirm(): Promise<Settled[]>;
 }
 
 export interface Federation {
@@ -98,7 +117,7 @@ export async function federate(opts: FederationOptions): Promise<Federation> {
     cluster.spreadCatalog();
     await cluster.publish();
     const catalog = Catalog.compile(chain[chain.length - 1]!);
-    const served = { read: 0, price: 0, descriptor: 0, vocabulary: 0 };
+    const served = { read: 0, price: 0, descriptor: 0, vocabulary: 0, hint: 0 };
     const binding: Binding = {
       database: m.uri,
       catalog,
@@ -108,7 +127,17 @@ export async function federate(opts: FederationOptions): Promise<Federation> {
       policyFor: m.policyFor,
       keys: opts.identity === true ? (await cluster.directory.identity(0), cluster.directory.publishedKeys()) : undefined,
     };
-    members.set(m.uri, { uri: m.uri, cluster, catalog, db: cluster.client(), binding, served });
+    members.set(m.uri, {
+      uri: m.uri,
+      cluster,
+      catalog,
+      db: cluster.client(),
+      binding,
+      served,
+      // Filled in below, once there is a `fetch` that reaches every member.
+      hint: () => Promise.reject(new Error("the federation is not wired yet")),
+      confirm: () => Promise.resolve([]),
+    });
   }
 
   /** One `fetch` over the whole federation: the handler of whichever member the URL belongs to. */
@@ -122,6 +151,7 @@ export async function federate(opts: FederationOptions): Promise<Federation> {
       if (route === "read") m.served.read++;
       else if (route === "price") m.served.price++;
       else if (route === "vocabulary") m.served.vocabulary++;
+      else if (route === "hint") m.served.hint++;
       else if (at.pathname === path) m.served.descriptor++;
       return handle(new Request(url, init as RequestInit), m.binding);
     }
@@ -151,6 +181,34 @@ export async function federate(opts: FederationOptions): Promise<Federation> {
   // by replacing the member's `db` rather than by mutating one.
   for (const m of members.values()) {
     m.db = hlekkWithForeign(m, fetchWith, omitted, opts);
+  }
+
+  // Hints, in both directions. Wired after the clients, because the edge a confirmed hint records is
+  // written by the member's own client and that is the one built just above.
+  for (const given of opts.members) {
+    const m = members.get(given.uri)!;
+    const reach: Reach = {
+      fetch: fetchWith,
+      deadlineMs: opts.foreign?.deadlineMs,
+      now: opts.foreign?.now,
+      ...(opts.identity === true
+        ? { identity: async () => ({ database: m.uri, pair: await m.cluster.directory.identity(0) }), pins: pinsOf(m) }
+        : {}),
+    };
+    m.hint = (edge, source, target) => sendHint(target, source, edge, reach);
+    if (given.backlinks === undefined) continue;
+    const queue = new HintQueue(given.hintQueue);
+    m.hints = queue;
+    m.binding.hints = queue;
+    m.confirm = async () => {
+      const settled: Settled[] = [];
+      for (const hint of queue.take()) {
+        settled.push(
+          await settleHint(hint, { ...reach, db: m.db, catalog: m.catalog, self: m.uri, edgeFor: given.backlinks!, as: given.backlinksAs }),
+        );
+      }
+      return settled;
+    };
   }
 
   return {

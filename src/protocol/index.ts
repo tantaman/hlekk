@@ -21,10 +21,19 @@ export {
   NotFollowed,
   Repudiated,
   ResponseCache,
+  discover,
+  discoverPinned,
   foreignClient,
   foreignClients,
 } from "./client.ts";
-export type { ForeignOptions, Omitted, Pins } from "./client.ts";
+export type { ForeignOptions, Omitted, Pins, TransportOptions } from "./client.ts";
+
+// Backlinks: a hint received, a read that checks it, and an edge of this database's own.
+export { Backoff } from "./backoff.ts";
+export { HINT_MEMBERS, HintQueue, parseHint } from "./hint.ts";
+export type { Hint, HintQueueOptions, HintSink, ReceivedHint } from "./hint.ts";
+export { DEFAULT_CHECK_PAGES, checkHint, retryAfterOf, sendHint, settleHint } from "./backlinks.ts";
+export type { CheckOptions, HintSent, Reach, Settled, SettleOptions, Verdict } from "./backlinks.ts";
 
 export {
   ALG,

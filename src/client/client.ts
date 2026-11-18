@@ -540,6 +540,14 @@ export class Hlekk {
     return this.write<void>({ kind: "assocAdd", atype, id1, db: to.db, id2: to.id, time, data });
   }
 
+  /** Adds an edge unless it is already there, in which case nothing about it changes — not its
+   *  `time`, and so not its place in the list. `assocAdd` is an upsert and moves an edge to the head;
+   *  this is for an edge whose re-statement somebody else can cause. See `AssocAddOp.keep`. */
+  async assocAddIfAbsent(atype: number, id1: Id, id2: Ref, time?: number, data?: Record<string, Json> | null): Promise<void> {
+    const to = await this.#aliasFor(atype, id2);
+    return this.write<void>({ kind: "assocAdd", atype, id1, db: to.db, id2: to.id, time, data, keep: true });
+  }
+
   /** Adds many edges, grouped so that each group is one transaction on one host.
    *
    *  `assocAdd` costs one durable commit per edge, which is the whole of the ~6,300 edges/s ceiling

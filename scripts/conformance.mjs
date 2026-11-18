@@ -15,9 +15,15 @@
 // from absent, transitively; paging; signature verification — are step 7's suite, which publishes a
 // catalog and a graph for an implementation to load by its own means.
 //
+// **`--hints`** runs the checks that need this suite to BE a calling database: it listens on a
+// loopback port, serves a descriptor and a read route of its own, signs hints, and reads back what
+// the database under test recorded. Only for a database that can reach this machine's loopback —
+// see spec/fixture/README.md.
+//
 // Exits non-zero if any check fails.
 
 import { readFileSync, readdirSync } from "node:fs";
+import { createServer } from "node:http";
 import { isDeepStrictEqual } from "node:util";
 
 import { validate } from "./lib/jsonschema.mjs";
@@ -25,8 +31,9 @@ import { validate } from "./lib/jsonschema.mjs";
 const argv = process.argv.slice(2);
 const [uri] = argv;
 const fixtureAt = flag("--fixture");
+const withHints = argv.includes("--hints");
 if (!uri || uri.startsWith("--")) {
-  console.error("usage: node scripts/conformance.mjs <database URI> [--fixture <manifest>]");
+  console.error("usage: node scripts/conformance.mjs <database URI> [--fixture <manifest> [--hints]]");
   process.exit(2);
 }
 
@@ -110,6 +117,19 @@ check("it states its keys, even when it has none", Array.isArray(descriptor?.key
 check(
   "it names its routes",
   ["read", "price", "vocabulary"].every((r) => typeof descriptor?.routes?.[r] === "string"),
+);
+check(
+  "and the whole descriptor validates against spec/schemas/descriptor.json",
+  descriptor !== null && invalid("descriptor.json", descriptor).length === 0,
+  (descriptor === null ? ["no body"] : invalid("descriptor.json", descriptor)).join("; "),
+);
+// Stated exactly where it is served, or not stated at all: its absence is how a caller tells a
+// database that takes no hints from one that does, without sending anything.
+const takesHints = descriptor?.routes?.hint !== undefined;
+check(
+  "a hint route, where it states one, is {db}/hint",
+  !takesHints || descriptor.routes.hint === `${uri}/hint`,
+  takesHints ? `stated as ${JSON.stringify(descriptor.routes.hint)}` : "not stated: this database takes no hints",
 );
 
 // ---- the vocabulary
@@ -317,6 +337,25 @@ check("GET on a POST route is 405", getRead === 405, `status ${getRead}`);
 const unknown = await fetch(`${uri}/no-such-route`).then((r) => r.status, () => 0);
 check("an unknown route is 404", unknown === 404, `status ${unknown}`);
 
+// ---- hints, as far as they can be checked without being a caller
+
+{
+  const unsigned = await send("hint", { source: "1", edge: "conf.some_edge", target: SOME_ID });
+  if (takesHints) {
+    // The one route where the anonymous caller is not a caller: without a signature there is no
+    // telling whose database the checking read would be sent to.
+    check(
+      "a hint nobody signed is refused with 401, not read as anonymous",
+      unsigned.status === 401 && unsigned.body !== null && invalid("refusal.json", unsigned.body).length === 0,
+      `status ${unsigned.status}`,
+    );
+    const getHint = await fetch(`${uri}/hint`).then((r) => r.status, () => 0);
+    check("GET on the hint route is 405", getHint === 405, `status ${getHint}`);
+  } else {
+    check("a database that states no hint route has none", unsigned.status === 404, `status ${unsigned.status}`);
+  }
+}
+
 // ---- what only a fixture can show
 //
 // Everything above runs against a live database without being told what is in it. These need the
@@ -431,6 +470,212 @@ if (fixture !== null) {
     forged >= 400 && forged < 500,
     `status ${forged}${forged === 200 ? " — stripping a header would then be a downgrade" : ""}`,
   );
+
+  // ---- hints, with this suite as the calling database
+  //
+  // Everything a hint is supposed to be is a statement about what the responder does NOT do with
+  // one: believe it, answer it differently for an object it hides, or read anybody before it has
+  // answered. None of that shows unless something is on the other end to be read, so the suite
+  // becomes a database: one object type, one edge type, and a table it changes between hints.
+  if (withHints && takesHints) {
+    const caller = await callerDatabase();
+    const cited = (source) => `${caller.uri}#${source}`;
+    /** What anyone reads of the edges recorded at one of the fixture's pages. */
+    const recordedAt = async (page) => {
+      const res = await send("read", { ids: [page], hops: [{ as: "cited", edge: "conf.page_cited_by", limit: 50 }] });
+      return { ids: res.body?.lists?.[`1:${page}`]?.ids ?? [], objects: Object.keys(res.body?.objects ?? {}) };
+    };
+    const until = async (settled, ms = 8000) => {
+      for (const start = Date.now(); Date.now() - start < ms; ) {
+        if (await settled()) return true;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return false;
+    };
+
+    // Claim 2 exists and cites nothing; claim 1 cites the fixture's root. The false hint goes first,
+    // so that by the time the true one has been recorded a responder working in order has also
+    // decided the false one.
+    caller.edges.set("2", []);
+    caller.edges.set("1", [`${uri}#${id("root")}`]);
+    const lie = await caller.hint("2", id("visible-a"));
+    const truth = await caller.hint("1", id("root"));
+    const toAbsent = await caller.hint("1", String(absent));
+    const toHidden = await caller.hint("1", id("hidden"));
+
+    check(
+      "a signed hint is taken with 202",
+      truth.status === 202 && invalid("hint-response.json", truth.body).length === 0,
+      `status ${truth.status}`,
+    );
+    check(
+      "and its answer is the same for a target that is there, one that is hidden and one that is absent",
+      [lie, toAbsent, toHidden].every((h) => h.status === truth.status && h.text === truth.text),
+      [lie, truth, toAbsent, toHidden].map((h) => h.status).join(", "),
+    );
+    check(
+      "the caller is not read before its hint is answered",
+      [lie, truth, toAbsent, toHidden].every((h) => h.readBeforeAnswer === false),
+      "the claim is looked at afterwards, or a stranger's server sets this route's latency",
+    );
+
+    const recorded = await until(async () => (await recordedAt(id("root"))).ids.includes(cited("1")));
+    check("an edge the caller really holds is recorded, as a reference to the caller's object", recorded);
+    check("and the caller was read for it, rather than believed", (caller.reads.get("1") ?? 0) >= 1, `${caller.reads.get("1") ?? 0} reads`);
+    const at = await recordedAt(id("root"));
+    check(
+      "and nothing stands behind the reference, as for any other the database holds",
+      !at.objects.includes(cited("1")) && at.objects.every((key) => /^(0|[1-9][0-9]*)$/.test(key)),
+    );
+    check(
+      "an edge the caller does not hold is not recorded, whatever its hint said",
+      recorded && !(await recordedAt(id("visible-a"))).ids.includes(cited("2")),
+      recorded ? "" : "not decidable: the true hint was never recorded, so the false one may not have been looked at",
+    );
+
+    // The same hint, after the edge is gone. A hint says "look", so there is no second message.
+    caller.edges.set("1", []);
+    const again = await caller.hint("1", id("root"));
+    const withdrawn = again.status === 202 && (await until(async () => !(await recordedAt(id("root"))).ids.includes(cited("1"))));
+    check("and it is withdrawn by the same hint, once a read no longer shows the edge", withdrawn, `status ${again.status}`);
+
+    await caller.close();
+  } else if (withHints) {
+    check("hints as a caller", true, "skipped: this database states no hint route");
+  }
+}
+
+/**
+ * This suite, as a database that hints.
+ *
+ * The smallest thing that can be read over the protocol: a descriptor with one key, and a read route
+ * that answers one shape — an object and the one edge type it has. Built from the specification's
+ * text and nothing in `src/`, so the signature base below is a second reading of §7.2 rather than
+ * the implementation's own.
+ */
+async function callerDatabase() {
+  const b64url = (bytes) => Buffer.from(bytes).toString("base64url");
+  const pair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  const keyId = b64url(await crypto.subtle.digest("SHA-256", raw));
+
+  /** source id -> the references its edge lists. An id that is not here is an object that is not. */
+  const edges = new Map();
+  /** source id -> how many reads have asked about it. */
+  const reads = new Map();
+  let own = "";
+
+  const json = (res, status, body) => {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  const server = createServer((req, res) => {
+    const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    if (req.method === "GET" && path === "/suite") {
+      return json(res, 200, {
+        v: 1,
+        protocol: "hlekk",
+        wire: [1],
+        database: own,
+        catalog: 1,
+        limits: { maxDepth: 1, maxLimit: 100, maxFrames: 2, maxNodes: 1000, maxCounts: 0, maxWhere: 0, maxIds: 1, maxBody: 65536 },
+        keys: [{ id: keyId, alg: "ed25519", key: b64url(raw) }],
+        routes: { read: `${own}/read`, price: `${own}/price`, vocabulary: `${own}/vocabulary` },
+      });
+    }
+    if (req.method === "GET" && path === "/suite/vocabulary") {
+      return json(res, 200, {
+        v: 1,
+        catalog: 1,
+        types: { "suite.claim": { fields: {} }, "conf.page": { fields: {} } },
+        edges: { "suite.claim_cites": { from: "suite.claim", to: "conf.page", counted: true, foreign: true } },
+      });
+    }
+    if (req.method === "POST" && path === "/suite/read") {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        let asked;
+        try {
+          asked = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        } catch {
+          return json(res, 400, { error: "body is not JSON" });
+        }
+        const source = asked?.ids?.[0];
+        const hop = asked?.hops?.[0];
+        if (typeof source !== "string") return json(res, 400, { error: "at least one id is required", at: "ids" });
+        if (hop !== undefined && hop.edge !== "suite.claim_cites") return json(res, 400, { error: "no such edge", at: "hops[0]" });
+        reads.set(source, (reads.get(source) ?? 0) + 1);
+        const held = edges.get(source);
+        const as = hop?.as ?? hop?.edge;
+        return json(res, 200, {
+          v: 1,
+          roots: held === undefined ? [] : [source],
+          objects: held === undefined ? {} : { [source]: { type: "suite.claim", version: 1, data: {} } },
+          lists: held === undefined || hop === undefined ? {} : { [`1:${source}`]: { ids: held, cursor: null, more: false } },
+          counts: {},
+          shape: hop === undefined ? { 0: {} } : { 0: { [as]: 1 }, 1: {} },
+          cost: { frames: hop === undefined ? 1 : 2, nodes: hop === undefined ? 1 : 1 + (hop.limit ?? 25) },
+          // Deliberately not reusable. Sending a hint is consent to record the edge it is about, and
+          // that does not depend on what the checking read says of the rest of its answer (§11.4).
+          cache: { reuse: "never" },
+        });
+      });
+      return undefined;
+    }
+    return json(res, 404, { error: "no such route" });
+  });
+  await new Promise((listening) => server.listen(0, "127.0.0.1", listening));
+  own = `http://127.0.0.1:${server.address().port}/suite`;
+
+  /** The four headers of §7.2, over exactly the four components it names, in its order. */
+  const sign = async (url, body) => {
+    const digest = `sha-256=:${Buffer.from(await crypto.subtle.digest("SHA-256", Buffer.from(body))).toString("base64")}:`;
+    const params = `("@method" "@target-uri" "content-digest" "hlekk-caller");created=${Math.floor(Date.now() / 1000)};keyid="${keyId}";alg="ed25519"`;
+    const base = [
+      `"@method": POST`,
+      `"@target-uri": ${url}`,
+      `"content-digest": ${digest}`,
+      `"hlekk-caller": ${own}`,
+      `"@signature-params": ${params}`,
+    ].join("\n");
+    const signature = Buffer.from(await crypto.subtle.sign("Ed25519", pair.privateKey, Buffer.from(base))).toString("base64");
+    return {
+      "content-type": "application/json",
+      "hlekk-caller": own,
+      "content-digest": digest,
+      "signature-input": `hlekk=${params}`,
+      signature: `hlekk=:${signature}:`,
+    };
+  };
+
+  return {
+    uri: own,
+    edges,
+    reads,
+    /** Sends one hint, and says whether this database had been read about its source by the time
+     *  the answer's status arrived. */
+    async hint(source, target) {
+      const url = `${uri}/hint`;
+      const body = JSON.stringify({ source, edge: "suite.claim_cites", target });
+      const before = reads.get(source) ?? 0;
+      const res = await fetch(url, { method: "POST", headers: await sign(url, body), body });
+      const readBeforeAnswer = (reads.get(source) ?? 0) > before;
+      const text = await res.text();
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        // left null
+      }
+      return { status: res.status, text, body: parsed, readBeforeAnswer };
+    },
+    close: () =>
+      new Promise((closed) => {
+        server.closeAllConnections();
+        server.close(() => closed());
+      }),
+  };
 }
 
 for (const c of checks) {

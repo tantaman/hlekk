@@ -23,6 +23,23 @@ query crosses the boundary over HTTP, and the wiki decides what the notes databa
 
 Try the [incident-to-release experiment](examples/incident-release/README.md). Give an agent one incident reference, let it follow the link to a maintainer’s Postgres release record, then repeat with the maintainer offline.
 
+And the wiki can answer who links to it, without anyone having written into it:
+
+```ts
+// The wiki takes hints, and records what they turn out to be true of.
+const wiki = await open({ dir, lock, backlinks: { edge: "wiki.page_cited_by" } });
+
+// Notes, after drawing its edge, says where to look.
+await notes.hint("notes.note_about", note, "https://wiki.example/db#281474976710691");
+
+// The wiki reads notes itself, and draws an edge of its own back. Nothing it was told is stored.
+await wiki.confirm();
+```
+
+A backlink is an ordinary edge out of the wiki, read like any other. The hint is signed, checked by
+a read, and may be dropped — [`docs/protocol.md`](docs/protocol.md) has the threat model, which is
+most of it.
+
 ## Where things are
 
 | | |
@@ -79,9 +96,12 @@ implementation under test would be checking that the implementation agrees with 
 - **Cross-database writes, inverses and cascades.** Reads only, and that is a decision rather than a
   gap: delivery routes through a host's own client, which is scoped to one database and never gives
   up, so writing the other half of a cross-database edge would mean holding credentials to write into
-  someone else's database inside a path with no give-up. A target database that wants a backlink
-  subscribes; it does not get written into.
-- **Backlinks across databases.** A subscription protocol with its own threat model.
+  someone else's database inside a path with no give-up. A target database that wants a backlink is
+  told where to look and reads for itself; it does not get written into.
+- **Backlinks nobody told it about.** A database records an edge back only after the database that
+  drew the edge sends a hint, and sending one is the application's call — nothing hints
+  automatically, and nothing retries. "Who anywhere links to this?" is an index built by something
+  that crawls, and is not here.
 - **A global directory of databases.** A URI is the name and DNS arbitrates it. Discovery is not
   identity.
 - **Many databases in one deployment.** One deployment serves one database, by decision rather than

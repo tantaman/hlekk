@@ -226,7 +226,7 @@
     }
   ],
   "policy": {
-    "comment": "What the implementation under test must enforce. Three rules, each the smallest that makes one protocol property observable from outside.",
+    "comment": "What the implementation under test must enforce. Each rule is the smallest that makes one protocol property observable from outside.",
     "hidden": {
       "objects": [
         "hidden"
@@ -244,6 +244,10 @@
         "visible-b"
       ],
       "why": "Visible to a verified caller and not to the anonymous one, so a suite that can sign has something to show for it."
+    },
+    "backlinks": {
+      "edge": "conf.page_cited_by",
+      "why": "Only for an implementation that takes hints (section 11). A hint from ANY caller whose target is a conf.page is checked by a read made as the anonymous caller, recorded under this edge when that read lists the reference, and removed when a later read does not. The suite is the caller: it serves a descriptor and a read route of its own on a loopback port, signs its hints, and then reads this database to see what was recorded."
     },
     "cache": {
       "reuse": "public",

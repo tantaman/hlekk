@@ -8,16 +8,34 @@ result. `scripts/conformance.mjs` checks what a black box can show about it.
 ## What to load
 
 - [`catalog.json`](catalog.json) is a hlekk lock. An implementation that is not this one needs the
-  three object types and three edge types it declares, under exactly those names: names are what
-  cross the wire, and the integers in the file are this engine's own encoding of them.
+  object types and edge types it declares, under exactly those names: names are what cross the wire,
+  and the integers in the file are this engine's own encoding of them.
 - [`graph.json`](graph.json) lists objects by name, then the edges between them. Load them in the
   order given; the `time` on each edge is the sort key its list is read by, and the suite relies on
   the order that produces.
 - `graph.json`'s `foreignEdges` hold a reference into a database nobody runs. A URI is mintable
   before the database behind it exists, so this is a legal edge and a read of it must list the
   reference and have no object for it.
-- `graph.json`'s `policy` is what the implementation must enforce. Three rules, each the smallest
-  that makes one protocol property observable from outside; each carries its own `why`.
+- `graph.json`'s `policy` is what the implementation must enforce. Each rule is the smallest that
+  makes one protocol property observable from outside, and each carries its own `why`.
+
+## If the implementation takes hints
+
+Taking hints is optional ([`../protocol.md`](../protocol.md) §11), and an implementation that takes
+none loads the fixture exactly as above: `conf.page_cited_by` is then an edge type nothing is ever
+stored under.
+
+One that does take them enforces `policy.backlinks`: a hint from any caller whose target is a
+`conf.page` is checked by a read made as the anonymous caller, recorded under `conf.page_cited_by`
+when that read lists the reference, and removed when a later read does not.
+
+To check that, the suite has to **be** a calling database. With `--hints` it listens on a loopback
+port, serves a descriptor with a key of its own and a read route, signs its hints with that key, and
+then reads the implementation to see what was recorded. So the implementation under test must be
+able to reach `http://127.0.0.1:<port>` — which a deployment refuses, rightly (§10), and a test run
+has to allow — and it must look at the hints it has been sent without being asked, within a few
+seconds. Without `--hints` the suite checks only what needs no caller: that the route is stated
+exactly where it is served, and that a hint nobody signed is refused.
 
 ## What to report
 
@@ -35,7 +53,7 @@ URI it is serving at.
 Then:
 
 ```bash
-node scripts/conformance.mjs <database URI> --fixture <path to the manifest>
+node scripts/conformance.mjs <database URI> --fixture <path to the manifest> [--hints]
 ```
 
 Without `--fixture` the suite runs the checks that need no data at all — a cost is arithmetic over

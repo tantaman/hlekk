@@ -5,6 +5,7 @@ import { describe, it } from "node:test";
 import { validate } from "../../scripts/lib/jsonschema.mjs";
 import { handle } from "./http.ts";
 import type { Binding } from "./http.ts";
+import { HintQueue, parseHint } from "./hint.ts";
 import { served } from "../testkit/served.ts";
 
 // The schemas in `spec/schemas/` are what an implementation other than this one is held to, so what
@@ -119,6 +120,50 @@ describe("every body this implementation serves", () => {
       const res = await post(binding, "/read", body);
       assert.equal(res.status, 200, JSON.stringify(body));
     }
+  });
+});
+
+describe("a hint", () => {
+  it("is refused by the handler exactly where the schema refuses it", () => {
+    const good: unknown[] = [
+      { source: "5", edge: "notes.note_about", target: "6" },
+      { source: "0", edge: "e", target: "9223372036854775807" },
+    ];
+    const bad: [string, unknown][] = [
+      ["a missing target", { source: "5", edge: "notes.note_about" }],
+      ["a source that is a reference", { source: "https://a.example/db#5", edge: "notes.note_about", target: "6" }],
+      ["a target that is a reference", { source: "5", edge: "notes.note_about", target: "https://a.example/db#6" }],
+      ["an id with a leading zero", { source: "05", edge: "notes.note_about", target: "6" }],
+      ["an empty edge name", { source: "5", edge: "", target: "6" }],
+      ["an edge name past the bound", { source: "5", edge: "e".repeat(129), target: "6" }],
+      ["an unknown member", { source: "5", edge: "notes.note_about", target: "6", time: 1 }],
+      ["an id that is a number", { source: 5, edge: "notes.note_about", target: "6" }],
+    ];
+    for (const body of good) {
+      assert.deepEqual(against("hint-request.json", body), [], JSON.stringify(body));
+      assert.doesNotThrow(() => parseHint(body), JSON.stringify(body));
+    }
+    for (const [why, body] of bad) {
+      assert.notDeepEqual(against("hint-request.json", body), [], `the schema should refuse ${why}`);
+      assert.throws(() => parseHint(body), `the parser should refuse ${why}`);
+    }
+  });
+
+  it("is advertised by a descriptor that still validates, and only by a database that can take one", async () => {
+    const { binding } = await served();
+    const taking: Binding = { ...binding, hints: new HintQueue(), callerKeys: async () => [] };
+    const descriptor = await (await at(taking, "")).json();
+    assert.equal(descriptor.routes.hint, "https://issues.example/db/hint");
+    assert.deepEqual(against("descriptor.json", descriptor), []);
+    // Somewhere to put a hint and no way to know who sent it is not a database that takes them.
+    const blind = await (await at({ ...binding, hints: new HintQueue() }, "")).json();
+    assert.equal(blind.routes.hint, undefined);
+    assert.equal((await at({ ...binding, hints: new HintQueue() }, "/hint", { method: "POST", body: "{}" })).status, 404);
+  });
+
+  it("is answered with a body the response schema accepts and nothing else", () => {
+    assert.deepEqual(against("hint-response.json", { v: 1 }), []);
+    assert.notDeepEqual(against("hint-response.json", { v: 1, recorded: true }), []);
   });
 });
 
