@@ -1,0 +1,12 @@
+{
+  "name": "hlekk-incident-release-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "releases": "node releases.mjs",
+    "incidents": "node incidents.mjs"
+  },
+  "dependencies": {
+    "pg": "8.23.1"
+  }
+}

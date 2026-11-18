@@ -21,6 +21,8 @@ row.about[0].title; // "Country"
 The two databases are run by different people, on different machines, under different policies. The
 query crosses the boundary over HTTP, and the wiki decides what the notes database may see.
 
+Try the [incident-to-release experiment](examples/incident-release/README.md). Give an agent one incident reference, let it follow the link to a maintainer’s Postgres release record, then repeat with the maintainer offline.
+
 ## Where things are
 
 | | |
