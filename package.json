@@ -60,6 +60,10 @@
       "types": "./dist/protocol/index.d.ts",
       "default": "./dist/protocol/index.js"
     },
+    "./reader": {
+      "types": "./dist/reader/index.d.ts",
+      "default": "./dist/reader/index.js"
+    },
     "./adapters/node": {
       "types": "./dist/adapters/node/index.d.ts",
       "default": "./dist/adapters/node/index.js"

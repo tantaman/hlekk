@@ -47,7 +47,8 @@ This README is written to be executed, and the steps are in the order you need t
 - **Ids are decimal strings, and they belong to whoever answered.** A bare id in an answer, including
   one inside a payload, is an object in the database that answered. Never resolve it against your own.
 - **You are the hub.** A database never follows a reference out of itself. When a list holds
-  `<database URI>#<id>`, split at the first `#` and ask that database yourself.
+  `<database URI>#<id>`, split at the first `#` and ask that database yourself. The
+  [reader](#from-a-program) does exactly that for you, within a budget.
 - **Ask the database what it is before you ask it anything else.** `GET {db}` states its limits and
   `GET {db}/vocabulary` states its types, their fields and where each edge starts and lands. Build
   requests from those and not from what you expect to be there.
@@ -224,6 +225,56 @@ unless one of them says `as`, which is why the count above does:
 [`spec/protocol.md`](spec/protocol.md) is the full contract, and [`spec/schemas/`](spec/schemas/)
 has a JSON Schema for every body.
 
+### From a program
+
+The same reads without building requests by hand. A reader is a client with no database behind it:
+it meets each database by its descriptor and vocabulary, sends each one the part of a request it can
+answer, and follows references into whichever database they name. Save this as `read.mjs` beside
+`notes.mjs`:
+
+```js
+// Reads other people's databases from a program that runs none.
+import { connect } from "./src/adapters/node/reader.ts";
+
+const ref = process.argv[2];
+// `allowLoopback` because these databases are on this machine. Without it a reader refuses any
+// address that is not public, which is what you want when the references come from strangers.
+const db = await connect(ref.slice(0, ref.indexOf("#")), { allowLoopback: true });
+console.log("from a note you may follow:", db.edgesFrom("notes.note").join(", "));
+
+const [note] = await db.reader.read(ref, {
+  counts: [{ as: "cited", edge: "notes.cites" }],
+  hops: [{ edge: "notes.cites", as: "cites", hops: [{ edge: "notes.about", as: "about" }] }],
+});
+const [cited] = note.cites.items;
+console.log(`${note.$type} "${note.title}" cites ${note.cited}: "${cited.title}"`);
+for (const about of cited.about.items) console.log(`  about ${about.$type} ${about.id}\n  ${JSON.stringify(about.ticket)}`);
+```
+
+```bash
+node read.mjs "$REF"
+```
+
+```
+from a note you may follow: notes.cites, notes.about
+notes.note "Follow-up" cites 1: "Duplicate deliveries"
+```
+
+- **The request is the body `POST {db}/read` takes, without its `ids`.** The same hops, counts,
+  filters, limits and cursors, under the same rules, and refused the same way.
+- **A row is the object's fields beside `id`, `$type` and `$version`.** `id` is always a full
+  reference. A hop comes back as a page: `{ items, cursor, more }`.
+- **Nothing is declared.** Each database is read by its own vocabulary, so one request may name edges
+  from several. A caller that does have a lock passes it, and queries built with `hlekk/schema` then
+  run against the reader as they would against a database: `Type.gen(ref).related(...).run(reader)`.
+- **A read is bounded.** A deadline, a number of requests and a number of databases, per read. A
+  database that cannot be reached fails the read by name, or is left out and reported with
+  `{ omit: { databases: {}, references: [] } }`.
+
+The reader itself is [`src/reader/`](src/reader/reader.ts) and runs wherever `fetch` does. The entry
+point above is the Node one, which adds the check that keeps a reference from leading into a
+private network.
+
 ## 4. Link it to someone else's
 
 Start a second database, run by somebody else as far as yours is concerned. The incident example's
@@ -257,8 +308,23 @@ INCIDENT='PASTE_THE_INCIDENT_REFERENCE'
 curl -fsS --json "{\"ids\":[\"${INCIDENT#*#}\"],\"hops\":[{\"edge\":\"ops.deployed_release\"}]}" "${INCIDENT%%#*}/read"
 ```
 
-That answer carries the incident and one more reference, into a release maintainer's database, which
-is a third publisher serving a Postgres view. The
+That answer carries the incident and one more reference, into a release maintainer's database.
+
+Or let the reader be the hub. The request in `read.mjs` has not changed, and it now crosses into the
+second database:
+
+```bash
+node read.mjs "$REF"
+```
+
+```
+from a note you may follow: notes.cites, notes.about
+notes.note "Follow-up" cites 1: "Duplicate deliveries"
+  about ops.incident http://127.0.0.1:8460/incidents#…
+  "INC-217"
+```
+
+The release maintainer's database is a third publisher, serving a Postgres view. The
 [incident-to-release experiment](examples/incident-release/README.md) starts it, hands a fresh agent
 nothing but the incident reference, and then takes the maintainer offline to see what the agent can
 still support.
@@ -328,6 +394,7 @@ npm run conformance:fixture   # the conformance suite, against the published fix
 | [`docs/protocol.md`](docs/protocol.md) | The protocol's rationale, and what cannot be revised |
 | [`docs/global-ids.md`](docs/global-ids.md) | How a reference into another database is stored and named |
 | [`docs/wikimedia-demo.md`](docs/wikimedia-demo.md) | The Wikimedia demo on Cloudflare Durable Objects: what it is and what was measured |
+| [`src/reader/`](src/reader/reader.ts) | The standalone client: reads across databases from a process that runs none |
 | [`src/adapters/`](src/adapters/) | The two adapters: Node.js over files, and Cloudflare Workers with Durable Objects |
 | [`PLAN.md`](PLAN.md) | What is done and what is not |
 
@@ -335,8 +402,8 @@ The documents are the point. Every decision that was hard is written down with t
 argument that settled it, and the ones still open are listed as open.
 
 To use the engine from another project, build the checkout and install it by path. The package
-exports `hlekk`, `hlekk/schema`, `hlekk/catalog`, `hlekk/protocol`, `hlekk/adapters/node`,
-`hlekk/adapters/cloudflare` and `hlekk/testkit`.
+exports `hlekk`, `hlekk/schema`, `hlekk/catalog`, `hlekk/protocol`, `hlekk/reader`,
+`hlekk/adapters/node`, `hlekk/adapters/cloudflare` and `hlekk/testkit`.
 
 ```bash
 npm run build                                  # in the checkout
