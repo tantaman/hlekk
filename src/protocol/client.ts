@@ -25,22 +25,25 @@
 // then gets a report of which databases could not be reached and how many references were left
 // unresolved — because an empty list must never be the way a failure is reported.
 
-import { BudgetSpent } from "../client/client.ts";
+import { BudgetSpent } from "../client/budget.ts";
 import { Catalog, idFieldsOf } from "../catalog/catalog.ts";
+import type { FieldSpec } from "../catalog/catalog.ts";
 import type { HostClient, HostReply } from "../query/driver.ts";
 import { canonicalDb, formatRef, parseRef } from "../query/ref.ts";
 import type { Ref } from "../query/ref.ts";
-import { listKey, tokenCursor } from "../query/types.ts";
+import { isReservedKey, listKey, tokenCursor } from "../query/types.ts";
 import type { Cursor, Edge, Fields, Id, Miss, Obj, Plan } from "../query/types.ts";
 import type { EdgeSegment, ReadSet } from "../query/stores.ts";
 import { describe, DEFAULT_HOP_LIMIT } from "../query/request.ts";
-import type { CountSpec, Hop } from "../query/request.ts";
+import type { Cost, CountSpec, Hop } from "../query/request.ts";
 import type { ReadRequest } from "../query/serve.ts";
 import { DESCRIPTOR_VERSION } from "./http.ts";
-import { WIRE_VERSION, decodeRead } from "./wire.ts";
+import { WIRE_VERSION, decodePrice, decodeRead } from "./wire.ts";
 import { reachable, signRequest, wellFormed } from "./identity.ts";
 import type { KeyPair, SignedHeaders } from "./identity.ts";
 import type { Descriptor } from "./http.ts";
+import { VOCABULARY_VERSION } from "./surface.ts";
+import type { VocabularyDoc } from "./surface.ts";
 
 /** How long one request to another database may take. */
 export const DEADLINE_MS = 5_000;
@@ -97,12 +100,23 @@ export class NotFollowed extends Error {
 export interface Omitted {
   /** Databases that failed, and how many references were left unresolved in each. */
   databases: Record<string, number>;
+  /** The references themselves, for a caller that supplies somewhere to put them. A count says how
+   *  much is missing; a reader showing someone an answer has to be able to say what. */
+  references?: Ref[];
 }
 
 export interface ForeignOptions {
-  /** The catalog this database reads by. Type names in an answer resolve through it, and one it does
-   *  not declare is declined rather than guessed at. */
-  catalog: Catalog;
+  /**
+   * The catalog this database reads by. Type names in an answer resolve through it, and one it does
+   * not declare is declined rather than guessed at.
+   *
+   * Or what states one, once the responder's descriptor is in hand. That is for a reader with no
+   * catalog of its own (`reader/reader.ts`), which reads each database by that database's own
+   * vocabulary and so cannot name one before it has asked. It is called inside `exec`, after the
+   * descriptor is checked and pinned, so a vocabulary that cannot be fetched fails — or is omitted —
+   * exactly as an object that cannot be fetched does.
+   */
+  catalog: Catalog | ((descriptor: Descriptor, spend?: () => AbortSignal) => Promise<Catalog>);
   /** Injected, so a test can hand in the handler itself and two databases can talk in one process
    *  over the same code a deployment runs. */
   fetch?: typeof fetch;
@@ -156,6 +170,9 @@ export interface ForeignOptions {
    * trust, which is where step 4 left it.
    */
   agree?: boolean;
+  /** The responder's vocabulary, where whoever built this client already holds it. `agree` reads it
+   *  from here rather than asking for the same document a second time. */
+  vocabulary?: (spend?: () => AbortSignal) => Promise<VocabularyDoc>;
 }
 
 /** The limits a responder's descriptor states, as the asking half uses them. */
@@ -218,8 +235,8 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
    * is already qualified is already absolute and is left alone, except one pointing back at the
    * asking database, which collapses to a bare id so that one object has one spelling.
    */
-  function absolute(otype: number, data: Fields): Fields {
-    const fields = opts.catalog.object(otype)?.fields;
+  function absolute(catalog: Catalog, otype: number, data: Fields): Fields {
+    const fields = catalog.object(otype)?.fields;
     if (fields === undefined) return data;
     const ids = idFieldsOf(fields);
     if (ids.length === 0) return data;
@@ -257,42 +274,6 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     });
   }
 
-  async function discoverPeer(spend?: () => AbortSignal): Promise<Descriptor> {
-    const pins = opts.pins;
-    if (!pins) return discover(db, opts, spend);
-    const held = await pins.pinOf(db);
-    if (held.state === "repudiated") {
-      throw new Repudiated(db, "an operator has to clear this before a read through it can run again");
-    }
-    const descriptor = await discover(db, opts, spend);
-    const keys = descriptor.keys;
-    if (keys.length === 0) {
-      // A database that publishes no key cannot be pinned, and a pin held against one that used to
-      // publish keys is not something to quietly forget.
-      if (held.pinned !== null) {
-        await pins.repudiate(db);
-        throw new Repudiated(db, "it published a key before and publishes none now");
-      }
-      return descriptor;
-    }
-    const current = keys.find((k) => k.retired === undefined)!;
-
-    if (held.pinned === null) {
-      // First contact. The current key — the one it has not retired — is what gets pinned.
-      await pins.pin(db, current.id);
-      return descriptor;
-    }
-    const reached = await reachable(keys, held.pinned);
-    if (reached?.id !== current.id) {
-      await pins.repudiate(db);
-      throw new Repudiated(db, `it publishes no key reachable from the pinned ${held.pinned}`);
-    }
-    // The pin advances along the rotation chain, so the next contact starts from the newest key it
-    // has proved rather than from one that may fall out of the grace window.
-    if (reached.id !== held.pinned) await pins.pin(db, reached.id);
-    return descriptor;
-  }
-
   let agreed: ReadonlySet<string> | undefined;
 
   return {
@@ -300,11 +281,12 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     async exec(plan, tasks, spend): Promise<HostReply> {
       const gathered: Gathered = { objects: new Map(), lists: [], counts: new Map() };
       try {
-        const descriptor = await discoverPeer(spend);
+        const descriptor = await discoverPinned(db, opts, spend);
+        const catalog = typeof opts.catalog === "function" ? await opts.catalog(descriptor, spend) : opts.catalog;
         const advertised = descriptor.limits;
         const max = advertised.maxIds;
-        for (const batch of group(tasks, plan, opts.catalog, max, advertised)) {
-          await send(batch, plan, gathered, descriptor, spend);
+        for (const batch of group(tasks, plan, catalog, max, advertised)) {
+          await send(batch, plan, gathered, descriptor, catalog, spend);
         }
       } catch (e) {
         // `omit` covers a database that could not be reached. A repudiated one was reached and
@@ -316,6 +298,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         // looking complete.
         const refs = tasks.filter((t) => t.kind === "object").map((t) => (t as { id: Ref }).id);
         opts.omit.databases[db] = (opts.omit.databases[db] ?? 0) + refs.length;
+        opts.omit.references?.push(...refs);
         for (const ref of refs) gathered.objects.set(ref, null);
         // A list or a count that could not be read is NOT answered as empty: an empty list is never
         // the report of a failure. Those tasks simply go unanswered, and the coordinator's store
@@ -354,7 +337,14 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     frames: Map<string, number>;
   }
 
-  async function send(batch: Batch, plan: Plan, into: Gathered, descriptor: Descriptor, spend?: () => AbortSignal): Promise<void> {
+  async function send(
+    batch: Batch,
+    plan: Plan,
+    into: Gathered,
+    descriptor: Descriptor,
+    catalog: Catalog,
+    spend?: () => AbortSignal,
+  ): Promise<void> {
     // Keyed by the request, which is canonical because this side built it. Two frames asking the
     // same thing of the same database in one query then cost one request.
     const payload = JSON.stringify(batch.body);
@@ -365,8 +355,8 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
       method: "POST", body: payload,
       headers: { "content-type": "application/json", ...await signature(url, payload, descriptor) },
     }, spend);
-    const decoded = decodeRead(body, opts.catalog);
-    const declined = new Set([...decoded.declined, ...(await disagreeing(spend))]);
+    const decoded = decodeRead(body, catalog);
+    const declined = new Set([...decoded.declined, ...(await disagreeing(catalog, spend))]);
     // The responder numbers the frames of the plan IT compiled, which are not this plan's numbers.
     // `shape` is how the two are joined: this side chose the aliases, so walking `shape` from the
     // root with those aliases gives the responder's frame for each of this plan's.
@@ -382,7 +372,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         for (const count of node.counts ?? []) {
           if (typeof count === "string") continue;
           const n = byAlias[count.as];
-          const atype = opts.catalog.edgeNamed(count.edge)?.atype;
+          const atype = catalog.edgeNamed(count.edge)?.atype;
           if (atype !== undefined && Number.isSafeInteger(n) && n >= 0) into.counts.set(listKey(refOf(parent), atype), n);
         }
       }
@@ -411,7 +401,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     for (const [local, entry] of Object.entries(decoded.result.objects)) {
       if (!allowedObjects.has(local)) continue;
       const ref = formatRef(db, local);
-      const name = opts.catalog.object(entry.otype)?.name;
+      const name = catalog.object(entry.otype)?.name;
       if (name !== undefined && declined.has(name)) {
         // A type the two catalogs do not mean the same thing by. Declined as absent, not as a guess
         // at the fields: an object that resolves while being uninterpretable is worse than one that
@@ -423,7 +413,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         id: ref,
         otype: entry.otype,
         version: entry.version,
-        data: absolute(entry.otype, declaredOnly(entry.otype, entry.data)),
+        data: absolute(catalog, entry.otype, declaredOnly(catalog, entry.otype, entry.data)),
       });
     }
 
@@ -474,45 +464,21 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
    * that its own schema does not know. A reader reads what it declares; `disagreeing` is what
    * catches the case where that is not enough.
    */
-  function declaredOnly(otype: number, data: Fields): Fields {
-    const fields = opts.catalog.object(otype)?.fields;
+  function declaredOnly(catalog: Catalog, otype: number, data: Fields): Fields {
+    const fields = catalog.object(otype)?.fields;
     if (fields === undefined) return data;
     const out: Fields = {};
     for (const name of Object.keys(fields)) if (name in data) out[name] = data[name];
     return out;
   }
 
-  /**
-   * Type names the two catalogs do not mean the same thing by, read from the responder's vocabulary
-   * once per database.
-   *
-   * A name is only half of an agreement. The vocabulary states each exposed type's fields, so the
-   * comparison is possible: a type this catalog declares a REQUIRED field for that the responder
-   * does not expose is one this side cannot read through, because every object of it would arrive
-   * missing something its own schema says is always there. A field the responder exposes and this
-   * side does not is the other direction and is fine — `declaredOnly` drops it.
-   */
-  async function disagreeing(spend?: () => AbortSignal): Promise<ReadonlySet<string>> {
+  /** Type names the two catalogs do not mean the same thing by, worked out once per client.
+   *  `disagreements` is the comparison and says why it is the one that matters. */
+  async function disagreeing(catalog: Catalog, spend?: () => AbortSignal): Promise<ReadonlySet<string>> {
     if (!opts.agree) return new Set();
     if (agreed) return agreed;
-    const out = new Set<string>();
-    const doc = await readJson(db, db + "/vocabulary", opts, {}, spend) as {
-      types?: Record<string, { fields?: Record<string, { type: string; optional: boolean }> }>;
-    };
-    for (const type of opts.catalog.objectTypes()) {
-      const theirs = doc.types?.[type.name];
-      if (theirs === undefined) continue; // not exposed at all: nothing of it will arrive
-      for (const [field, spec] of Object.entries(type.fields)) {
-        const mine = describe(spec);
-        const match = theirs.fields?.[field];
-        if (mine.optional && match === undefined) continue;
-        if (match === undefined || match.type !== mine.type || (!mine.optional && match.optional)) {
-          out.add(type.name);
-          break;
-        }
-      }
-    }
-    agreed = out;
+    const doc = await (opts.vocabulary?.(spend) ?? discoverVocabulary(db, opts, spend));
+    agreed = disagreements(catalog.objectTypes(), doc);
     return agreed;
   }
 
@@ -741,6 +707,54 @@ async function readJson(db: string, url: string, opts: TransportOptions, init: R
   }
 }
 
+/**
+ * A database's descriptor, held to what it proved before.
+ *
+ * `discover` reads and checks the document. This is first contact and every contact after it: the
+ * current key is pinned the first time, the pin walks forward along rotation signatures, and a
+ * database that publishes no key reachable from its pin is repudiated and stays that way.
+ */
+export async function discoverPinned(
+  database: string,
+  opts: TransportOptions & Pick<ForeignOptions, "pins">,
+  spend?: () => AbortSignal,
+): Promise<Descriptor> {
+  const db = canonicalDb(database);
+  const pins = opts.pins;
+  if (!pins) return discover(db, opts, spend);
+  const held = await pins.pinOf(db);
+  if (held.state === "repudiated") {
+    throw new Repudiated(db, "an operator has to clear this before a read through it can run again");
+  }
+  const descriptor = await discover(db, opts, spend);
+  const keys = descriptor.keys;
+  if (keys.length === 0) {
+    // A database that publishes no key cannot be pinned, and a pin held against one that used to
+    // publish keys is not something to quietly forget.
+    if (held.pinned !== null) {
+      await pins.repudiate(db);
+      throw new Repudiated(db, "it published a key before and publishes none now");
+    }
+    return descriptor;
+  }
+  const current = keys.find((k) => k.retired === undefined)!;
+
+  if (held.pinned === null) {
+    // First contact. The current key — the one it has not retired — is what gets pinned.
+    await pins.pin(db, current.id);
+    return descriptor;
+  }
+  const reached = await reachable(keys, held.pinned);
+  if (reached?.id !== current.id) {
+    await pins.repudiate(db);
+    throw new Repudiated(db, `it publishes no key reachable from the pinned ${held.pinned}`);
+  }
+  // The pin advances along the rotation chain, so the next contact starts from the newest key it
+  // has proved rather than from one that may fall out of the grace window.
+  if (reached.id !== held.pinned) await pins.pin(db, reached.id);
+  return descriptor;
+}
+
 export async function discover(database: string, opts: TransportOptions, spend?: () => AbortSignal): Promise<Descriptor> {
   const db = canonicalDb(database);
   const d = await readJson(db, db, opts, {}, spend) as Descriptor;
@@ -760,6 +774,93 @@ export async function discover(database: string, opts: TransportOptions, spend?:
     if (d.routes?.[route] !== db + "/" + route) throw new ForeignUnreachable(db, `invalid descriptor route ${route}`);
   }
   return d;
+}
+
+/**
+ * A database's vocabulary, checked against `spec/schemas/vocabulary.json` rather than cast.
+ *
+ * It is a stranger's document like any other, and what is built from it is a catalog: a name that is
+ * not a name, or a field under one a row already carries, would otherwise surface as a failure
+ * somewhere that cannot say whose document was wrong.
+ */
+export async function discoverVocabulary(database: string, opts: TransportOptions, spend?: () => AbortSignal): Promise<VocabularyDoc> {
+  const db = canonicalDb(database);
+  const doc = (await readJson(db, db + "/vocabulary", opts, {}, spend)) as VocabularyDoc;
+  const invalid = (what: string) => new ForeignUnreachable(db, `invalid vocabulary: ${what}`);
+  const record = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value);
+  const name = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 128;
+
+  if (!record(doc) || doc.v !== VOCABULARY_VERSION) throw invalid("not a version this reader knows");
+  if (!Number.isSafeInteger(doc.catalog) || doc.catalog < 0) throw invalid("no catalog version");
+  if (!record(doc.types) || !record(doc.edges)) throw invalid("types and edges are both required");
+  for (const [type, entry] of Object.entries(doc.types)) {
+    if (!name(type) || !record(entry) || !record(entry.fields)) throw invalid(`type ${JSON.stringify(type)}`);
+    for (const [field, spec] of Object.entries(entry.fields)) {
+      if (!field || !record(spec) || typeof spec.type !== "string" || !spec.type || typeof spec.optional !== "boolean") {
+        throw invalid(`field ${JSON.stringify(field)} of ${type}`);
+      }
+      // A row carries these beside its payload, so a field under one cannot be read back out of it.
+      if (isReservedKey(field)) throw invalid(`${type}.${field} uses a name a row already carries`);
+    }
+  }
+  for (const [edge, entry] of Object.entries(doc.edges)) {
+    if (!name(edge) || !record(entry) || !name(entry.from) || !name(entry.to) || typeof entry.counted !== "boolean" ||
+        (entry.foreign !== undefined && typeof entry.foreign !== "boolean")) {
+      throw invalid(`edge ${JSON.stringify(edge)}`);
+    }
+  }
+  return doc;
+}
+
+/**
+ * What a request would cost one database, asked of that database and with nothing read.
+ *
+ * The request goes exactly as written, so this is the price of sending that body there — which is
+ * what a caller deciding whether to send it wants to know.
+ */
+export async function askPrice(database: string, request: ReadRequest, opts: TransportOptions, spend?: () => AbortSignal): Promise<Cost> {
+  const db = canonicalDb(database);
+  const body = await readJson(db, db + "/price", opts, {
+    method: "POST",
+    body: JSON.stringify(request),
+    headers: { "content-type": "application/json" },
+  }, spend);
+  try {
+    return decodePrice(body);
+  } catch (e) {
+    throw new ForeignUnreachable(db, (e as Error).message);
+  }
+}
+
+/**
+ * Type names a reader and a responder do not mean the same thing by.
+ *
+ * A name is only half of an agreement. The vocabulary states each exposed type's fields, so the
+ * comparison is possible: a type the reader declares a REQUIRED field for that the responder does
+ * not expose is one it cannot read through, because every object of it would arrive missing
+ * something its own schema says is always there. A field the responder exposes and the reader does
+ * not is the other direction and is fine — the reader keeps what it declares.
+ */
+export function disagreements(
+  declared: readonly { name: string; fields: Record<string, FieldSpec> }[],
+  doc: Pick<VocabularyDoc, "types">,
+): Set<string> {
+  const out = new Set<string>();
+  for (const type of declared) {
+    const theirs = doc.types?.[type.name];
+    if (theirs === undefined) continue; // not exposed at all: nothing of it will arrive
+    for (const [field, spec] of Object.entries(type.fields)) {
+      const mine = describe(spec);
+      const match = theirs.fields?.[field];
+      if (mine.optional && match === undefined) continue;
+      if (match === undefined || match.type !== mine.type || (!mine.optional && match.optional)) {
+        out.add(type.name);
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 /** The body, up to the cap. A stranger's Content-Length is a claim, so the bytes are counted as they
