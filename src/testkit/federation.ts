@@ -204,7 +204,23 @@ export async function federate(opts: FederationOptions): Promise<Federation> {
       const settled: Settled[] = [];
       for (const hint of queue.take()) {
         settled.push(
-          await settleHint(hint, { ...reach, db: m.db, catalog: m.catalog, self: m.uri, edgeFor: given.backlinks!, as: given.backlinksAs }),
+          await settleHint(hint, {
+            ...reach,
+            db: m.db,
+            catalog: m.catalog,
+            self: m.uri,
+            edgeFor: given.backlinks!,
+            as: given.backlinksAs,
+            // What the member's own handler answers a read under, read off the binding at the time
+            // so that a test which changes one changes both. A member whose policy differs by caller
+            // is asked for the anonymous one's: a hint carries who signed it and not the key, and
+            // "what anyone could read" is the reading that can only decline too much.
+            policy:
+              m.binding.policyFor === undefined
+                ? m.binding.policy
+                : async () => (await m.binding.policyFor!(null)).policy,
+            exposes: (otype) => m.binding.surface.typeName(otype) !== undefined,
+          }),
         );
       }
       return settled;

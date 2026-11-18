@@ -247,7 +247,7 @@
     },
     "backlinks": {
       "edge": "conf.page_cited_by",
-      "why": "Only for an implementation that takes hints (section 11). A hint from ANY caller whose target is a conf.page is checked by a read made as the anonymous caller, recorded under this edge when that read lists the reference, and removed when a later read does not. The suite is the caller: it serves a descriptor and a read route of its own on a loopback port, signs its hints, and then reads this database to see what was recorded."
+      "why": "Only for an implementation that takes hints (section 11). A hint from ANY caller whose target is a conf.page that caller could itself read is checked by a read made as the anonymous caller, recorded under this edge when that read lists the reference, and removed when a later read does not. A hint whose target is `hidden`, or no object at all, causes no read. The suite is the caller: it serves a descriptor and a read route of its own on a loopback port, signs its hints, and then reads this database to see what was recorded."
     },
     "cache": {
       "reuse": "public",

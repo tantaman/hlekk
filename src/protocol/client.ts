@@ -822,10 +822,17 @@ export function refusalOf(body: string): { error?: string; at?: string } | null 
  * through rotation signatures, and advances the pin to the key reached. Anything else repudiates the
  * database here, and every read through a reference into it fails by name until an operator clears
  * it. Without `pins`, the published keys are taken at face value every time.
+ *
+ * `remember: false` is for looking at a database this one has not decided to keep anything about —
+ * the read that checks a stranger's hint. A first contact then writes nothing, because pinning
+ * interns, and a row for every database that ever asked to be looked at is the registry growing at
+ * a stranger's say-so. A pin that is ALREADY held is still checked and still advanced: a database
+ * this one knows does not become a stranger by being looked at this way. It is the asking half's
+ * counterpart of the responder's rule in `http.ts`.
  */
 export async function discoverPinned(
   database: string,
-  opts: TransportOptions & Pick<ForeignOptions, "pins">,
+  opts: TransportOptions & Pick<ForeignOptions, "pins"> & { remember?: boolean },
   spend?: () => AbortSignal,
 ): Promise<Descriptor> {
   const db = canonicalDb(database);
@@ -850,7 +857,7 @@ export async function discoverPinned(
 
   if (held.pinned === null) {
     // First contact. The current key — the one it has not retired — is what gets pinned.
-    await pins.pin(db, current.id);
+    if (opts.remember !== false) await pins.pin(db, current.id);
     return descriptor;
   }
   const reached = await reachable(keys, held.pinned);

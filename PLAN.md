@@ -24,8 +24,8 @@ Figures marked **measured** were read off a real artifact and say how.
 
 ## Where this stands
 
-Built, with typecheck clean and **678 of 678 tests passing under both storage formats**
-(`npm run test:formats`), **84 of 84** conformance checks against the published fixture
+Built, with typecheck clean and **686 of 686 tests passing under both storage formats**
+(`npm run test:formats`), **85 of 85** conformance checks against the published fixture
 (`npm run conformance:fixture`) and **55 of 55** without one (`npm run conformance:node`):
 
 - **Step 1.** `src/query/ref.ts`. A reference is a local id or `<database URI>#<id>`, with one

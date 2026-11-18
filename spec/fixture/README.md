@@ -26,8 +26,11 @@ none loads the fixture exactly as above: `conf.page_cited_by` is then an edge ty
 stored under.
 
 One that does take them enforces `policy.backlinks`: a hint from any caller whose target is a
-`conf.page` is checked by a read made as the anonymous caller, recorded under `conf.page_cited_by`
-when that read lists the reference, and removed when a later read does not.
+`conf.page` that caller could itself read is checked by a read made as the anonymous caller, recorded
+under `conf.page_cited_by` when that read lists the reference, and removed when a later read does
+not. A hint whose target is `hidden`, or is no object at all, is not checked: the suite counts the
+reads it is sent, and one made on account of either is how a hint would say which of them exists
+(§11.4).
 
 To check that, the suite has to **be** a calling database. With `--hints` it listens on a loopback
 port, serves a descriptor with a key of its own and a read route, signs its hints with that key, and

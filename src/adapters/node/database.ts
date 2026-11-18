@@ -68,7 +68,8 @@ export interface OpenOptions {
    * route is a 404 and the descriptor does not state it.
    *
    * Needs `identity`, which is on by default — a hint is signed, and a database that verifies no
-   * signature cannot tell whose database a hint asks it to read.
+   * signature cannot tell whose database a hint asks it to read. Asking for both this and
+   * `identity: false` throws, rather than opening a database that quietly takes no hints.
    */
   backlinks?: BacklinkOptions;
 }
@@ -81,6 +82,10 @@ export interface BacklinkOptions {
    * sent it — the open policy, and the right one only for a database that wants to be cited by
    * strangers. A function is the policy in full: it is told who is hinting, what they call their
    * edge and the type of the object it points at, and it answers before anything is read.
+   *
+   * A name is checked when the database is opened: it has to be a stored edge type of this
+   * database, declared `foreign`. One that is not throws there, since it would otherwise decline
+   * every hint it was ever sent and say nothing.
    */
   edge: string | ((hint: ReceivedHint, targetType: string) => string | undefined);
   /** Whether the checking read is signed. `"anonymous"`, the default, is what makes a recorded edge
@@ -110,6 +115,10 @@ export interface NodeHlekk {
   /**
    * Looks at every hint received so far: reads each one's source and records or removes an edge.
    * Like `deliver`, there is no alarm, so somebody has to ask. Empty when this database takes none.
+   *
+   * One look at a time, however often it is asked: a call made while one is running waits for it and
+   * then looks again, and every call made meanwhile shares that second look. So a timer may call
+   * this on a period shorter than a slow source takes to answer.
    */
   confirm(): Promise<Settled[]>;
   close(): void;
@@ -166,13 +175,19 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
   await cluster.publish();
 
   const catalog = cluster.directory.catalog();
+  const identity = opts.identity ?? true;
+  try {
+    checkBacklinks(opts.backlinks, catalog, identity);
+  } catch (e) {
+    for (const sql of opened.values()) sql.close();
+    throw e;
+  }
   const cache = new ResponseCache();
   // What this database knows of every other's keys, limits and routes, kept for as long as each said
   // it may be. One for the process, so a read, a hint and a caller's signature all look at the same
   // copy of a database's descriptor.
   const descriptors = new DescriptorCache();
   const guard = privateAddressGuard({ allowLoopback: opts.allowLoopback ?? false });
-  const identity = opts.identity ?? true;
   const own = () => cluster.directory.databaseUri() ?? undefined;
 
   const pins: Pins = {
@@ -220,6 +235,7 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
     if (typeof edge === "function") return edge(hint, targetType);
     return catalog.edgeNamed(edge)?.from === targetType ? edge : undefined;
   };
+  const surface = surfaceOf(catalog, opts.projection);
   const binding: Binding & ListenBinding = {
     // Filled in by whoever listens, which is the only party that knows the port. `adapters/node/http.ts`
     // does it.
@@ -231,7 +247,7 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
     },
     catalog,
     source: db,
-    surface: surfaceOf(catalog, opts.projection),
+    surface,
     policy: opts.policy,
     publishedKeys: identity ? () => cluster.directory.publishedKeys() : undefined,
     get keys() { return identity ? cluster.directory.publishedKeys() : undefined; },
@@ -254,6 +270,67 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
     hints,
   };
 
+  /** One look at everything queued: each hint settled in the order it arrived. */
+  const look = async (): Promise<Settled[]> => {
+    const settled: Settled[] = [];
+    const self = own();
+    if (hints === undefined || self === undefined) return settled;
+    const failures: unknown[] = [];
+    for (const hint of hints.take()) {
+      try {
+        settled.push(
+          await settleHint(hint, {
+            ...reach(),
+            db,
+            catalog,
+            self,
+            edgeFor,
+            // What a read is answered under, so that a target a read would hide is one a hint does
+            // not find either — see `SettleOptions.policy`.
+            policy: opts.policy,
+            exposes: (otype) => surface.typeName(otype) !== undefined,
+            as: opts.backlinks!.as,
+            maxPages: opts.backlinks!.maxPages,
+          }),
+        );
+      } catch (e) {
+        // One hint that cannot be settled must not cost the ones queued behind it, which came
+        // from other databases. It is still reported: a policy naming an edge type that cannot
+        // hold a backlink is the operator's to hear about, not to find in an empty list.
+        failures.push(e);
+        settled.push("unknown");
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `${failures.length} of ${settled.length} hints could not be settled`);
+    }
+    return settled;
+  };
+
+  // **One look at a time.** A look takes the whole queue and then waits on other people's servers,
+  // so a second one started meanwhile would run beside it — and two looks side by side are how the
+  // work a caller can cause stops being bounded by the queue, and how a hint settles out of order:
+  // the look that read "present" before an edge was withdrawn writing after the look that read
+  // "absent". So a call made during a look waits for it and looks again, since hints have arrived
+  // that the first did not take, and every call made in the meantime shares that one second look.
+  let looking: Promise<Settled[]> | undefined;
+  let next: Promise<Settled[]> | undefined;
+  const confirm = (): Promise<Settled[]> => {
+    if (looking === undefined) {
+      const mine: Promise<Settled[]> = look().finally(() => {
+        if (looking === mine) looking = undefined;
+      });
+      return (looking = mine);
+    }
+    next ??= looking
+      .catch(() => {})
+      .then(() => {
+        next = undefined;
+        return confirm();
+      });
+    return next;
+  };
+
   return {
     cluster,
     db,
@@ -261,39 +338,44 @@ export async function open(opts: OpenOptions): Promise<NodeHlekk> {
     binding,
     deliver: () => cluster.deliverAll(),
     hint: (edge, source, target) => sendHint(target, source, edge, reach()),
-    async confirm() {
-      const settled: Settled[] = [];
-      const self = own();
-      if (hints === undefined || self === undefined) return settled;
-      const failures: unknown[] = [];
-      for (const hint of hints.take()) {
-        try {
-          settled.push(
-            await settleHint(hint, {
-              ...reach(),
-              db,
-              catalog,
-              self,
-              edgeFor,
-              as: opts.backlinks!.as,
-              maxPages: opts.backlinks!.maxPages,
-            }),
-          );
-        } catch (e) {
-          // One hint that cannot be settled must not cost the ones queued behind it, which came
-          // from other databases. It is still reported: a policy naming an edge type that cannot
-          // hold a backlink is the operator's to hear about, not to find in an empty list.
-          failures.push(e);
-          settled.push("unknown");
-        }
-      }
-      if (failures.length > 0) {
-        throw new AggregateError(failures, `${failures.length} of ${settled.length} hints could not be settled`);
-      }
-      return settled;
-    },
+    confirm,
     close: () => {
       for (const sql of opened.values()) sql.close();
     },
   };
+}
+
+/**
+ * Refuses a backlink configuration that could never record anything, when the database is opened.
+ *
+ * Both of these would otherwise fail by doing nothing: a database with no identity states no hint
+ * route and is never sent one, and an edge type that does not exist, or cannot hold a reference,
+ * matches no target and declines every hint that arrives. `settleHint` is loud about a policy
+ * FUNCTION that names such a type, because it cannot know until it is asked; a name can be checked
+ * before anybody asks.
+ */
+function checkBacklinks(backlinks: BacklinkOptions | undefined, catalog: Catalog, identity: boolean): void {
+  if (backlinks === undefined) return;
+  if (!identity) {
+    throw new TypeError(
+      "backlinks need identity: a hint is signed, and a database that verifies no signature takes none." +
+        " Leave `identity` on, or leave `backlinks` out.",
+    );
+  }
+  const name = backlinks.edge;
+  if (typeof name !== "string") return;
+  const edge = catalog.edgeNamed(name);
+  if (edge === undefined) {
+    const able = catalog.edgeTypes().filter((e) => e.atype !== undefined && e.foreign).map((e) => e.name);
+    throw new TypeError(
+      `backlinks: no edge type "${name}" in this database's catalog.` +
+        ` The ones that can record a backlink are ${able.length === 0 ? "none: it declares no foreign edge type" : able.join(", ")}`,
+    );
+  }
+  if (edge.atype === undefined || !edge.foreign) {
+    throw new TypeError(
+      `backlinks: ${name} cannot record a backlink: it has to be a stored edge type of this database,` +
+        ' declared "foreign": true, so that it can hold a reference into the database that hinted',
+    );
+  }
 }

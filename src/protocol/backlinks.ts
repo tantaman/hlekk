@@ -21,6 +21,13 @@
 // **Policy before the read.** `settleHint` asks whether this database would keep anything BEFORE it
 // spends a request on the source. A hint is an instruction to make a request, and the cheapest
 // defence against being made to is to decide first that the answer would not matter.
+//
+// **The read is something the caller sees.** It arrives at the hinting database's own server, so
+// whether one is made is an answer as surely as a status is — and the one answer a hint must not
+// give is whether its target exists. So a target the hinting database could not have read is treated
+// as one that is not there: no read, no pin, no row. And the hinting database is looked at without
+// being remembered; it is interned and pinned only once an edge into it has actually been recorded,
+// so a hint that is not true leaves nothing behind in the registry.
 
 import type { Catalog } from "../catalog/catalog.ts";
 import type { Hlekk } from "../client/client.ts";
@@ -29,8 +36,11 @@ import { canonicalDb, formatRef, parseRef } from "../query/ref.ts";
 import type { Ref } from "../query/ref.ts";
 import type { Id, Plan } from "../query/types.ts";
 import { DEFAULT_HOP_LIMIT } from "../query/request.ts";
+import { PUBLIC } from "../query/serve.ts";
+import type { Policy } from "../query/serve.ts";
 import { ForeignRefused, ForeignUnreachable, Repudiated, discoverPinned, exchange, readJson, refusalOf } from "./client.ts";
-import type { ForeignOptions, TransportOptions } from "./client.ts";
+import type { ForeignOptions, Pins, TransportOptions } from "./client.ts";
+import type { Descriptor } from "./http.ts";
 import { signRequest } from "./identity.ts";
 import type { SignedHeaders } from "./identity.ts";
 import type { ReceivedHint } from "./hint.ts";
@@ -160,50 +170,23 @@ const LIST = "l";
  * searched for one reference.
  */
 export async function checkHint(hint: ReceivedHint, opts: CheckOptions): Promise<Verdict> {
+  return (await look(hint, opts)).verdict;
+}
+
+/**
+ * `checkHint`, with the descriptor the read was made against: what there is to pin, should the
+ * verdict turn out to be worth remembering the database for. Absent where none was read.
+ *
+ * The database is looked at and **not remembered**. Pinning interns, and this is a database that
+ * has so far done nothing but ask to be looked at; a row for each of those would be the registry
+ * growing at a stranger's say-so, whatever the read then showed. A pin already held is still
+ * checked — see `discoverPinned`.
+ */
+async function look(hint: ReceivedHint, opts: CheckOptions): Promise<{ verdict: Verdict; descriptor?: Descriptor }> {
   const db = canonicalDb(hint.caller);
-  const wanted = formatRef(canonicalDb(opts.self), hint.target);
-  const signing = opts.as === "self" ? opts.identity : undefined;
   try {
-    const descriptor = await discoverPinned(db, opts);
-    const limit = Math.min(descriptor.limits.maxLimit, Math.max(DEFAULT_HOP_LIMIT, 100));
-    const url = descriptor.routes.read;
-    let after: string | undefined;
-    for (let page = 0; page < (opts.maxPages ?? DEFAULT_CHECK_PAGES); page++) {
-      const body = JSON.stringify({
-        ids: [hint.source],
-        hops: [{ as: LIST, edge: hint.edge, limit, ...(after === undefined ? {} : { after }) }],
-      });
-      let signed: SignedHeaders = {};
-      if (signing !== undefined && descriptor.keys.length > 0) {
-        const { database, pair } = await signing();
-        if (database !== null) {
-          signed = await signRequest({
-            method: "POST",
-            url,
-            body,
-            caller: database,
-            seed: pair.seed,
-            keyId: pair.public.id,
-            created: Math.floor((opts.now?.() ?? Date.now()) / 1000),
-          });
-        }
-      }
-      const answer = await readJson(db, url, opts, {
-        method: "POST",
-        body,
-        headers: { "content-type": "application/json", ...signed },
-      });
-      const decoded = decodeRead(answer, opts.catalog);
-      const frame = decoded.result.shape[0]?.[LIST];
-      const list = frame === undefined ? undefined : decoded.result.lists[`${frame}:${hint.source}`];
-      // No list at all is the source not being there for this reader — absent, or hidden, which are
-      // the same answer by design. Either way there is no edge this database may say it saw.
-      if (list === undefined) return "absent";
-      if (list.ids.includes(wanted)) return "present";
-      if (!list.more || list.cursor === null) return "absent";
-      after = list.cursor;
-    }
-    return "unknown";
+    const descriptor = await discoverPinned(db, { ...opts, remember: false });
+    return { verdict: await listed(hint, db, descriptor, opts), descriptor };
   } catch (e) {
     if (
       e instanceof ForeignRefused ||
@@ -212,10 +195,55 @@ export async function checkHint(hint: ReceivedHint, opts: CheckOptions): Promise
       e instanceof WireError ||
       (e as Error).name === "PrivateAddress"
     ) {
-      return "unknown";
+      return { verdict: "unknown" };
     }
     throw e;
   }
+}
+
+/** Pages the source's list for the reference, and throws whatever a read throws. */
+async function listed(hint: ReceivedHint, db: string, descriptor: Descriptor, opts: CheckOptions): Promise<Verdict> {
+  const wanted = formatRef(canonicalDb(opts.self), hint.target);
+  const signing = opts.as === "self" ? opts.identity : undefined;
+  const limit = Math.min(descriptor.limits.maxLimit, Math.max(DEFAULT_HOP_LIMIT, 100));
+  const url = descriptor.routes.read;
+  let after: string | undefined;
+  for (let page = 0; page < (opts.maxPages ?? DEFAULT_CHECK_PAGES); page++) {
+    const body = JSON.stringify({
+      ids: [hint.source],
+      hops: [{ as: LIST, edge: hint.edge, limit, ...(after === undefined ? {} : { after }) }],
+    });
+    let signed: SignedHeaders = {};
+    if (signing !== undefined && descriptor.keys.length > 0) {
+      const { database, pair } = await signing();
+      if (database !== null) {
+        signed = await signRequest({
+          method: "POST",
+          url,
+          body,
+          caller: database,
+          seed: pair.seed,
+          keyId: pair.public.id,
+          created: Math.floor((opts.now?.() ?? Date.now()) / 1000),
+        });
+      }
+    }
+    const answer = await readJson(db, url, opts, {
+      method: "POST",
+      body,
+      headers: { "content-type": "application/json", ...signed },
+    });
+    const decoded = decodeRead(answer, opts.catalog);
+    const frame = decoded.result.shape[0]?.[LIST];
+    const list = frame === undefined ? undefined : decoded.result.lists[`${frame}:${hint.source}`];
+    // No list at all is the source not being there for this reader — absent, or hidden, which are
+    // the same answer by design. Either way there is no edge this database may say it saw.
+    if (list === undefined) return "absent";
+    if (list.ids.includes(wanted)) return "present";
+    if (!list.more || list.cursor === null) return "absent";
+    after = list.cursor;
+  }
+  return "unknown";
 }
 
 // ---- settling
@@ -226,7 +254,8 @@ export type Settled =
   | "recorded"
   /** The source does not show it, and this database holds none back (whether or not it did). */
   | "removed"
-  /** Nothing here to hang an edge on, or a policy that keeps none for this hint. No request made. */
+  /** Nothing here the hinting database could have read to hang an edge on, or a policy that keeps
+   *  none for this hint. No request made. */
   | "declined"
   /** The read did not get an answer. Nothing changed. */
   | "unknown";
@@ -246,6 +275,22 @@ export interface SettleOptions extends CheckOptions {
    * recording nothing.
    */
   edgeFor: (hint: ReceivedHint, targetType: string) => string | undefined;
+  /**
+   * The policy this database would answer a read of the target under, for the database that hinted:
+   * what `ServeOptions.policy` is for that caller. `PUBLIC` by default, as there. A function is for
+   * a database whose policy differs by caller.
+   *
+   * **A deployment that serves under a policy has to hand the same one here.** A target it hides is
+   * declined exactly as one that does not exist is, with no request made — because the checking read
+   * lands on the hinting database's own server, and a read made only for targets that exist would
+   * tell that database which ids do. Declining to look for a caller that could have seen the target
+   * costs it nothing it was owed; looking for one that could not is the way around "forbidden is
+   * indistinguishable from absent".
+   */
+  policy?: Policy | ((hint: ReceivedHint) => Policy | Promise<Policy>);
+  /** Which object types this database exposes at all: `ServeOptions.exposes`, and for the same
+   *  reason. A target of a type nobody can read is one nobody is told about either. */
+  exposes?: (otype: number) => boolean;
 }
 
 const IDS_ONLY: Plan = { frames: [{ source: { kind: "ids" }, children: [], counts: [] }] };
@@ -263,11 +308,16 @@ export async function settleHint(hint: ReceivedHint, opts: SettleOptions): Promi
   const self = canonicalDb(opts.self);
   if (canonicalDb(hint.caller) === self) return "declined";
 
-  // Is there anything here to hang an edge on? Read through this database's own client, which is the
-  // trusted one: whether a caller may SEE the target is decided when the edge is read, not now.
+  // Is there anything here to hang an edge on? Read through this database's own client, which sees
+  // everything — so what it found is then put to the policy a read by the hinting database would
+  // have been answered under. A target that caller could not have read is, to it, a target that is
+  // not there, and it has to stay one here: everything below this point ends in a request to the
+  // caller's own server, which is how it would find out otherwise.
   const local = await opts.db.normalized(IDS_ONLY, [hint.target], { foreign: "reference" });
   const held = local.objects[hint.target];
   if (held === undefined) return "declined";
+  const policy = typeof opts.policy === "function" ? await opts.policy(hint) : (opts.policy ?? PUBLIC);
+  if (opts.exposes?.(held.otype) === false || !policy.object(hint.target, held.otype)) return "declined";
   const targetType = opts.catalog.object(held.otype)?.name;
   if (targetType === undefined) return "declined";
 
@@ -281,13 +331,33 @@ export async function settleHint(hint: ReceivedHint, opts: SettleOptions): Promi
     );
   }
 
-  const verdict = await checkHint(hint, opts);
+  const { verdict, descriptor } = await look(hint, opts);
   if (verdict === "unknown") return "unknown";
   const back = formatRef(hint.caller, hint.source);
   if (verdict === "present") {
     await opts.db.assocAddIfAbsent(edge.atype, hint.target, back, opts.now?.());
+    await remember(hint.caller, descriptor, opts.pins);
     return "recorded";
   }
+  // Removes what is there and allocates nothing: a database this one has no alias for is one it
+  // holds no edge into, and `assocRemove` does not intern one to find that out.
   await opts.db.assocRemove(edge.atype, hint.target, back);
   return "removed";
+}
+
+/**
+ * Pins the hinting database at the key its checking read was made against, now that this database
+ * holds an edge into it.
+ *
+ * Here, and not when it was first looked at: the edge is what gave it an alias, and from this point
+ * it is a database this one has a relationship with — pinned on first contact, like any other it
+ * reads through, rather than at whatever key it shows the first time somebody follows the edge. A
+ * pin that was already held was checked, and advanced, by the look itself.
+ */
+async function remember(database: string, descriptor: Descriptor | undefined, pins: Pins | undefined): Promise<void> {
+  const current = descriptor?.keys.find((k) => k.retired === undefined);
+  if (pins === undefined || current === undefined) return;
+  const db = canonicalDb(database);
+  const held = await pins.pinOf(db);
+  if (held.pinned === null && held.state !== "repudiated") await pins.pin(db, current.id);
 }

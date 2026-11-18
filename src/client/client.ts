@@ -205,6 +205,18 @@ export class Hlekk {
    * 4. The alias joins the isolate's cache, so the next edge into the same database costs nothing.
    */
   async #aliasFor(atype: number, target: Ref): Promise<{ db: number; id: Id }> {
+    return (await this.#alias(atype, target, true))!;
+  }
+
+  /**
+   * `#aliasFor`, for an operation that may not allocate: null where the database has no alias.
+   *
+   * A removal is the one. A database nobody interned is one no edge here points into, so there is
+   * nothing to remove — and interning it in order to find that out would hand a row in the registry
+   * to anyone who can cause a removal, which a hint about an edge that is not there does
+   * (`protocol/backlinks.ts`).
+   */
+  async #alias(atype: number, target: Ref, allocate: boolean): Promise<{ db: number; id: Id } | null> {
     const { db, id } = parseRef(target);
     if (db === null) return { db: 0, id };
     const registry = await this.registry();
@@ -218,6 +230,14 @@ export class Hlekk {
     }
     const held = registry.byUri.get(db);
     if (held !== undefined) return { db: held, id };
+    if (!allocate) {
+      // Interned by another isolate since this one read the registry, perhaps. Aliases are
+      // append-only and never repointed, so one re-read settles it — as it does for an alias this
+      // isolate has not seen, in `#exec`.
+      this.#registry = null;
+      const again = (await this.registry()).byUri.get(db);
+      return again === undefined ? null : { db: again, id };
+    }
     const alias = await this.#transport.intern(db);
     registry.byUri.set(db, alias);
     registry.byAlias.set(alias, db);
@@ -600,7 +620,9 @@ export class Hlekk {
   }
 
   async assocRemove(atype: number, id1: Id, id2: Ref): Promise<void> {
-    const to = await this.#aliasFor(atype, id2);
+    const to = await this.#alias(atype, id2, false);
+    // No alias, so no edge into that database was ever written here and there is none to remove.
+    if (to === null) return;
     return this.write<void>({ kind: "assocRemove", atype, id1, db: to.db, id2: to.id });
   }
 

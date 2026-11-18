@@ -664,10 +664,15 @@ if (fixture !== null) {
     // decided the false one.
     caller.edges.set("2", []);
     caller.edges.set("1", [`${uri}#${id("root")}`]);
+    // Claims 3 and 4 really do cite the page the fixture hides and an id nothing has, so a responder
+    // that went and looked would find both edges. Each has a source of its own, so that a read made
+    // on its account can be told from a read about anything else.
+    caller.edges.set("3", [`${uri}#${id("hidden")}`]);
+    caller.edges.set("4", [`${uri}#${absent}`]);
     const lie = await caller.hint("2", id("visible-a"));
     const truth = await caller.hint("1", id("root"));
-    const toAbsent = await caller.hint("1", String(absent));
-    const toHidden = await caller.hint("1", id("hidden"));
+    const toAbsent = await caller.hint("4", String(absent));
+    const toHidden = await caller.hint("3", id("hidden"));
 
     check(
       "a signed hint is taken with 202",
@@ -704,6 +709,20 @@ if (fixture !== null) {
     const again = await caller.hint("1", id("root"));
     const withdrawn = again.status === 202 && (await until(async () => !(await recordedAt(id("root"))).ids.includes(cited("1"))));
     check("and it is withdrawn by the same hint, once a read no longer shows the edge", withdrawn, `status ${again.status}`);
+
+    // The read is the one thing a hint causes that this side can see, so it is the one place left
+    // for "forbidden is absent" to leak: a responder that looks only for targets that exist tells a
+    // caller which ids do, by whether its server is called. Both hints went out before the one just
+    // settled, so a responder working in order has decided them.
+    const forHidden = caller.reads.get("3") ?? 0;
+    const forAbsent = caller.reads.get("4") ?? 0;
+    check(
+      "the caller is not read on account of a target it could not have read, hidden or absent",
+      withdrawn && forHidden === 0 && forAbsent === 0,
+      withdrawn
+        ? `${forHidden} reads for the hidden target, ${forAbsent} for the absent one`
+        : "not decidable: the last hint was never settled, so these two may not have been looked at",
+    );
 
     await caller.close();
   } else if (withHints) {

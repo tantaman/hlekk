@@ -299,6 +299,34 @@ is indistinguishable from absent on `/read`, and a hint that answered "no such o
 way around that. It also does not say whether anything will be recorded, because that is this
 database's policy and nobody is owed a backlink.
 
+**Being watched while it looks.** The status is not the only answer a hint gets. The checking read
+arrives at the caller's own server, so a wiki that reads notes only for targets that exist is telling
+notes which ids do: the `404` beside the `403` again, spelled as a request and the lack of one. A
+review found exactly that, by counting — one read of the caller for a page the policy hid, none for
+an id nothing had. So `settleHint` puts the target to the policy a read by the hinting database
+would have been answered under, and a target that read would have hidden is declined as one that is
+not there is: no request. `SettleOptions.policy` and `exposes` are `ServeOptions`' own, and a
+deployment that serves under a policy hands the same one to both. The conformance suite checks it
+from the only side that can, by being the database that would have been read.
+
+**Being made to remember.** Pinning a database interns it, and the checking read is a first contact.
+Done the obvious way, every domain that ever sent a hint about an existing page became a row in the
+registry and an alias, whether or not its edge was there — the thing "strangers do not grow the
+registry" exists to stop, by another door. So the check looks without remembering
+(`discoverPinned`'s `remember: false`): a pin already held is still checked and advanced, and a
+first contact writes nothing. The hinting database is interned and pinned only when an edge into it
+is actually recorded, at the key its descriptor showed when it was read. And a removal that finds
+no alias removes nothing and allocates nothing — `assocRemove` no longer interns a database in
+order to learn that it holds no edge into it.
+
+**Being made to look twice at once.** A look takes the whole queue and then waits on other people's
+servers. Started again beside itself — by a timer with a period shorter than a slow source — it
+stops being bounded by the queue, since the quota frees the moment a hint is taken; and it settles
+out of order, the look that read *present* before an edge was withdrawn writing after the look that
+read *absent*, which leaves a backlink nobody will ever hint about again. So `confirm()` is one look
+at a time: a call made during a look waits and looks again, and every call made meanwhile shares
+that second look.
+
 **Passing on a privileged view.** If the wiki reads notes *as the wiki*, notes may show it an edge
 the public cannot see, and the wiki would then be serving that edge to everybody. So the checking
 read is anonymous by default: what gets recorded is exactly what anyone could have read from notes
@@ -379,6 +407,14 @@ side effect of writing one.
   stands, until that one is hinted again. Record under separate types where that matters.
 - **Only the Node adapter looks at its queue.** The protocol layer is platform-free, and `open()`
   wires it; a Durable Object would settle hints from its alarm, and that wiring is not written.
+- **One slow source holds the line.** Hints are settled one at a time and in order, which is what
+  keeps two looks from racing. A caller whose server answers at the deadline therefore delays every
+  hint queued behind its own, by up to its quota times the pages read times the deadline. Nothing
+  that was true becomes false, and a full queue answers `503`; a budget per caller per look would
+  bound it, and is not written.
+- **A hint carries who signed it, not the key.** So a database whose policy differs by caller
+  decides a target's visibility from the caller's URI (`SettleOptions.policy` as a function). The
+  Node adapter has one policy for everyone and hands that over.
 - **A policy still cannot hide a reference** (PLAN.md, *Open*). It decides objects and counts, and a
   recorded edge is neither. A database serves its backlinks to everyone who may see the object they
   hang off, or does not expose the edge type at all.

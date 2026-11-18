@@ -111,9 +111,20 @@ export async function main(argv: readonly string[]): Promise<void> {
   if (args.backlinks !== undefined) {
     console.log(`  taking hints, and recording what they turn out to be true of as ${args.backlinks}`);
     // No alarm on Node, so a timer asks. Unref'd: it is not a reason for the process to stay up.
-    setInterval(() => {
-      void database.confirm().catch((e) => console.error("hlekk: some hints could not be settled", e));
-    }, 1000).unref();
+    //
+    // A second after the last look FINISHED, not every second: a look waits on other databases, and
+    // one that is slow to answer must not find the next look already started beside it. `confirm`
+    // would not let two run at once in any case; this is so that the timer does not queue up behind
+    // itself either.
+    const again = (): void => {
+      setTimeout(() => {
+        void database
+          .confirm()
+          .catch((e) => console.error("hlekk: some hints could not be settled", e))
+          .finally(again);
+      }, 1000).unref();
+    };
+    again();
   }
 
   const stop = async (): Promise<void> => {

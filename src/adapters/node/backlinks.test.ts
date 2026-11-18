@@ -31,6 +31,13 @@ const INCIDENTS = planLock({
   },
   packages: { objects: { "packages.release": { fields: {} } } },
 });
+/** An edge type that stays inside its database, which is what a backlink cannot be recorded under. */
+const INCIDENTS_LOCAL = planLock({
+  ops: {
+    objects: { "ops.incident": { fields: { ticket: "string" } } },
+    edges: { "ops.incident_follows": { from: "ops.incident", to: "ops.incident" } },
+  },
+});
 
 describe("a backlink between two databases over real HTTP", () => {
   const dirs: string[] = [];
@@ -92,6 +99,99 @@ describe("a backlink between two databases over real HTTP", () => {
       why: "unsupported",
     });
     assert.deepEqual(await incidents.store.confirm(), []);
+  });
+
+  it("looks at its hints one look at a time, however often it is asked to", async () => {
+    // The first read of the incidents database is held AFTER it has answered: the releases database
+    // has been told "the edge is there" and has not yet acted on it. That is the moment a second
+    // look, started beside the first, would get ahead of it.
+    let reads = 0;
+    let letGo!: () => void;
+    let reached!: () => void;
+    const held = new Promise<void>((done) => (letGo = done));
+    const holding = new Promise<void>((done) => (reached = done));
+    const slow: typeof fetch = async (input, init) => {
+      const res = await fetch(input, init);
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith("/incidents/read") && ++reads === 1) {
+        reached();
+        await held;
+      }
+      return res;
+    };
+    const releases = await start("/releases", {
+      lock: RELEASES,
+      backlinks: { edge: "packages.release_cited_by" },
+      foreign: { fetch: slow },
+    });
+    const incidents = await start("/incidents", { lock: INCIDENTS });
+    const release = await releases.store.db.create(
+      releases.store.catalog.objectNamed("packages.release")!.otype,
+      { tag: "4.0.0" },
+      { vshard: "3" },
+    );
+    const incident = await incidents.store.db.create(
+      incidents.store.catalog.objectNamed("ops.incident")!.otype,
+      { ticket: "INC-300" },
+      { vshard: "7" },
+    );
+    const target = `${releases.server.database}#${release}`;
+    const deployed = incidents.store.catalog.edgeNamed("ops.deployed_release")!.atype!;
+
+    await incidents.store.db.assocAdd(deployed, incident, target, 1);
+    assert.deepEqual(await incidents.store.hint("ops.deployed_release", incident, target), { sent: true });
+    const first = releases.store.confirm();
+    await holding;
+
+    // Meanwhile the edge is withdrawn, and the same hint says so. A timer fires twice.
+    await incidents.store.db.assocRemove(deployed, incident, target);
+    assert.deepEqual(await incidents.store.hint("ops.deployed_release", incident, target), { sent: true });
+    const second = releases.store.confirm();
+    const third = releases.store.confirm();
+    // Both of those are one look, and it has not started: nobody is being read beside the first.
+    assert.equal(second, third);
+    await new Promise((turn) => setTimeout(turn, 50));
+    assert.equal(reads, 1);
+
+    // In order, then. The look that read "present" records, and the look that read "absent" comes
+    // after it and removes — where side by side the removal would have found nothing to remove, and
+    // the record would have landed after it and stayed.
+    letGo();
+    assert.deepEqual(await first, ["recorded"]);
+    assert.deepEqual(await second, ["removed"]);
+    assert.equal(reads, 2);
+    const res = await fetch(`${releases.server.database}/objects/${release}/packages.release_cited_by`);
+    const body = (await res.json()) as { lists: Record<string, { ids: string[] }> };
+    assert.deepEqual(body.lists[`1:${release}`].ids, []);
+  });
+
+  it("refuses to open with a backlink edge that could never record one", async () => {
+    const opening = (opts: Omit<Parameters<typeof open>[0], "dir">) => {
+      const dir = mkdtempSync(join(tmpdir(), "hlekk-backlinks-"));
+      dirs.push(dir);
+      return { dir, opened: open({ dir, format: 2, allowLoopback: true, ...opts }) };
+    };
+    // A name the catalog does not have matches no target, so every hint would be declined and the
+    // database would look, from outside and from its own log, exactly like one that was working.
+    const misspelled = opening({ lock: RELEASES, backlinks: { edge: "packages.release_cited_bye" } });
+    await assert.rejects(misspelled.opened, /no edge type "packages\.release_cited_bye".*packages\.release_cited_by$/);
+    // One that exists and cannot hold a reference into another database is no better.
+    await assert.rejects(
+      opening({ lock: INCIDENTS_LOCAL, backlinks: { edge: "ops.incident_follows" } }).opened,
+      /ops\.incident_follows cannot record a backlink/,
+    );
+    // And without an identity there is no hint route at all, so the option would do nothing.
+    await assert.rejects(
+      opening({ lock: RELEASES, identity: false, backlinks: { edge: "packages.release_cited_by" } }).opened,
+      /backlinks need identity/,
+    );
+
+    // Refused cleanly: the same directory opens once the name is right.
+    const store = await open({ dir: misspelled.dir, format: 2, allowLoopback: true, lock: RELEASES, backlinks: { edge: "packages.release_cited_by" } });
+    stores.push(store);
+    // A policy function is not checked up front — it has not been asked anything yet.
+    const asked = await opening({ lock: RELEASES, backlinks: { edge: () => "no.such_edge" } }).opened;
+    stores.push(asked);
   });
 
   it("reads the edge type to record under from the command line", () => {

@@ -3,15 +3,17 @@ import { describe, it } from "node:test";
 
 import { Catalog, plan as planLock } from "../catalog/catalog.ts";
 import type { Lock } from "../catalog/catalog.ts";
-import { federate } from "../testkit/federation.ts";
+import { federate, pinsOf } from "../testkit/federation.ts";
 import { T, served } from "../testkit/served.ts";
 import type { Federation, Member, MemberOptions } from "../testkit/federation.ts";
 import { DEFAULT_LIMITS } from "../query/request.ts";
 import type { Policy } from "../query/serve.ts";
 import type { Id, Plan } from "../query/types.ts";
 import { Backoff } from "./backoff.ts";
+import { checkHint, settleHint } from "./backlinks.ts";
+import type { Settled } from "./backlinks.ts";
 import { HintQueue, parseHint } from "./hint.ts";
-import { signRequest } from "./identity.ts";
+import { generateKeyPair, signRequest } from "./identity.ts";
 import type { Caller } from "./identity.ts";
 
 // Backlinks, end to end: one database draws an edge at another, says so, and the other records an
@@ -368,6 +370,110 @@ describe("settling a hint", () => {
     assert.deepEqual(await wiki.confirm(), ["declined"]);
     assert.deepEqual(notes.served, before);
     assert.deepEqual(await citations(f, page), []);
+  });
+
+  it("makes no request on account of a target the hinting database could not have read", async () => {
+    // The wiki hides whatever is in this set, from everybody.
+    const hidden = new Set<Id>();
+    const { f, wiki, notes, page, note } = await world({
+      wiki: { policy: { ...PUBLIC, object: (id) => !hidden.has(id) } },
+    });
+    const secret = await wiki.db.create(W.page, { title: "Unannounced" }, { with: page });
+    hidden.add(secret);
+    // The edge is real, so a read of notes WOULD list the reference. What decides is the wiki.
+    await notes.db.assocAdd(N.about, note, `${WIKI}#${secret}`, 1);
+    assert.deepEqual(await notes.hint("notes.note_about", note, `${WIKI}#${secret}`), { sent: true });
+    assert.deepEqual(await notes.hint("notes.note_about", note, `${WIKI}#999999`), { sent: true });
+
+    // Neither is looked at. The checking read lands on the caller's own server, so one made for the
+    // page that exists and none for the id that does not would tell the caller which is which — what
+    // a 403 beside a 404 would, by another route. To notes, both are a hint nothing came of.
+    const before = { ...notes.served };
+    assert.deepEqual(await wiki.confirm(), ["declined", "declined"]);
+    assert.deepEqual(notes.served, before);
+    assert.deepEqual(wiki.cluster.directory.aliases(), []);
+
+    // It was the policy that decided, and not the edge: shown the page, the same hint is checked.
+    hidden.delete(secret);
+    await notes.hint("notes.note_about", note, `${WIKI}#${secret}`);
+    assert.deepEqual(await wiki.confirm(), ["recorded"]);
+    assert.deepEqual(await citations(f, secret), [`${NOTES}#${note}`]);
+  });
+
+  it("treats a target of a type it does not expose as one that is not there", async () => {
+    // Pages are held and not exposed: no read of the wiki can return one, whoever asks.
+    const { wiki, notes, page, note } = await world({ wiki: { projection: { name: "stubs", include: ["wiki.stub"] } } });
+    await notes.db.assocAdd(N.about, note, `${WIKI}#${page}`, 1);
+    await notes.hint("notes.note_about", note, `${WIKI}#${page}`);
+    const before = { ...notes.served };
+    assert.deepEqual(await wiki.confirm(), ["declined"]);
+    assert.deepEqual(notes.served, before);
+  });
+
+  it("puts the target to the policy for the database that hinted, where that differs by caller", async () => {
+    const { f, wiki, notes, page, note } = await world({ more: [{ uri: OTHER, lock: NOTES_LOCK, database: "other" }] });
+    const other = f.member(OTHER);
+    const theirs = await other.db.create(N.note, { body: "also about it" }, { vshard: "9" });
+    const target = `${WIKI}#${page}`;
+    await notes.db.assocAdd(N.about, note, target, 1);
+    await other.db.assocAdd(N.about, theirs, target, 1);
+    await notes.hint("notes.note_about", note, target);
+    await other.hint("notes.note_about", theirs, target);
+
+    // Settled by hand, with a policy that shows the wiki's pages to NOTES and to nobody else. Both
+    // edges are real; only one of the two callers could have read what its edge points at.
+    const settled: Settled[] = [];
+    for (const hint of wiki.hints!.take()) {
+      settled.push(
+        await settleHint(hint, {
+          fetch: f.fetch,
+          db: wiki.db,
+          catalog: wiki.catalog,
+          self: WIKI,
+          edgeFor: anyone,
+          policy: (from) => (from.caller === NOTES ? PUBLIC : NOTHING),
+        }),
+      );
+    }
+    assert.deepEqual(settled, ["recorded", "declined"]);
+    assert.equal(notes.served.read, 1);
+    assert.equal(other.served.read, 0);
+  });
+
+  it("keeps nothing about a database whose hint was not true, and pins one whose hint was", async () => {
+    const { wiki, notes, page, note } = await world();
+    const target = `${WIKI}#${page}`;
+    await notes.hint("notes.note_about", note, target);
+    assert.deepEqual(await wiki.confirm(), ["removed"]);
+    // Looked at, and not remembered: no alias, no pin, no row. A database that has only ever asked
+    // to be looked at is a stranger, and strangers do not grow the registry — it would otherwise
+    // cost one domain to add a row to anybody's.
+    assert.equal(notes.served.read, 1);
+    assert.deepEqual(wiki.cluster.directory.aliases(), []);
+    assert.equal(wiki.cluster.directory.pinnedOf(NOTES), undefined);
+
+    await notes.db.assocAdd(N.about, note, target, 1);
+    await notes.hint("notes.note_about", note, target);
+    assert.deepEqual(await wiki.confirm(), ["recorded"]);
+    // Now the wiki holds an edge into it. It has an alias because the edge needs one, and it is
+    // pinned at the key the checking read was made against, as on any other first contact.
+    assert.deepEqual(wiki.cluster.directory.aliases().map((a) => a.uri), [NOTES]);
+    assert.equal(wiki.cluster.directory.pinnedOf(NOTES), (await notes.cluster.directory.identity(0)).public.id);
+  });
+
+  it("still holds a database it already knows to the key it pinned", async () => {
+    const { f, wiki, notes, page, note } = await world();
+    const target = `${WIKI}#${page}`;
+    await notes.db.assocAdd(N.about, note, target, 1);
+    await notes.hint("notes.note_about", note, target);
+    assert.deepEqual(await wiki.confirm(), ["recorded"]);
+
+    // Whatever answers at that URI now publishes a key the pinned one never signed. Looking without
+    // remembering is for strangers; this is not one, and a look at it is checked like any other.
+    notes.binding.keys = [(await generateKeyPair()).public];
+    const again = { caller: NOTES, source: note, edge: "notes.note_about", target: page };
+    assert.equal(await checkHint(again, { fetch: f.fetch, pins: pinsOf(wiki), catalog: wiki.catalog, self: WIKI }), "unknown");
+    assert.equal(wiki.cluster.directory.stateOf(NOTES), "repudiated");
   });
 
   it("is told who is hinting and what at, so a policy can admit some and not others", async () => {

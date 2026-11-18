@@ -579,7 +579,9 @@ it refuses one, the count **MUST** be absent rather than zero.
 - **A hint is an instruction to make a request too** (§11). It is bounded by being signed — the
   request it causes goes to the database that asked for it, and to no database a third party chose —
   and by being looked at off the request path, under a quota per caller. A responder **SHOULD** ask
-  its own policy whether it would record anything before it reads anybody.
+  its own policy whether it would record anything before it reads anybody. The request is also
+  something the caller *sees*, so it is not made for a target that caller could not have read
+  (§11.4): otherwise a hint is a way to ask which ids exist.
 - **A recorded edge is true, not endorsed.** An edge a database drew says something about what that
   database thinks; an edge it recorded from a hint says only that a stranger's database linked to
   it, and anyone can run a database. A reader following one is following a link a stranger chose,
@@ -666,6 +668,11 @@ would record anything if it did.
   have read from the calling database: a read (§5) entering from `source`, hopping `edge`, whose
   answer lists the reference `{db}#{target}` — this database's own URI and that id.
 - That read **MUST** go to the database that signed the hint, and to no other.
+- A responder **MUST NOT** make that read on account of a `target` that a read by the calling
+  database would not show it: one that does not exist, or one its policy hides from that caller
+  (§8). The read arrives at the calling database's own server, so whether one is made is an answer
+  as surely as a status is, and a read made only for targets that exist tells the caller which ids
+  do. This is §11.3's rule again, for the one thing a hint causes that its answer does not carry.
 - Where the read succeeds and lists the reference, the responder **MAY** record that the edge
   exists. Where it succeeds and does not — including where `source` is not in the answer at all,
   which §8 makes the same thing — the responder **MUST NOT** record it, and **SHOULD** stop serving
@@ -679,6 +686,11 @@ would record anything if it did.
   no object behind it. A caller reads it with §5 as it stands. **No answer says whether an edge was
   drawn or recorded**; a responder **SHOULD** therefore record under edge types of its own, distinct
   from the ones it draws itself, so that its vocabulary says which is which.
+- A responder **SHOULD NOT** keep anything about a calling database on account of a hint that
+  records no edge, a pin included: a database that has only asked to be looked at is one of §7.3's
+  callers to verify and forget. The checking read is a first contact for §7.3 only where the edge is
+  recorded, and the key pinned is then the one the calling database published when it was read. A pin
+  the responder already holds **MUST** be checked as §7.3 says, whatever the read goes on to show.
 - A responder that will serve a recorded edge to callers other than itself **SHOULD** make the
   checking read as the anonymous caller (§7.1). It then serves only what anyone could have read from
   the calling database themselves. One that reads as itself may be shown an edge the public is not,
