@@ -24,9 +24,9 @@ Figures marked **measured** were read off a real artifact and say how.
 
 ## Where this stands
 
-Built, with typecheck clean and **585 of 585 tests passing under both storage formats**
-(`npm run test:formats`), **42 of 42** conformance checks against the published fixture
-(`npm run conformance:fixture`) and **30 of 30** without one (`npm run conformance:node`):
+Built, with typecheck clean and **646 of 646 tests passing under both storage formats**
+(`npm run test:formats`), **48 of 48** conformance checks against the published fixture
+(`npm run conformance:fixture`) and **35 of 35** without one (`npm run conformance:node`):
 
 - **Step 1.** `src/query/ref.ts`. A reference is a local id or `<database URI>#<id>`, with one
   canonical spelling for the URI, refused rather than repaired.
@@ -50,6 +50,14 @@ Built, with typecheck clean and **585 of 585 tests passing under both storage fo
 - **Step 7.** `spec/protocol.md`, `spec/schemas/`, `spec/fixture/`, the Node adapter as a whole
   database over files with a `serve` command, the package's exports map and build, README, LICENSE
   (Apache-2.0), CONTRIBUTING and CI.
+
+- **After step 7.** `src/reader/`. A reader: a query across databases from a process that has none,
+  which is what "the protocol is the agent surface" needed to be usable from code as well as from
+  `curl`. It is the two drivers and the asking half of step 4, unchanged, with the one thing a
+  database of your own supplies them — a catalog — built per database from that database's own
+  `/vocabulary`. A lock is optional: with one, a module generated from it runs against the reader
+  as it would against a database. `hlekk/reader` runs wherever `fetch` does, and
+  `hlekk/adapters/node` wraps it with the address guard.
 
 Not built: step 8, below.
 
@@ -194,6 +202,18 @@ steps above, so that nothing reads as finished that is not.
   covered only in `src/protocol/federation.test.ts`, which does not interleave them with moves.
 - **Publishing the package.** Everything that makes it publishable is in place; `"private": true`
   stays, because publishing is a decision with a name attached and one word to undo.
+- **A subtree sent to a database that does not expose all of it.** Found while building the reader,
+  and it is in the engine's client, not the reader. Step 6 sends a frame's subtree as hops, named
+  through the ASKING catalog — so a hop the asker can name and the responder does not expose rides
+  along, and the responder refuses the whole request (`no edge "…"`), correctly. One catalog that
+  covers three databases therefore cannot read through the first of them: `note → about → release`
+  is refused by the notes database, which has no `ops.deployed_release` to be asked about
+  (`src/reader/reader.test.ts` records it). It was not seen before because every federation in the
+  suite gives the first foreign database the later edge too. The reader does not have it, since it
+  reads each database by that database's vocabulary and so leaves out what that database cannot be
+  asked. Closing it in the client means the same thing there: consult the responder's vocabulary
+  before a subtree is sent, which `ForeignOptions.catalog` now allows and which costs one request
+  per database, kept.
 - **Filters sent with a foreign hop.** Step 6 sends a frame's subtree without them, because the cache
   keys a list by object and edge type and a filtered list merged into it would answer another frame
   wrongly. Sending them means keying foreign lists by frame.
