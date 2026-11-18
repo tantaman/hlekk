@@ -25,6 +25,8 @@ import { systemClock } from "../runtime/runtime.ts";
 import type { Clock } from "../runtime/runtime.ts";
 import { formatRef, isQualified, parseRef } from "../query/ref.ts";
 import type { Ref } from "../query/ref.ts";
+import { budgeted } from "./budget.ts";
+import type { Budget } from "./budget.ts";
 import { Routes } from "./routes.ts";
 import { anchorOf } from "./transport.ts";
 import type { Mutation, Transport } from "./transport.ts";
@@ -80,36 +82,11 @@ export interface WriteOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
-/**
- * What one query may spend reaching other databases.
- *
- * Per query, not per client: a foreign client is built once per isolate and a budget that lived
- * there would be shared by every query the isolate runs, which is the opposite of what it is for.
- * One tenant's query latency is partly another tenant's problem the moment a hop crosses the
- * internet, and three numbers are what bound it — a deadline, how many requests, and how many
- * databases.
- */
-export interface Budget {
-  /** Milliseconds for the whole query's foreign hops. */
-  deadlineMs?: number;
-  /** Requests to other databases. */
-  requests?: number;
-  /** Databases one query may reach. */
-  databases?: number;
-}
-
-export const DEFAULT_BUDGET: Required<Budget> = { deadlineMs: 15_000, requests: 64, databases: 8 };
-
-/** A query's budget, spent. `what` is which of the three ran out, so a caller can raise the right
- *  one rather than guessing. */
-export class BudgetSpent extends Error {
-  readonly what: "deadline" | "requests" | "databases";
-  constructor(what: "deadline" | "requests" | "databases", detail: string) {
-    super(`this query's foreign-hop budget is spent: ${detail}`);
-    this.name = "BudgetSpent";
-    this.what = what;
-  }
-}
+// The budget lives in `budget.ts`, so that a reader with no database of its own (`reader/reader.ts`)
+// is bounded by the same three numbers. Exported from here as well, which is where it has always
+// been imported from.
+export { BudgetSpent, DEFAULT_BUDGET } from "./budget.ts";
+export type { Budget } from "./budget.ts";
 
 export interface QueryOptions {
   /** Rounds sends every outstanding read and waits; async lets each branch move on when its own data
@@ -278,7 +255,7 @@ export class Hlekk {
    */
   async #router(seed: readonly bigint[], budget?: Budget): Promise<(id: Ref) => HostClient> {
     await this.routes.routeAll(seed);
-    const spending = this.#budget(budget);
+    const spending = budgeted(this.clock, budget);
     return (id: Ref) => {
       if (isQualified(id)) {
         const database = parseRef(id).db!;
@@ -291,60 +268,6 @@ export class Hlekk {
       // sending, so the guess costs nothing.
       const host = route?.host ?? this.#anyHost();
       return this.#clientFor(host);
-    };
-  }
-
-  /**
-   * One query's budget, as a wrapper around whichever foreign client it reaches for.
-   *
-   * The wrapper and not the client, because the client is cached for the isolate and the budget is
-   * not. Every hop goes through here, so the three numbers are enforced in one place and a refusal
-   * says which ran out.
-   */
-  #budget(given: Budget | undefined): (database: string, client: HostClient) => HostClient {
-    const budget = { ...DEFAULT_BUDGET, ...given };
-    const until = this.clock.now() + budget.deadlineMs;
-    const reached = new Set<string>();
-    let requests = budget.requests;
-    // One wrapper per database per query, and not one per call. Both drivers batch by client
-    // IDENTITY, so a fresh object per miss would put every miss in its own batch — twelve objects in
-    // one database would be twelve requests, which is exactly what the batching exists to avoid.
-    const wrapped = new Map<string, HostClient>();
-    const wrap = (database: string, client: HostClient): HostClient => ({
-      exec: async (plan, tasks) => {
-        if (!reached.has(database) && reached.size >= budget.databases) {
-          throw new BudgetSpent(
-            "databases",
-            `${budget.databases} databases, and ${database} would be the ${reached.size + 1}st`,
-          );
-        }
-        reached.add(database);
-        const remaining = until - this.clock.now();
-        const expired = () => new BudgetSpent("deadline", `${budget.deadlineMs} ms for foreign hops to ${database}`);
-        if (remaining <= 0) throw expired();
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(expired()), remaining);
-        const spend = () => {
-          if (this.clock.now() >= until || controller.signal.aborted) throw expired();
-          if (requests <= 0) throw new BudgetSpent("requests", `${budget.requests} requests to other databases`);
-          requests--;
-          return controller.signal;
-        };
-        try {
-          if (!client.metersRequests) spend();
-          const timedOut = new Promise<never>((_, reject) => {
-            controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
-          });
-          return await Promise.race([client.exec(plan, tasks, spend), timedOut]);
-        } finally {
-          clearTimeout(timer);
-        }
-      },
-    });
-    return (database, client) => {
-      let held = wrapped.get(database);
-      if (!held) wrapped.set(database, (held = wrap(database, client)));
-      return held;
     };
   }
 
