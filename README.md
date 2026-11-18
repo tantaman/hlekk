@@ -242,13 +242,16 @@ const ref = process.argv[2];
 const db = await connect(ref.slice(0, ref.indexOf("#")), { allowLoopback: true });
 console.log("from a note you may follow:", db.edgesFrom("notes.note").join(", "));
 
-const [note] = await db.reader.read(ref, {
-  counts: [{ as: "cited", edge: "notes.cites" }],
-  hops: [{ edge: "notes.cites", as: "cites", hops: [{ edge: "notes.about", as: "about" }] }],
-});
+const read = db.reader
+  .from(ref)
+  .countAs("cited", "notes.cites")
+  .related("cites", "notes.cites", (cites) => cites.related("about", "notes.about"));
+
+const [note] = await read.run();
 const [cited] = note.cites.items;
 console.log(`${note.$type} "${note.title}" cites ${note.cited}: "${cited.title}"`);
 for (const about of cited.about.items) console.log(`  about ${about.$type} ${about.id}\n  ${JSON.stringify(about.ticket)}`);
+console.log("as data:", JSON.stringify(read.request()));
 ```
 
 ```bash
@@ -258,10 +261,13 @@ node read.mjs "$REF"
 ```
 from a note you may follow: notes.cites, notes.about
 notes.note "Follow-up" cites 1: "Duplicate deliveries"
+as data: {"counts":[{"as":"cited","edge":"notes.cites"}],"hops":[{"edge":"notes.cites","as":"cites","hops":[{"edge":"notes.about","as":"about"}]}]}
 ```
 
-- **The request is the body `POST {db}/read` takes, without its `ids`.** The same hops, counts,
-  filters, limits and cursors, under the same rules, and refused the same way.
+- **A read is data.** `read.request()` is the body `POST {db}/read` takes, without its `ids`: the
+  same hops, counts, filters, limits and cursors, under the same rules, and refused the same way.
+  `db.reader.read(ref, request)` runs one directly, so a read can be stored, sent, or written by
+  something else. The chained form writes that request and can say nothing it cannot.
 - **A row is the object's fields beside `id`, `$type` and `$version`.** `id` is always a full
   reference. A hop comes back as a page: `{ items, cursor, more }`.
 - **Nothing is declared.** Each database is read by its own vocabulary, so one request may name edges
@@ -322,6 +328,7 @@ from a note you may follow: notes.cites, notes.about
 notes.note "Follow-up" cites 1: "Duplicate deliveries"
   about ops.incident http://127.0.0.1:8460/incidents#…
   "INC-217"
+as data: …
 ```
 
 The release maintainer's database is a third publisher, serving a Postgres view. The

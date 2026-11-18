@@ -24,7 +24,7 @@ Figures marked **measured** were read off a real artifact and say how.
 
 ## Where this stands
 
-Built, with typecheck clean and **652 of 652 tests passing under both storage formats**
+Built, with typecheck clean and **658 of 658 tests passing under both storage formats**
 (`npm run test:formats`), **48 of 48** conformance checks against the published fixture
 (`npm run conformance:fixture`) and **35 of 35** without one (`npm run conformance:node`):
 
@@ -56,8 +56,10 @@ Built, with typecheck clean and **652 of 652 tests passing under both storage fo
   `curl`. It is the two drivers and the asking half of step 4, unchanged, with the one thing a
   database of your own supplies them — a catalog — built per database from that database's own
   `/vocabulary`. A lock is optional: with one, a module generated from it runs against the reader
-  as it would against a database. `hlekk/reader` runs wherever `fetch` does, and
-  `hlekk/adapters/node` wraps it with the address guard.
+  as it would against a database. Without one a read is the wire's own request, as data, or the
+  same request written by chaining (`src/reader/query.ts`), which compiles to that data and can say
+  nothing it cannot. `hlekk/reader` runs wherever `fetch` does, and `hlekk/adapters/node` wraps it
+  with the address guard.
 
 Not built: step 8, below.
 
