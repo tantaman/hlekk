@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import { Catalog, plan as planLock } from "../catalog/catalog.ts";
 import { LocalCluster } from "../client/local.ts";
 import { Refused } from "./request.ts";
-import { PUBLIC, enforce, planOf, serve, vocabularyOf } from "./serve.ts";
+import { MAX_IDS, PUBLIC, enforce, planOf, serve, vocabularyOf } from "./serve.ts";
 import type { Policy, ReadRequest, ReadSource } from "./serve.ts";
 import type { QueryResult } from "./normalize.ts";
 import type { Plan } from "./types.ts";
@@ -77,6 +77,20 @@ describe("serving a read to another database", () => {
     assert.equal(served.result.counts["0:" + issue]["issues.issue_comments"], 3);
     assert.deepEqual(served.cost, { frames: 2, nodes: 1 + 10 });
     assert.deepEqual(served.cache, { reuse: "public", seconds: 60 });
+  });
+
+  it("answers for every id it was asked for, up to the number it will take", async () => {
+    // The entry is not a list, so no default limit applies to it. One once did: a read entering
+    // from more than fifty ids was priced for all of them and answered for the first fifty, with
+    // nothing in the answer to say so — and a caller reads an id that did not come back as an
+    // object that does not exist.
+    const { db } = await database();
+    const ids: string[] = [];
+    for (let i = 0; i < MAX_IDS; i++) ids.push(await db.create(ISSUE, { title: `issue ${i}` }, { vshard: "7" }));
+    const served = await serve({ ids }, { catalog: CATALOG, source: db, vocabulary: VOCAB });
+    assert.deepEqual(served.result.roots, ids, "every id, in the order it was given");
+    assert.equal(Object.keys(served.result.objects).length, MAX_IDS);
+    assert.equal(served.cost.nodes, MAX_IDS, "which is what it was priced for");
   });
 
   it("makes a forbidden object indistinguishable from an absent one", async () => {

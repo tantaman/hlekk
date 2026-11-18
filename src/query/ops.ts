@@ -115,7 +115,14 @@ export function buildFrame(plan: Plan, id: number, mode: "full" | "rows"): Op {
           ? new EdgeHop(id, f.source.atype, f.after ?? null)
           : new FieldHop(id, f.source.field);
     if (f.where) op = new Where(op, f.where);
-    op = new Take(op, f.limit ?? DEFAULT_LIMIT); // every frame has a limit
+    // Every list has a limit, and a default where it names none: a list is a page, and what a page
+    // left out is reachable through its cursor. The ids a query enters from are not a list. The
+    // caller named each one, there is no cursor to say that some were left out, and what bounds
+    // them is the caller — or `maxIds`, where the caller is a stranger. Given the default all the
+    // same, a read entering from sixty ids returned the first fifty and nothing that said so, and a
+    // database asking another for sixty objects took the ten it was not sent to be absent. So the
+    // entry is cut only where the plan itself says to.
+    if (f.source.kind !== "ids" || f.limit !== undefined) op = new Take(op, f.limit ?? DEFAULT_LIMIT);
   }
   for (const c of f.children) op = new Join(op, c.alias, c.frame);
   for (const c of f.counts) op = new CountRel(op, c.alias, c.atype);
