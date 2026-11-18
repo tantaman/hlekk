@@ -32,6 +32,7 @@ query crosses the boundary over HTTP, and the wiki decides what the notes databa
 | [`docs/protocol.md`](docs/protocol.md) | The protocol's rationale, and what cannot be revised |
 | [`docs/global-ids.md`](docs/global-ids.md) | How a reference into another database is stored and named |
 | [`PLAN.md`](PLAN.md) | What is done and what is not |
+| [`site/index.html`](site/index.html) | The product page: one file, no build |
 
 The documents are the point. Every decision that was hard is written down with the reading or the
 argument that settled it, and the ones still open are listed as open.
