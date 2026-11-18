@@ -24,7 +24,7 @@ Figures marked **measured** were read off a real artifact and say how.
 
 ## Where this stands
 
-Built, with typecheck clean and **646 of 646 tests passing under both storage formats**
+Built, with typecheck clean and **652 of 652 tests passing under both storage formats**
 (`npm run test:formats`), **48 of 48** conformance checks against the published fixture
 (`npm run conformance:fixture`) and **35 of 35** without one (`npm run conformance:node`):
 
@@ -83,6 +83,15 @@ Worth recording, because it is the argument for having built them rather than on
   and a hop named `id` did not shadow a field but collapsed the structure of the whole answer, since
   the normalized form keys everything by `row.id`. The wiki demo's authored-query box had the first
   of those too.
+- Building the **reader** — the first caller with no catalog of its own — found that the engine's
+  client could not read through three databases that share none. A frame's subtree is named through
+  the ASKING catalog, so a hop the asker can name and the responder does not expose rode along, and
+  the responder refused all of it, correctly: `entry → about → release → supersedes` was refused by
+  the ops database, which has no `packages.supersedes` to be asked about. Every federation in the
+  suite had given the first foreign database the later edges too, which is why nothing saw it.
+  Below the first hop the client now sends only what the responder's vocabulary exposes, and asks
+  for that vocabulary only when a request nests; a hop directly under the ids is still the
+  responder's to refuse, which is what keeps a wrong query loud.
 
 ## Decisions now permanent
 
@@ -202,18 +211,6 @@ steps above, so that nothing reads as finished that is not.
   covered only in `src/protocol/federation.test.ts`, which does not interleave them with moves.
 - **Publishing the package.** Everything that makes it publishable is in place; `"private": true`
   stays, because publishing is a decision with a name attached and one word to undo.
-- **A subtree sent to a database that does not expose all of it.** Found while building the reader,
-  and it is in the engine's client, not the reader. Step 6 sends a frame's subtree as hops, named
-  through the ASKING catalog — so a hop the asker can name and the responder does not expose rides
-  along, and the responder refuses the whole request (`no edge "…"`), correctly. One catalog that
-  covers three databases therefore cannot read through the first of them: `note → about → release`
-  is refused by the notes database, which has no `ops.deployed_release` to be asked about
-  (`src/reader/reader.test.ts` records it). It was not seen before because every federation in the
-  suite gives the first foreign database the later edge too. The reader does not have it, since it
-  reads each database by that database's vocabulary and so leaves out what that database cannot be
-  asked. Closing it in the client means the same thing there: consult the responder's vocabulary
-  before a subtree is sent, which `ForeignOptions.catalog` now allows and which costs one request
-  per database, kept.
 - **Filters sent with a foreign hop.** Step 6 sends a frame's subtree without them, because the cache
   keys a list by object and edge type and a filtered list merged into it would answer another frame
   wrongly. Sending them means keying foreign lists by frame.

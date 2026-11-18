@@ -4,13 +4,13 @@
 // Node process should take `reader()` from `hlekk/adapters/node` instead, which adds the check that
 // keeps a stranger's reference from reaching a private network.
 
-export { Database, NoSuchEdge, Reader, VOCABULARY_TTL_MS, connect, memoryPins } from "./reader.ts";
+export { Database, NoSuchEdge, Reader, connect, memoryPins } from "./reader.ts";
 export type { Page, ReadOptions, ReaderOptions, Row } from "./reader.ts";
 
 // What a read can fail with, so a caller can tell them apart without a second import.
 export { BudgetSpent, DEFAULT_BUDGET } from "../client/budget.ts";
 export type { Budget } from "../client/budget.ts";
-export { ForeignRefused, ForeignUnreachable, NotFollowed, Repudiated, ResponseCache } from "../protocol/client.ts";
+export { ForeignRefused, ForeignUnreachable, NotFollowed, Repudiated, ResponseCache, VOCABULARY_TTL_MS } from "../protocol/client.ts";
 export type { Omitted, Pins } from "../protocol/client.ts";
 export { Refused } from "../query/request.ts";
 export type { Cmp, Cost, CountSpec, Hop, Request } from "../query/request.ts";

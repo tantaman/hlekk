@@ -20,12 +20,13 @@
 //   with a type the responder cannot fill declined rather than guessed at, as in the engine.
 //
 // **One catalog per database, not one for the reader.** A single merged catalog was the simpler
-// thing and it is wrong in two ways. Two publishers may use one type name for different shapes, and
-// the union of their fields describes neither. And a hop is only sent to a database that exposes
-// its edge: the engine's client, holding one catalog, sends a whole subtree to the first database
-// and is refused the moment that database does not know an edge further down. Reading each database
-// by its own vocabulary leaves the unknown hop out of that request and asks it of the database the
-// references lead to, which is what "the caller is the hub" means.
+// thing and it is wrong. Two publishers may use one type name for different shapes, and the union
+// of their fields describes neither: a field one of them calls an id would be read as a reference
+// in the other's payload. Read by its own vocabulary, each database's objects carry the fields that
+// database states, and a hop is only ever sent to a database that exposes its edge — an unknown one
+// is asked of whichever database the references lead to, which is what "the caller is the hub"
+// means. (The engine's client learned the second half of that from this file: see `subtree` in
+// `protocol/client.ts`.)
 //
 // **Every edge a vocabulary names is read as a list.** A vocabulary says whether an edge is counted,
 // which tells a stored edge from a field relationship, and does not say which field — so a reader
@@ -51,6 +52,7 @@ import {
   ForeignUnreachable,
   NotFollowed,
   ResponseCache,
+  VOCABULARY_TTL_MS,
   askPrice,
   discoverPinned,
   discoverVocabulary,
@@ -61,10 +63,6 @@ import type { Descriptor } from "../protocol/http.ts";
 import type { VocabularyDoc } from "../protocol/surface.ts";
 import { budgeted } from "../client/budget.ts";
 import type { Budget } from "../client/budget.ts";
-
-/** How long a vocabulary is read from before it is asked for again. The descriptor's catalog version
- *  catches a schema that changed; this catches a projection that did, which no version states. */
-export const VOCABULARY_TTL_MS = 5 * 60_000;
 
 export interface ReaderOptions {
   /**
