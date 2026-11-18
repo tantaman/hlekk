@@ -6,6 +6,8 @@
 
 export { Database, NoSuchEdge, Reader, connect, memoryPins } from "./reader.ts";
 export type { Page, ReadOptions, ReaderOptions, Row } from "./reader.ts";
+export { HopBuilder, ReadBuilder } from "./query.ts";
+export type { Shaped } from "./query.ts";
 
 // What a read can fail with, so a caller can tell them apart without a second import.
 export { BudgetSpent, DEFAULT_BUDGET } from "../client/budget.ts";

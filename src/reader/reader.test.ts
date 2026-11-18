@@ -557,3 +557,138 @@ describe("a caller with a lock of its own", () => {
     assert.equal((await w.reader.read(w.release)).length, 1);
   });
 });
+
+describe("a read built by chaining", () => {
+  /** The chain every database in the world is on, written rather than spelled out. */
+  const chain = (reader: Reader, ref: string) =>
+    reader
+      .from(ref)
+      .countAs("cited", "notes.cites")
+      .related("cites", "notes.cites", (cites) =>
+        cites.limit(5).related("about", "notes.about", (about) => about.related("release", "ops.deployed_release")),
+      );
+
+  it("is the request it compiles to, and nothing more", async () => {
+    const w = await world();
+    const q = chain(w.reader, w.second);
+    assert.deepEqual(q.request(), {
+      counts: [{ as: "cited", edge: "notes.cites" }],
+      hops: [
+        {
+          edge: "notes.cites",
+          as: "cites",
+          limit: 5,
+          hops: [{ edge: "notes.about", as: "about", hops: [{ edge: "ops.deployed_release", as: "release" }] }],
+        },
+      ],
+    });
+    assert.deepEqual(q.refs, [w.second]);
+    // Run, it is that request handed to `read`: one meaning for a read, and it is the data's.
+    assert.deepEqual(await q.run(), await new Reader({ fetch: w.f.fetch }).read(w.second, q.request()));
+    // And the data survives a wire, which is the point of its being data.
+    assert.deepEqual(await w.reader.read(w.second, JSON.parse(JSON.stringify(q.request()))), await q.run());
+  });
+
+  it("knows the names it was given, so a row needs no cast", async () => {
+    const w = await world();
+    const [row] = await chain(w.reader, w.second).run();
+    const cited: number = row!.cited;
+    const release = row!.cites.items[0]!.about.items[0]!.release.items[0]!;
+    assert.deepEqual([cited, row!.cites.more, release.id, release.$type, release.tag], [1, false, w.release, "packages.release", "3.7.2"]);
+
+    // The compiler holds these, which is the half of this test `npm run typecheck` runs. Never
+    // called: each line is a mistake, and the point is that it does not compile.
+    void (() => {
+      // @ts-expect-error a count is a number, not a page
+      void row!.cited.items;
+      // @ts-expect-error a name that was never given, two levels down, is not a page either
+      void row!.cites.items[0]!.nope.items;
+      // @ts-expect-error the read enters from ids, and ids have no filter
+      void w.reader.from(w.second).where;
+    });
+  });
+
+  it("leaves what it was built from as it was", async () => {
+    const w = await world();
+    const base = w.reader.from(w.second).related("cites", "notes.cites");
+    const counted = base.countAs("cited", "notes.cites");
+    const limited = w.reader.from(w.second).related("cites", "notes.cites", (cites) => cites.limit(1));
+    assert.deepEqual(base.request(), { hops: [{ edge: "notes.cites", as: "cites" }] });
+    assert.deepEqual(Object.keys(counted.request()).sort(), ["counts", "hops"]);
+    assert.equal(limited.request().hops![0]!.limit, 1);
+
+    // What `request()` hands back is the caller's to change.
+    const taken = base.request();
+    taken.hops!.push({ edge: "notes.about" });
+    assert.equal(base.request().hops!.length, 1);
+  });
+
+  it("refuses a name as it is given, where the mistake is one line long", async () => {
+    const w = await world();
+    const from = () => w.reader.from(w.second);
+    const refused = (build: () => unknown): Refused => {
+      try {
+        build();
+      } catch (e) {
+        assert.ok(e instanceof Refused, String(e));
+        return e;
+      }
+      return assert.fail("nothing was refused");
+    };
+    // A count and a hop under one name: the later one would silently win.
+    assert.equal(refused(() => from().related("cites", "notes.cites").countAs("cites", "notes.cites")).at, "counts[0]");
+    assert.equal(refused(() => from().related("x", "notes.cites").related("x", "notes.about")).at, "hops[1]");
+    // A name a row already carries.
+    assert.match(refused(() => from().related("id", "notes.cites")).message, /already carries/);
+    assert.match(refused(() => from().countAs("$version", "notes.cites")).message, /already carries/);
+    // The same one level down, inside the hop being built.
+    refused(() => from().related("cites", "notes.cites", (c) => c.countAs("n", "notes.about").related("n", "notes.about")));
+    // And a hop or a count with no name or no edge.
+    refused(() => from().related("", "notes.cites"));
+    refused(() => from().countAs("n", ""));
+  });
+
+  it("filters, limits and pages as the request does", async () => {
+    const w = await world();
+    const packages = w.f.member(PACKAGES);
+    const p = of(PACKAGES_LOCK);
+    const root = await packages.db.create(p.type("packages.release"), { tag: "4.0.0", change: "Everything." }, { vshard: "9" });
+    for (let i = 1; i <= 5; i++) {
+      const id = await packages.db.create(p.type("packages.release"), { tag: `3.9.${i}`, change: i % 2 ? "odd" : "even" }, { vshard: "9" });
+      await packages.db.assocAdd(p.edge("packages.supersedes"), root, id, i);
+    }
+    const db = await w.reader.database(PACKAGES);
+
+    // Two filters are one condition: both hold.
+    const [both] = await db
+      .from(root)
+      .related("older", "packages.supersedes", (older) => older.where("change", "=", "odd").where("tag", "!=", "3.9.3"))
+      .run();
+    assert.deepEqual(both!.older.items.map((r) => r.tag), ["3.9.5", "3.9.1"]);
+
+    const seen: string[] = [];
+    let after: string | undefined;
+    for (let guard = 0; guard < 10; guard++) {
+      const [row] = await db
+        .from(root)
+        .related("older", "packages.supersedes", (older) => (after === undefined ? older.limit(2) : older.limit(2).after(after)))
+        .run();
+      seen.push(...row!.older.items.map((r) => r.tag as string));
+      if (!row!.older.more) break;
+      after = row!.older.cursor!;
+    }
+    assert.deepEqual(seen, ["3.9.5", "3.9.4", "3.9.3", "3.9.2", "3.9.1"]);
+  });
+
+  it("passes on what `read` refuses, with its place in the request", async () => {
+    const w = await world();
+    const err = (await w.reader
+      .from(w.second)
+      .related("cites", "notes.cites", (cites) => cites.limit(0))
+      .run()
+      .then(() => null, (e: Error) => e)) as Refused;
+    assert.ok(err instanceof Refused, String(err));
+    assert.equal(err.at, "hops[0].limit");
+    await assert.rejects(w.reader.from(w.second).related("nope", "notes.nope").run(), NoSuchEdge);
+  });
+});

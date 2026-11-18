@@ -63,6 +63,7 @@ import type { Descriptor } from "../protocol/http.ts";
 import type { VocabularyDoc } from "../protocol/surface.ts";
 import { budgeted } from "../client/budget.ts";
 import type { Budget } from "../client/budget.ts";
+import { ReadBuilder } from "./query.ts";
 
 export interface ReaderOptions {
   /**
@@ -116,8 +117,8 @@ export interface ReadOptions {
 
 /** One page of a list: what a hop returns. A list is always a page, so it always says whether it
  *  goes on and where from. */
-export interface Page {
-  items: Row[];
+export interface Page<R extends Row = Row> {
+  items: R[];
   /** Hand it back as the hop's `after`. Opaque. */
   cursor: string | null;
   more: boolean;
@@ -434,6 +435,16 @@ export class Reader {
   }
 
   /**
+   * Starts a read from references, to be built by chaining: `related`, `countAs`, then `run`.
+   *
+   * The same read as `read(refs, request)`, written rather than spelled out. `request()` on what
+   * this returns is that request.
+   */
+  from(refs: Ref | readonly Ref[]): ReadBuilder {
+    return new ReadBuilder(this, typeof refs === "string" ? [refs] : [...refs]);
+  }
+
+  /**
    * A request as a plan, in this reader's numbers.
    *
    * Checked here for what can be checked without a vocabulary: members the protocol does not
@@ -551,6 +562,11 @@ export class Database {
    *  it is, wherever it points. */
   ref(id: Id | Ref): Ref {
     return parseRef(id).db === null ? formatRef(this.database, id) : id;
+  }
+
+  /** `Reader.from`, entered from this database's own ids. */
+  from(ids: Id | Ref | readonly (Id | Ref)[]): ReadBuilder {
+    return this.reader.from((typeof ids === "string" ? [ids] : [...ids]).map((id) => this.ref(id)));
   }
 
   /** `Reader.read`, entered from this database's own ids. */
