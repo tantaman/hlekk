@@ -74,11 +74,12 @@ implementation under test would be checking that the implementation agrees with 
 
 ## What it does not do
 
-- **Cross-database writes, inverses and cascades.** Reads only, and that is a decision rather than a
-  gap: delivery routes through a host's own client, which is scoped to one database and never gives
-  up, so writing the other half of a cross-database edge would mean holding credentials to write into
-  someone else's database inside a path with no give-up. A target database that wants a backlink
-  subscribes; it does not get written into.
+- **Cross-database writes, inverses and cascades.** Version 1 is reads only. Writes are deferred
+  rather than ruled out, and adding them later is additive (`docs/protocol.md`). They cannot ride
+  the machinery that exists: delivery routes through a host's own client, which is scoped to one
+  database and never gives up, so writing the other half of a cross-database edge would mean holding
+  credentials to write into someone else's database inside a path with no give-up. For now, a target
+  database that wants a backlink subscribes; it does not get written into.
 - **Backlinks across databases.** A subscription protocol with its own threat model.
 - **A global directory of databases.** A URI is the name and DNS arbitrates it. Discovery is not
   identity.
@@ -100,9 +101,8 @@ implementation under test would be checking that the implementation agrees with 
   all. What makes it safe is that **mounting the handler is the act of exposure**: a database that
   exists and is not mounted is reachable by nobody. `src/query/serve.ts` records the one thing that
   would invert that argument.
-- **Writes are nobody's but yours.** There is no write operation in the protocol and there is not
-  going to be one. Writing is your own client, inside your own deployment, behind whatever you
-  already have.
+- **Writes are nobody's but yours.** Version 1 of the protocol has no write operation. Writing is
+  your own client, inside your own deployment, behind whatever you already have.
 
 ## Contributing
 
