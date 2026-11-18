@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 
 import { Catalog, plan as planLock } from "../catalog/catalog.ts";
 import type { Lock } from "../catalog/catalog.ts";
-import { ForeignRefused, ForeignUnreachable, Repudiated } from "../protocol/client.ts";
+import { ForeignUnreachable, Repudiated } from "../protocol/client.ts";
 import { generateKeyPair } from "../protocol/identity.ts";
 import { surfaceOf } from "../protocol/surface.ts";
 import { Refused } from "../query/request.ts";
@@ -15,8 +15,7 @@ import { NoSuchEdge, Reader, connect } from "./reader.ts";
 import type { Page, Row } from "./reader.ts";
 
 // Three databases run by three parties, each declaring only its own types and the names of the ones
-// it points at. Nobody holds a catalog that covers all three, which is the situation a reader is
-// for — and the one the engine's own client is refused in, as the first test records.
+// it points at. Nobody holds a catalog that covers all three, which is the situation a reader is for.
 
 const NOTES = "https://notes.example/db";
 const OPS = "https://ops.example/db";
@@ -139,11 +138,11 @@ describe("a reader with no database of its own", () => {
     assert.deepEqual([release.id, release.$type, release.tag], [w.release, "packages.release", "3.7.2"]);
   });
 
-  it("where the engine's client, holding one catalog for all three, is refused by the first", async () => {
-    // The reason a reader reads each database by its own vocabulary. Nothing here is the reader:
-    // it is the notes database's client, with a catalog that declares everything, asked to start
-    // from an object in ANOTHER database. It sends the whole subtree to that database, which has no
-    // `ops.deployed_release` to be asked about.
+  it("reads what the engine's client reads, which holds one catalog for all three", async () => {
+    // The same chain through the other asking half: a database of its own, a lock that declares
+    // every type and edge in the world, and a query that starts from an object in ANOTHER database.
+    // It used to be refused here — it sent the whole subtree to the notes database, which has no
+    // `ops.deployed_release` to be asked about — and `protocol/federation.test.ts` holds the fix.
     const w = await world();
     const all = planLock({
       notes: {
@@ -154,27 +153,33 @@ describe("a reader with no database of its own", () => {
         objects: { "ops.incident": { fields: { ticket: "string" } } },
         edges: { "ops.deployed_release": { from: "ops.incident", to: "packages.release", foreign: true } },
       },
-      packages: { objects: { "packages.release": { fields: {} } } },
+      packages: { objects: { "packages.release": { fields: { tag: "string" } } } },
     });
     const elsewhere = await federate({ members: [{ uri: "https://asker.example/db", lock: all, database: "asker" }], wrap: () => w.f.fetch });
     const catalog = Catalog.compile(all);
     const hop = (name: string) => ({ kind: "edge" as const, atype: catalog.edgeNamed(name)!.atype! });
-    const err = await elsewhere
-      .member("https://asker.example/db")
-      .db.query(
-        {
-          frames: [
-            { source: { kind: "ids" }, children: [{ alias: "cites", frame: 1 }], counts: [] },
-            { source: hop("notes.cites"), children: [{ alias: "about", frame: 2 }], counts: [] },
-            { source: hop("notes.about"), children: [{ alias: "release", frame: 3 }], counts: [] },
-            { source: hop("ops.deployed_release"), children: [], counts: [] },
-          ],
-        },
-        [w.second],
-      )
-      .then(() => null, (e: Error) => e);
-    assert.ok(err instanceof ForeignRefused, String(err));
-    assert.match(err.message, /no edge "ops.deployed_release"/);
+    type Its = { id: string; cites: { id: string; about: { id: string; ticket: string; release: { id: string; tag: string }[] }[] }[] }[];
+    const its = (await elsewhere.member("https://asker.example/db").db.query(
+      {
+        frames: [
+          { source: { kind: "ids" }, children: [{ alias: "cites", frame: 1 }], counts: [] },
+          { source: hop("notes.cites"), children: [{ alias: "about", frame: 2 }], counts: [] },
+          { source: hop("notes.about"), children: [{ alias: "release", frame: 3 }], counts: [] },
+          { source: hop("ops.deployed_release"), children: [], counts: [] },
+        ],
+      },
+      [w.second],
+    )) as Its;
+
+    const [row] = await w.reader.read(w.second, CHAIN);
+    const cited = page(row, "cites").items[0]!;
+    const incident = page(cited, "about").items[0]!;
+    const release = page(incident, "release").items[0]!;
+    assert.deepEqual(
+      [its[0]!.id, its[0]!.cites[0]!.id, its[0]!.cites[0]!.about[0]!.id, its[0]!.cites[0]!.about[0]!.release[0]!.id],
+      [row.id, cited.id, incident.id, release.id],
+    );
+    assert.deepEqual([its[0]!.cites[0]!.about[0]!.ticket, its[0]!.cites[0]!.about[0]!.release[0]!.tag], [incident.ticket, release.tag]);
   });
 
   it("asks each database once for what it holds, however deep the request goes inside it", async () => {

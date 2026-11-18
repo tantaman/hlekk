@@ -824,3 +824,171 @@ describe("type agreement, one step further", () => {
     assert.deepEqual(Object.keys(rows[0].about[0]!).sort(), ["$edge", "$version", "id", "title"]);
   });
 });
+
+// Three databases run by three parties, each declaring its own types and only the NAMES of the
+// ones it points at. Every federation above gives the first foreign database the later edges too,
+// which is why none of them found this: a subtree is named through the asking catalog, and a
+// responder that does not have one of those names refuses the whole request.
+describe("a query through databases that share no catalog", () => {
+  const JOURNAL = "https://journal.example/db";
+  const OPS = "https://ops.example/db";
+  const PACKAGES = "https://packages.example/db";
+
+  const OPS_LOCK: Lock = planLock({
+    ops: {
+      objects: { "ops.incident": { fields: { ticket: "string" } } },
+      edges: {
+        "ops.related": { from: "ops.incident", to: "ops.incident" },
+        "ops.deployed_release": { from: "ops.incident", to: "packages.release", foreign: true },
+      },
+    },
+    packages: { objects: { "packages.release": { fields: {} } } },
+  });
+  const PACKAGES_LOCK: Lock = planLock({
+    packages: {
+      objects: { "packages.release": { fields: { tag: "string" } } },
+      edges: { "packages.supersedes": { from: "packages.release", to: "packages.release" } },
+    },
+  });
+  /** The asker's, which is the only catalog that covers all three. */
+  const JOURNAL_LOCK: Lock = planLock({
+    journal: {
+      objects: { "journal.entry": { fields: { text: "string" } } },
+      edges: { "journal.about": { from: "journal.entry", to: "ops.incident", foreign: true } },
+    },
+    ops: {
+      objects: { "ops.incident": { fields: { ticket: "string" } } },
+      edges: {
+        "ops.related": { from: "ops.incident", to: "ops.incident" },
+        "ops.deployed_release": { from: "ops.incident", to: "packages.release", foreign: true },
+      },
+    },
+    packages: {
+      objects: { "packages.release": { fields: { tag: "string" } } },
+      edges: { "packages.supersedes": { from: "packages.release", to: "packages.release" } },
+    },
+  });
+  const J = Catalog.compile(JOURNAL_LOCK);
+  const O = Catalog.compile(OPS_LOCK);
+  const P = Catalog.compile(PACKAGES_LOCK);
+  const hop = (name: string) => ({ kind: "edge" as const, atype: J.edgeNamed(name)!.atype! });
+
+  async function three() {
+    const f = await federate({
+      members: [
+        { uri: JOURNAL, lock: JOURNAL_LOCK, database: "journal" },
+        { uri: OPS, lock: OPS_LOCK, database: "ops" },
+        { uri: PACKAGES, lock: PACKAGES_LOCK, database: "packages" },
+      ],
+    });
+    const [journal, ops, packages] = [f.member(JOURNAL), f.member(OPS), f.member(PACKAGES)];
+    const older = await packages.db.create(P.objectNamed("packages.release")!.otype, { tag: "3.7.1" }, { vshard: "2" });
+    const release = await packages.db.create(P.objectNamed("packages.release")!.otype, { tag: "3.7.2" }, { vshard: "2" });
+    await packages.db.assocAdd(P.edgeNamed("packages.supersedes")!.atype!, release, older, 1);
+    const cause = await ops.db.create(O.objectNamed("ops.incident")!.otype, { ticket: "INC-216" }, { vshard: "3" });
+    const incident = await ops.db.create(O.objectNamed("ops.incident")!.otype, { ticket: "INC-217" }, { vshard: "3" });
+    await ops.db.assocAdd(O.edgeNamed("ops.related")!.atype!, incident, cause, 1);
+    await ops.db.assocAdd(O.edgeNamed("ops.deployed_release")!.atype!, incident, `${PACKAGES}#${release}`, 1);
+    const entry = await journal.db.create(J.objectNamed("journal.entry")!.otype, { text: "why did deliveries double?" }, { vshard: "4" });
+    await journal.db.assocAdd(J.edgeNamed("journal.about")!.atype!, entry, `${OPS}#${incident}`, 1);
+    return { f, journal, ops, packages, entry, incident: `${OPS}#${incident}`, release: `${PACKAGES}#${release}`, older: `${PACKAGES}#${older}` };
+  }
+
+  /** entry -> about -> release -> supersedes: three databases, and `packages.supersedes` is an edge
+   *  the ops database has never heard of, two hops below the objects it is asked for. */
+  const CHAIN: Plan = {
+    frames: [
+      { source: { kind: "ids" }, children: [{ alias: "about", frame: 1 }], counts: [] },
+      { source: hop("journal.about"), children: [{ alias: "release", frame: 2 }], counts: [] },
+      { source: hop("ops.deployed_release"), children: [{ alias: "older", frame: 3 }], counts: [] },
+      { source: hop("packages.supersedes"), children: [], counts: [] },
+    ],
+  };
+  type Chain = { about: { id: string; release: { id: string; tag: string; older: { id: string; tag: string }[] }[] }[] }[];
+
+  for (const driver of ["async", "rounds"] as const) {
+    it(`leaves out of a subtree what the responder does not expose, and asks whoever holds it, on ${driver}`, async () => {
+      const w = await three();
+      const rows = (await w.journal.db.query(CHAIN, [w.entry], { driver })) as Chain;
+      const release = rows[0]!.about[0]!.release[0]!;
+      assert.deepEqual([rows[0]!.about[0]!.id, release.id, release.tag], [w.incident, w.release, "3.7.2"]);
+      assert.deepEqual(release.older.map((r) => [r.id, r.tag]), [[w.older, "3.7.1"]]);
+    });
+  }
+
+  it("asks for a vocabulary only where a request nests, and once", async () => {
+    const w = await three();
+    await w.journal.db.query(CHAIN, [w.entry]);
+    // ops was sent a hop under a hop, so what it exposes had to be known. packages was asked for
+    // objects with one hop under them, and its own refusal would have been the answer.
+    assert.deepEqual([w.ops.served.vocabulary, w.packages.served.vocabulary], [1, 0]);
+    await w.journal.db.query(CHAIN, [w.entry]);
+    assert.equal(w.ops.served.vocabulary, 1, "kept for the life of the client");
+  });
+
+  it("does the same for a count that hangs under a hop", async () => {
+    const w = await three();
+    const rows = (await w.journal.db.query(
+      {
+        frames: [
+          { source: { kind: "ids" }, children: [{ alias: "about", frame: 1 }], counts: [] },
+          { source: hop("journal.about"), children: [{ alias: "release", frame: 2 }], counts: [] },
+          // A count on the release, which is in a database ops cannot answer for.
+          { source: hop("ops.deployed_release"), children: [], counts: [{ alias: "older", atype: hop("packages.supersedes").atype }] },
+        ],
+      },
+      [w.entry],
+    )) as { about: { release: { older: number }[] }[] }[];
+    assert.equal(rows[0]!.about[0]!.release[0]!.older, 1);
+  });
+
+  it("still refuses, by name, a hop under objects the responder does hold", async () => {
+    // Left out of the subtree like any edge ops does not expose. But these parents are ops's own
+    // incidents, so nobody else can be asked, and the read that asks ops directly is refused. What
+    // must not come back is an empty list: nothing was asked that ops could answer.
+    const w = await three();
+    const err = await w.journal.db
+      .query(
+        {
+          frames: [
+            { source: { kind: "ids" }, children: [{ alias: "about", frame: 1 }], counts: [] },
+            { source: hop("journal.about"), children: [{ alias: "related", frame: 2 }], counts: [] },
+            { source: hop("ops.related"), children: [{ alias: "older", frame: 3 }], counts: [] },
+            { source: hop("packages.supersedes"), children: [], counts: [] },
+          ],
+        },
+        [w.entry],
+      )
+      .then(() => null, (e: Error) => e);
+    assert.equal(err?.name, "ForeignRefused", String(err));
+    assert.match(err!.message, /no edge "packages.supersedes"/);
+  });
+
+  it("fails by name where the vocabulary cannot be read, rather than send what may be refused", async () => {
+    const f = await federate({
+      members: [
+        { uri: JOURNAL, lock: JOURNAL_LOCK, database: "journal" },
+        { uri: OPS, lock: OPS_LOCK, database: "ops" },
+      ],
+      wrap: (inner) => async (input, init) =>
+        String(input).endsWith("/vocabulary") ? new Response("{}", { status: 200 }) : inner(input, init),
+    });
+    const incident = await f.member(OPS).db.create(O.objectNamed("ops.incident")!.otype, { ticket: "INC-1" }, { vshard: "3" });
+    const entry = await f.member(JOURNAL).db.create(J.objectNamed("journal.entry")!.otype, { text: "t" }, { vshard: "4" });
+    await f.member(JOURNAL).db.assocAdd(J.edgeNamed("journal.about")!.atype!, entry, `${OPS}#${incident}`, 1);
+    const err = await f.member(JOURNAL).db.query(CHAIN, [entry]).then(() => null, (e: Error) => e);
+    assert.ok(err instanceof ForeignUnreachable, String(err));
+    assert.match(err.message, /invalid vocabulary/);
+    // And a read that does not nest never needed it.
+    const shallow = (await f.member(JOURNAL).db.query(ABOUT_SHALLOW, [entry])) as { about: unknown[] }[];
+    assert.equal(shallow[0]!.about.length, 1);
+  });
+
+  const ABOUT_SHALLOW: Plan = {
+    frames: [
+      { source: { kind: "ids" }, children: [{ alias: "about", frame: 1 }], counts: [] },
+      { source: hop("journal.about"), children: [{ alias: "related", frame: 2 }], counts: [] },
+      { source: hop("ops.related"), children: [], counts: [] },
+    ],
+  };
+});

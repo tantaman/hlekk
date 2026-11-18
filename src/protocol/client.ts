@@ -178,6 +178,15 @@ export interface ForeignOptions {
 /** The limits a responder's descriptor states, as the asking half uses them. */
 type Advertised = Partial<Descriptor["limits"]>;
 
+/** How long a vocabulary is read from before it is asked for again. The descriptor's catalog version
+ *  catches a schema that changed; this catches a projection that did, which no version states. */
+export const VOCABULARY_TTL_MS = 5 * 60_000;
+
+/** Whether a request carries a hop or a count under a hop, which is where `subtree` needs to know
+ *  what the responder exposes. */
+const nests = (batch: { body: ReadRequest }): boolean =>
+  (batch.body.hops ?? []).some((hop) => (hop.hops?.length ?? 0) > 0 || (hop.counts?.length ?? 0) > 0);
+
 /** Answers kept for as long as the responder permitted. One per (asking database, foreign database),
  *  held for the life of an isolate. */
 export class ResponseCache {
@@ -274,7 +283,26 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     });
   }
 
-  let agreed: ReadonlySet<string> | undefined;
+  let learned: { version: number; at: number; doc: VocabularyDoc } | undefined;
+  let agreed: { doc: VocabularyDoc; names: ReadonlySet<string> } | undefined;
+
+  /**
+   * The responder's vocabulary, asked for once and kept.
+   *
+   * Asked for again when the descriptor reports a different catalog version, which costs nothing to
+   * notice since the descriptor is read on every execution, and after `VOCABULARY_TTL_MS` whatever
+   * it reports.
+   */
+  async function vocabularyOf(descriptor: Descriptor, spend?: () => AbortSignal): Promise<VocabularyDoc> {
+    if (opts.vocabulary !== undefined) return opts.vocabulary(spend);
+    const now = opts.now?.() ?? Date.now();
+    if (learned !== undefined && learned.version === descriptor.catalog && now - learned.at < VOCABULARY_TTL_MS) {
+      return learned.doc;
+    }
+    const doc = await discoverVocabulary(db, opts, spend);
+    learned = { version: descriptor.catalog, at: now, doc };
+    return doc;
+  }
 
   return {
     metersRequests: true,
@@ -285,9 +313,15 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         const catalog = typeof opts.catalog === "function" ? await opts.catalog(descriptor, spend) : opts.catalog;
         const advertised = descriptor.limits;
         const max = advertised.maxIds;
-        for (const batch of group(tasks, plan, catalog, max, advertised)) {
-          await send(batch, plan, gathered, descriptor, catalog, spend);
+        let batches = group(tasks, plan, catalog, max, advertised);
+        if (batches.some(nests)) {
+          // Only now is the vocabulary worth a request: `subtree` says why a hop under another hop
+          // is the one place it decides anything. A read that goes one level into a database — most
+          // of them — never asks for it.
+          const exposed = new Set(Object.keys((await vocabularyOf(descriptor, spend)).edges));
+          batches = group(tasks, plan, catalog, max, advertised, exposed);
         }
+        for (const batch of batches) await send(batch, plan, gathered, descriptor, catalog, spend);
       } catch (e) {
         // `omit` covers a database that could not be reached. A repudiated one was reached and
         // answered — with a key that is not the one it proved before — and omitting that would turn
@@ -356,7 +390,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
       headers: { "content-type": "application/json", ...await signature(url, payload, descriptor) },
     }, spend);
     const decoded = decodeRead(body, catalog);
-    const declined = new Set([...decoded.declined, ...(await disagreeing(catalog, spend))]);
+    const declined = new Set([...decoded.declined, ...(await disagreeing(catalog, descriptor, spend))]);
     // The responder numbers the frames of the plan IT compiled, which are not this plan's numbers.
     // `shape` is how the two are joined: this side chose the aliases, so walking `shape` from the
     // root with those aliases gives the responder's frame for each of this plan's.
@@ -472,14 +506,13 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     return out;
   }
 
-  /** Type names the two catalogs do not mean the same thing by, worked out once per client.
+  /** Type names the two catalogs do not mean the same thing by, worked out once per vocabulary.
    *  `disagreements` is the comparison and says why it is the one that matters. */
-  async function disagreeing(catalog: Catalog, spend?: () => AbortSignal): Promise<ReadonlySet<string>> {
+  async function disagreeing(catalog: Catalog, descriptor: Descriptor, spend?: () => AbortSignal): Promise<ReadonlySet<string>> {
     if (!opts.agree) return new Set();
-    if (agreed) return agreed;
-    const doc = await (opts.vocabulary?.(spend) ?? discoverVocabulary(db, opts, spend));
-    agreed = disagreements(catalog.objectTypes(), doc);
-    return agreed;
+    const doc = await vocabularyOf(descriptor, spend);
+    if (agreed?.doc !== doc) agreed = { doc, names: disagreements(catalog.objectTypes(), doc) };
+    return agreed.names;
   }
 
   /** A bare id in the responder's answer means an object in the RESPONDER's database; a qualified one
@@ -502,7 +535,14 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
    * batches by edge type across parents. A count batches by edge type too. A continued list is one
    * request, because a token places exactly one page.
    */
-  function group(tasks: readonly Miss[], plan: Plan, catalog: Catalog, max: number, advertised?: Advertised): Batch[] {
+  function group(
+    tasks: readonly Miss[],
+    plan: Plan,
+    catalog: Catalog,
+    max: number,
+    advertised?: Advertised,
+    exposed?: ReadonlySet<string>,
+  ): Batch[] {
     const out: Batch[] = [];
 
     const byFrame = new Map<number, Ref[]>();
@@ -533,21 +573,21 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         // does not cross.
         throw new NotFollowed(db, `a continuation of the ${name} list of ${t.id1} by sort key rather than by its token`);
       }
-      out.push(listBatch(plan, catalog, t.atype, t.frame, t.n, [t.id1], t.after, advertised));
+      out.push(listBatch(plan, catalog, t.atype, t.frame, t.n, [t.id1], t.after, advertised, exposed));
     }
 
     for (const [frame, refs] of byFrame) {
       for (let i = 0; i < refs.length; i += max) {
         const slice = refs.slice(i, i + max);
         out.push({
-          body: { ids: slice.map((r) => parseRef(r).id), ...subtree(plan, frame, catalog, advertised, 1) },
+          body: { ids: slice.map((r) => parseRef(r).id), ...subtree(plan, frame, catalog, advertised, 1, exposed) },
           frames: labels(plan, frame),
         });
       }
     }
     for (const { atype, frame, n, parents } of heads.values()) {
       for (let i = 0; i < parents.length; i += max) {
-        out.push(listBatch(plan, catalog, atype, frame, n, parents.slice(i, i + max), null, advertised));
+        out.push(listBatch(plan, catalog, atype, frame, n, parents.slice(i, i + max), null, advertised, exposed));
       }
     }
     for (const [atype, parents] of counts) {
@@ -574,6 +614,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     parents: readonly Ref[],
     after: Cursor | null,
     advertised?: Advertised,
+    exposed?: ReadonlySet<string>,
   ): Batch {
     const name = catalog.edge(atype)!.name;
     const hop: Hop = {
@@ -583,7 +624,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
       // costs a round trip and tells the caller nothing it could not have read in the descriptor.
       limit: Math.min(Math.max(n, after?.resume?.limit ?? 0), advertised?.maxLimit ?? Infinity),
       ...(after?.token !== undefined ? { after: after.token } : {}),
-      ...subtree(plan, frame, catalog, advertised, 2),
+      ...subtree(plan, frame, catalog, advertised, 2, exposed),
     };
     return {
       body: { ids: parents.map((r) => parseRef(r).id), hops: [hop] },
@@ -600,6 +641,21 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
    * so it applies the filter itself; what it loses is that the responder reads more rows than the
    * filter keeps, which `EdgeHop` already handles by asking for a larger page. Sending them means
    * keying foreign lists by frame, and that is a later optimization.
+   *
+   * **Below the first hop, only what the responder exposes is sent.** A subtree is named through
+   * the ASKING catalog, and a responder refuses a request naming an edge it does not have — all of
+   * it, and rightly. But a hop under another hop may hang under objects that are not the
+   * responder's at all: a `foreign` edge lands in another database, and the edge after it is that
+   * database's to answer. Sent anyway, it had one catalog covering three databases refused by the
+   * first of them (`note -> about -> release`, asked of a notes database that has no release edge),
+   * which is the failure `federation.test.ts` records. So with `exposed` in hand, a hop or a count
+   * at depth 2 or more is left out where the responder does not expose its edge: the reference
+   * comes back unfollowed, and the coordinator asks whoever holds it.
+   *
+   * A hop directly under the ids is NOT left out. Those are the responder's own objects, nobody
+   * else can answer for them, and its refusal is the answer. That is also what keeps this loud: a
+   * level left out here is read by the coordinator itself, and where the objects turn out to be the
+   * responder's after all, that read is a hop directly under ids — refused, by name.
    */
   function subtree(
     plan: Plan,
@@ -607,6 +663,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     catalog: Catalog,
     advertised: Advertised | undefined,
     depth: number,
+    exposed?: ReadonlySet<string>,
   ): { hops?: Hop[]; counts?: CountSpec[] } {
     const f = plan.frames[frame];
     if (f === undefined) return {};
@@ -614,6 +671,9 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     // levels itself — one request each instead of one for all of them, which is slower and is an
     // answer rather than a refusal.
     if (depth > (advertised?.maxDepth ?? Infinity)) return {};
+    // Both this frame's counts and its children's hops sit under a hop once depth is 2: the counts
+    // are on that hop's targets, and the hops start from them.
+    const hidden = (name: string): boolean => depth >= 2 && exposed !== undefined && !exposed.has(name);
     const hops: Hop[] = [];
     for (const child of f.children) {
       const source = plan.frames[child.frame]?.source;
@@ -626,6 +686,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
       // A type this catalog cannot name is one the two sides do not agree on, so the hop is left out
       // and the coordinator reads that level itself — which will fail by name rather than quietly.
       if (name === undefined) continue;
+      if (hidden(name)) continue;
       const frame = plan.frames[child.frame];
       // The coordinator requests continued lists explicitly, with their own cursor.
       if (frame.after) continue;
@@ -634,13 +695,13 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
         as: `f${child.frame}`,
         edge: name,
         limit,
-        ...subtree(plan, child.frame, catalog, advertised, depth + 1),
+        ...subtree(plan, child.frame, catalog, advertised, depth + 1, exposed),
       });
     }
     const counts: CountSpec[] = [];
     for (const atype of new Set(f.counts.map(c => c.atype))) {
       const name = catalog.edge(atype)?.name;
-      if (name !== undefined) counts.push({ as: `a${atype}`, edge: name });
+      if (name !== undefined && !hidden(name)) counts.push({ as: `a${atype}`, edge: name });
     }
     return { ...(hops.length > 0 ? { hops } : {}), ...(counts.length > 0 ? { counts } : {}) };
   }
