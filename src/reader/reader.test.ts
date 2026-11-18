@@ -200,6 +200,26 @@ describe("a reader with no database of its own", () => {
     assert.equal(w.f.member(NOTES).served.vocabulary, 1, "a vocabulary is kept between reads");
   });
 
+  it("reads every reference it was given, however many", async () => {
+    // More references than the engine's default page holds, and more than one request to a database
+    // may carry. The first used to cut the read to fifty rows, twice over — here, and again in the
+    // database answering — and a row has no cursor to say that anything was left out.
+    const w = await world();
+    const packages = w.f.member(PACKAGES);
+    const p = of(PACKAGES_LOCK);
+    const refs: string[] = [];
+    for (let i = 0; i < 120; i++) {
+      const id = await packages.db.create(p.type("packages.release"), { tag: `5.0.${i}`, change: "One of many." }, { vshard: "9" });
+      refs.push(`${PACKAGES}#${id}`);
+    }
+    assert.equal(refs.length > (await w.reader.database(PACKAGES)).limits.maxIds, true, "so it takes more than one request");
+    for (const driver of ["async", "rounds"] as const) {
+      const rows = await new Reader({ fetch: w.f.fetch }).read(refs, {}, { driver });
+      assert.deepEqual(rows.map((r) => r.id), refs, `every reference, in the order given, on ${driver}`);
+      assert.deepEqual([rows[0]!.tag, rows[119]!.tag], ["5.0.0", "5.0.119"]);
+    }
+  });
+
   it("gives the same answer on either driver", async () => {
     const w = await world();
     const a = await w.reader.read(w.second, CHAIN, { driver: "async" });
