@@ -41,3 +41,11 @@ The catalog in [server/store.mjs](server/store.mjs) uses a common notebook node 
 Removing a block from a document detaches the composition edge. A collection, embed, or restored revision can still use the block’s identity. A commit stores an immutable copy of the document’s block values on a revision node. Autosave updates the working nodes and reconciles their edges.
 
 The local server serializes commands and checks the document version before applying a save or restore. A pending multi-write operation is recorded in Hlekk and replayed on recovery. The browser loads the notebook graph into memory for search, backlinks, and navigation. This example is sized for a personal notebook.
+
+## Incremental sync
+
+The first visit fetches `GET /api/workspace`. It returns the current graph and an opaque `cursor` from the same serialized read. Folio stores the nodes and cursor in IndexedDB. On a return visit, the cached graph opens immediately for reading and search. Editing becomes available once the server confirms the workspace. Autosaves and other commands refresh through the same feed. Unsynced edits live in memory.
+
+`GET /api/changes?after=<encoded cursor>` returns `{ cursor, patches }`. Each patch is keyed by node ID. A `value` field replaces that node’s payload. A `blocks`, `links`, `embeds`, or `members` field replaces the entire ordered list, including an empty list. Omitted fields keep their cached values. New nodes start with empty lists. The browser persists changed nodes and the new cursor together in one transaction. An up-to-date cursor yields empty patches. A cursor belonging to a different notebook or ahead of the server returns HTTP 409 and triggers a fresh snapshot.
+
+Hlekk keeps one timestamped marker edge per changed node value or outgoing list. A later edit moves its marker, so catching up after many edits to the same block transfers its current contents once. The recovery journal publishes the sequence after both the graph mutations and their markers land. Existing notebooks acquire a cursor on first open after upgrading. Named revisions continue to load through the history endpoint.

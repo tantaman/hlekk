@@ -108,7 +108,11 @@ test("a mounted editor keeps both title and block edits across separate autosave
   });
   t.mock.method(globalThis, "fetch", async (path, init) => {
     const data =
-      path === "/api/workspace" ? await n.workspace() : { id: await n.command(JSON.parse(init.body)) };
+      path === "/api/workspace"
+        ? await n.workspace()
+        : path.startsWith("/api/changes?")
+          ? await n.changes(new URL(path, "http://localhost").searchParams.get("after"))
+          : { id: await n.command(JSON.parse(init.body)) };
     return Response.json(data);
   });
   await client.load();

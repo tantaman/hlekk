@@ -27,6 +27,7 @@ import "@fontsource/spectral/latin-400.css";
 import "@fontsource/spectral/latin-400-italic.css";
 import "@fontsource/spectral/latin-500.css";
 import "@fontsource/spectral/latin-600.css";
+import { parseCursor } from "../workspace.js";
 import { NotebookClient, allOf, nodeTitle, blockText, parentsOf } from "./client";
 import { Editor } from "./editor";
 import { Dialog } from "./dialog";
@@ -70,7 +71,7 @@ function SectionLabel({ label, onClick }) {
     </div>
   );
 }
-function Sidebar({ workspace, selected, view, nav, go, openDialog, mobile, close }) {
+function Sidebar({ verified, workspace, selected, view, nav, go, openDialog, mobile, close }) {
   const { nodes, home } = workspace;
   const docs = allOf(nodes, "document").sort((a, b) =>
     a.id === home ? -1 : b.id === home ? 1 : b.edited - a.edited || a.title.localeCompare(b.title),
@@ -134,7 +135,7 @@ function Sidebar({ workspace, selected, view, nav, go, openDialog, mobile, close
           <span>
             <strong>Personal workspace</strong>
             <small>
-              <i /> Hlekk connected
+              <i /> {verified ? "Hlekk connected" : "Cached notebook"}
             </small>
           </span>
         </div>
@@ -143,9 +144,17 @@ function Sidebar({ workspace, selected, view, nav, go, openDialog, mobile, close
     </>
   );
 }
-function DocumentView({ doc, nodes, go, showDialog, jump, status }) {
-  const [initial] = useState(() => client.draft(doc)),
-    [title, setTitle] = useState(initial.title),
+function DocumentView(props) {
+  const [open, setOpen] = useState(() => ({ session: client.draft(props.doc), generation: 0 }));
+  // Own saves advance this session in place. A newer remote version needs a
+  // fresh editor only when the user has no outstanding edits to preserve.
+  if (open.session.version < props.doc.version && !client.drafts.has(props.doc.id)) {
+    setOpen({ session: client.draft(props.doc), generation: open.generation + 1 });
+  }
+  return <DocumentEditor key={open.generation} {...props} initial={open.session} />;
+}
+function DocumentEditor({ initial, doc, nodes, go, showDialog, jump, status, readOnly }) {
+  const [title, setTitle] = useState(initial.title),
     [blocks, setBlocks] = useState(initial.blocks);
   const collection = allOf(nodes, "collection").find((n) => n.members.includes(doc.id));
   const words = blocks
@@ -156,7 +165,7 @@ function DocumentView({ doc, nodes, go, showDialog, jump, status }) {
     .filter(Boolean).length;
   async function follow(target, label) {
     try {
-      await client.flush();
+      if (client.drafts.size) await client.flush();
       const next = client.state.workspace.nodes;
       const saved = next[doc.id].blocks
         .flatMap((id) => next[id].content)
@@ -201,7 +210,7 @@ function DocumentView({ doc, nodes, go, showDialog, jump, status }) {
         </div>
         <h1
           className="editable-title"
-          contentEditable
+          contentEditable={!readOnly}
           suppressContentEditableWarning
           role="textbox"
           aria-label="Document title"
@@ -244,6 +253,7 @@ function DocumentView({ doc, nodes, go, showDialog, jump, status }) {
           </span>
         </div>
         <Editor
+          readOnly={readOnly}
           initial={initial.blocks}
           docId={doc.id}
           graph={nodes}
@@ -405,6 +415,7 @@ function Notebook() {
     <div className="app">
       <Sidebar
         workspace={w}
+        verified={state.verified}
         selected={selected}
         view={view}
         nav={nav}
@@ -438,7 +449,11 @@ function Notebook() {
                 <button className="history-btn" onClick={() => setDialog({ mode: "history" })}>
                   <History size={16} /> <span>History</span>
                 </button>
-                <button className="button primary commit" onClick={() => setDialog({ mode: "commit" })}>
+                <button
+                  className="button primary commit"
+                  disabled={!state.verified}
+                  onClick={() => setDialog({ mode: "commit" })}
+                >
                   <GitCommitHorizontal size={17} /> Commit
                 </button>
                 <span className="divider" />
@@ -454,13 +469,17 @@ function Notebook() {
         </header>
         {state.error && (
           <div className="error-banner" role="alert">
-            {state.error} <button onClick={() => client.flush().catch(() => {})}>Retry save</button>
+            {state.error}{" "}
+            <button onClick={() => (client.drafts.size ? client.flush().catch(() => {}) : client.load())}>
+              {client.drafts.size ? "Retry save" : "Retry sync"}
+            </button>
           </div>
         )}
         <div className="panes">
           {doc ? (
             <DocumentView
-              key={doc.id + "-" + generation}
+              key={[parseCursor(w.cursor)?.feedId ?? w.home, doc.id, state.verified, generation].join("/")}
+              readOnly={!state.verified}
               {...{ doc, nodes, go }}
               showDialog={setDialog}
               jump={search.block}

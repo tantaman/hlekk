@@ -237,7 +237,7 @@ function Tool({ name, icon: Icon, onClick, active }) {
     </button>
   );
 }
-export function Editor({ initial, graph, onEdit, onLink, onDialog, jump, docId }) {
+export function Editor({ initial, graph, onEdit, onLink, onDialog, jump, docId, readOnly }) {
   const mount = useRef(null),
     view = useRef(null),
     latest = useRef({});
@@ -247,6 +247,7 @@ export function Editor({ initial, graph, onEdit, onLink, onDialog, jump, docId }
   useLayoutEffect(() => {
     const editor = new EditorView(mount.current, {
       state: EditorState.create({ doc: makeDoc(initial), plugins }),
+      editable: () => !readOnly,
       attributes: {
         role: "textbox",
         "aria-label": "Document blocks",
@@ -377,6 +378,7 @@ export function Editor({ initial, graph, onEdit, onLink, onDialog, jump, docId }
     <>
       <div
         className="toolbar"
+        inert={readOnly}
         role="toolbar"
         aria-label="Document formatting"
         onBlur={(e) => {

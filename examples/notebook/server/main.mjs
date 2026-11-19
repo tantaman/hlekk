@@ -27,9 +27,12 @@ const server = createServer(async (req, res) => {
   try {
     if (!/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(req.headers.host ?? ""))
       fail("Use the local notebook address.", 403);
-    const path = new URL(req.url, "http://localhost").pathname;
+    const url = new URL(req.url, "http://localhost");
+    const path = url.pathname;
     if (path.startsWith("/api/")) {
       if (req.method === "GET" && path === "/api/workspace") return send(res, await notebook.workspace());
+      if (req.method === "GET" && path === "/api/changes")
+        return send(res, await notebook.changes(url.searchParams.get("after")));
       if (req.method === "GET" && /^\/api\/history\/\d+$/.test(path))
         return send(res, await notebook.history(path.split("/").pop()));
       if (req.method === "POST" && path === "/api/command") {
@@ -49,7 +52,7 @@ const server = createServer(async (req, res) => {
         } catch {
           fail("Invalid JSON.");
         }
-        return send(res, { id: await notebook.command(action) });
+        return send(res, { id: await notebook.command(action, req.headers["x-folio-notebook"]) });
       }
       return send(res, { error: "Unknown notebook endpoint." }, 404);
     }

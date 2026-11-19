@@ -1,17 +1,24 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { open } from "../../../src/adapters/node/database.ts";
 import { plan } from "../../../src/catalog/catalog.ts";
 import { sampleDocs, seedBodies } from "./seed.mjs";
 
+import { edgeLists, parseCursor } from "../workspace.js";
+
 const type = "notebook.node";
 const edge = () => ({ from: type, to: type });
 const names = ["registry", "blocks", "links", "members", "history", "embeds"];
-const lock = plan({
+const parts = ["value", ...Object.values(edgeLists).flat()];
+const marker = (part) => "changed_" + part;
+const domain = (edgeNames) => ({
   notebook: {
     objects: { [type]: { fields: { kind: "string", value: "json" } } },
-    edges: Object.fromEntries(names.map((name) => ["notebook." + name, edge()])),
+    edges: Object.fromEntries(edgeNames.map((name) => ["notebook." + name, edge()])),
   },
 });
+// Retain the original atypes in notebooks created before incremental sync.
+const originalLock = plan(domain(names));
+const lock = plan(domain([...names, ...parts.map(marker)]), originalLock);
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 export function fail(message, status = 400) {
   throw Object.assign(new Error(message), { status });
@@ -65,8 +72,13 @@ function validateBlocks(blocks) {
 const frame = (source, children = []) => ({ source, children, counts: [], limit: Number.MAX_SAFE_INTEGER });
 
 export async function openNotebook(dir) {
-  const store = await open({ dir, lock, identity: false });
-  const { db, catalog, cluster } = store;
+  const store = await open({ dir, lock: originalLock, identity: false });
+  const { db, cluster } = store;
+  if (store.catalog.version < lock.version) {
+    cluster.directory.applyLock(lock);
+    cluster.spreadCatalog();
+  }
+  const catalog = cluster.directory.catalog();
   if (!cluster.directory.indexVshards().length) {
     cluster.openIndexVshards(1);
     await cluster.publish();
@@ -100,6 +112,31 @@ export async function openNotebook(dir) {
   }
   const rootValue = async () => (await one(root)).value;
 
+  const prior = await rootValue();
+  if (!prior.feedId) {
+    await db.update(root, { kind: "workspace", value: { ...prior, feedId: randomUUID(), sequence: 0 } });
+  }
+  const cursorOf = (value) => value.feedId + ":" + value.sequence;
+
+  // A marker holds the latest sequence for one node value or one outgoing list.
+  // Moving the same marker forward coalesces edits without retaining old draft text.
+  async function markChanges(ops, sequence) {
+    const touched = new Map();
+    for (const op of ops) {
+      let part, id;
+      if (op.kind === "update" || op.name === "registry") {
+        part = "value";
+        id = op.id ?? op.to;
+      } else if (parts.includes(op.name)) {
+        part = op.name;
+        id = op.from;
+      } else continue; // Named revisions have a separate, on-demand history endpoint.
+      const atypeId = atype(marker(part));
+      touched.set(part + ":" + id, { atype: atypeId, id1: root, id2: id, time: -sequence });
+    }
+    await db.assocAddMany([...touched.values()]);
+  }
+
   // Graph operations can span Hlekk mutations. Replaying the prepared after-images
   // repairs interrupted saves before serving a subsequent read or comparing versions.
   async function apply(ops) {
@@ -113,7 +150,9 @@ export async function openNotebook(dir) {
     const value = await rootValue();
     if (value.pending) {
       await apply(value.pending);
-      await db.update(root, { kind: "workspace", value: { ...value, pending: null } });
+      const sequence = value.sequence + 1;
+      await markChanges(value.pending, sequence);
+      await db.update(root, { kind: "workspace", value: { ...value, sequence, pending: null } });
     }
   }
   async function transact(ops) {
@@ -151,6 +190,7 @@ export async function openNotebook(dir) {
     title = titleOf(title);
     validateBlocks(blocks);
     const registered = await entries(root, "registry");
+    const registeredIds = new Set(registered.map((n) => n.id));
     const docs = registered.filter((n) => n.kind === "document");
     const docIds = new Set(docs.map((d) => d.id));
     const byTitle = new Map(docs.map((d) => [d.value.title.toLowerCase(), d.id]));
@@ -188,7 +228,10 @@ export async function openNotebook(dir) {
               title: href,
             });
             targets.add(target);
-            ops.push(register(target));
+            if (!registeredIds.has(target)) {
+              ops.push(register(target));
+              registeredIds.add(target);
+            }
           }
           content.push(span);
         }
@@ -200,7 +243,8 @@ export async function openNotebook(dir) {
           fail("Choose a text block to embed.");
         value.target = b.target;
       }
-      if (!same(previous.value, value)) ops.push(update(id, "block", value), register(id));
+      if (!same(previous.value, value)) ops.push(update(id, "block", value));
+      if (!registeredIds.has(id)) ops.push(register(id));
       await replace(ops, "links", id, [...targets]);
       await replace(ops, "embeds", id, value.target ? [value.target] : []);
     }
@@ -235,7 +279,7 @@ export async function openNotebook(dir) {
     }
     await db.update(root, {
       kind: "workspace",
-      value: { ready: true, pending: null, home: docs.get("noticing") },
+      value: { ...(await rootValue()), ready: true, home: docs.get("noticing") },
     });
   }
   await initialize();
@@ -244,18 +288,47 @@ export async function openNotebook(dir) {
     const registry = await entries(root, "registry");
     const grouped = (kind) => registry.filter((r) => r.kind === kind).map((r) => r.id);
     const nodes = {};
-    for (const [kind, hops] of [
-      ["document", ["blocks"]],
-      ["collection", ["members"]],
-      ["block", ["links", "embeds"]],
-      ["url", []],
-    ]) {
+    for (const [kind, hops] of Object.entries(edgeLists)) {
       for (const row of await read(grouped(kind), hops)) {
         nodes[row.id] = { id: row.id, kind, ...row.value };
         for (const name of hops) nodes[row.id][name] = row[name].map((r) => r.id);
       }
     }
-    return { home: (await rootValue()).home, nodes };
+    const value = await rootValue();
+    return { home: value.home, cursor: cursorOf(value), nodes };
+  }
+  async function changes(after) {
+    const cursor = parseCursor(after);
+    if (!cursor) fail("Invalid sync cursor.");
+    const { feedId, sequence: since } = cursor;
+    const value = await rootValue();
+    if (feedId !== value.feedId || since > value.sequence) fail("Fetch a new workspace snapshot.", 409);
+    const patches = {};
+    if (since !== value.sequence) {
+      const frames = [frame({ kind: "ids" })];
+      for (const part of parts) {
+        frames[0].children.push({ alias: part, frame: frames.length });
+        const changed = frame({ kind: "edge", atype: atype(marker(part)) });
+        // The Hlekk index sorts (time, db, id2) descending. All local IDs are
+        // positive, so this seeks past every marker at 'since' in one step.
+        changed.after = { time: -since, db: 0, id2: "0" };
+        frames.push(changed);
+        if (part !== "value") {
+          changed.children.push({ alias: "targets", frame: frames.length });
+          frames.push(frame({ kind: "edge", atype: atype(part) }));
+        }
+      }
+      const [rows] = await db.query({ frames }, [root]);
+      for (const row of rows.value) {
+        patches[row.id] = { value: { id: row.id, kind: row.kind, ...row.value } };
+      }
+      for (const part of parts.slice(1)) {
+        for (const row of rows[part]) {
+          (patches[row.id] ??= {})[part] = row.targets.map((target) => target.id);
+        }
+      }
+    }
+    return { cursor: cursorOf(value), patches };
   }
   async function command(c) {
     if (!c || typeof c !== "object") fail("Invalid notebook action.");
@@ -321,7 +394,13 @@ export async function openNotebook(dir) {
   }
   return {
     workspace: () => run(workspace),
-    command: (c) => run(() => command(c)),
+    changes: (after) => run(() => changes(after)),
+    command: (c, feedId) =>
+      run(async () => {
+        if (feedId && feedId !== (await rootValue()).feedId)
+          fail("The notebook changed. Reopen it before editing.", 409);
+        return command(c);
+      }),
     history: (id) =>
       run(async () =>
         (await entries(id, "history")).map(({ id, value }) => ({
