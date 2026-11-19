@@ -8,6 +8,7 @@ import { MAX_IDS, PUBLIC, enforce, planOf, serve, vocabularyOf } from "./serve.t
 import type { Policy, ReadRequest, ReadSource } from "./serve.ts";
 import type { QueryResult } from "./normalize.ts";
 import type { Plan } from "./types.ts";
+import { encodeToken } from "../schema/query.ts";
 
 // The design doc's own example, because it has the two shapes that matter: a stored edge with a
 // maintained count, and a field relationship that follows an id in a payload and stores nothing.
@@ -266,6 +267,19 @@ describe("refusing before any I/O", () => {
     }
     throw new Error("expected the request to be refused");
   };
+
+  it("refuses a cursor for a list another database holds, which no list served here is", async () => {
+    // Both are well formed, and are what a caller that follows edges out of a database hands on:
+    // another database's token, wrapped, and a place inside one of its pages. A host can place
+    // neither. The first was a fault and the second an empty page.
+    const elsewhere = encodeURIComponent("https://elsewhere.example/db#5");
+    for (const after of [encodeToken("v2:4:0:5"), `p1:2:${elsewhere}:`, `p1:2:${elsewhere}:${encodeToken("v2:4:0:5").slice(3)}`]) {
+      const { error, reached } = await refused({ ids: ["7"], hops: [{ edge: "issues.issue_comments", hops: [{ edge: "issues.comment_author" }] }, { edge: "issues.issue_comments", as: "again", after }] });
+      assert.equal(error.at, "hops[1]", after);
+      assert.match(error.message, /another database holds/);
+      assert.equal(reached, false);
+    }
+  });
 
   it("refuses an entry that is not a non-empty list of ids", async () => {
     for (const ids of [[], undefined, "7", [7]]) {

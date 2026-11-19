@@ -357,7 +357,40 @@ export function price(req: ReadRequest, opts: ServeOptions): Cost {
   // The names the answer will carry, against the aliasing this protocol uses. Separate from `check`,
   // which is shared with callers that derive their names differently.
   checkAliases(req, undefined, limits.maxDepth);
-  return check(req, vocabulary, limits, ids.length);
+  const cost = check(req, vocabulary, limits, ids.length);
+  ownCursors(req.hops, "");
+  return cost;
+}
+
+/**
+ * Refuses a cursor this database could not have handed out.
+ *
+ * `check` has decoded every `after`, so each one is well formed, and two of the well-formed kinds
+ * continue a list ANOTHER database holds: its token, wrapped, and a place inside one of its pages.
+ * Those are what a caller that follows edges out of a database gives its own callers. No list
+ * served here is one of those. A database answering a read follows nothing out of itself, so every
+ * list in its answer is its own and continues from its own sort key — which is why this is here
+ * and not in `check`, whose other callers do follow.
+ *
+ * Neither kind was refused, and a host cannot place either. The token was a fault, reported as
+ * this database breaking. The place in a page was worse: it read as a sort key at the very end of
+ * the list, and answered an empty page with nothing after it.
+ */
+function ownCursors(hops: Hop[] | undefined, at: string): void {
+  for (const [i, hop] of (hops ?? []).entries()) {
+    const path = `${at}hops[${i}]`;
+    if (hop.after !== undefined) {
+      const cursor = decodeCursor(hop.after);
+      if (cursor.token !== undefined || cursor.resume !== undefined) {
+        throw new Refused(
+          path,
+          "after continues a list another database holds, and every list served here is this database's own:" +
+            " continue from the cursor a page of this list returned",
+        );
+      }
+    }
+    ownCursors(hop.hops, `${path}.`);
+  }
 }
 
 /**
