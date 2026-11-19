@@ -340,6 +340,36 @@ describe("a list is a page", () => {
     assert.equal(err.at, "hops[0].after");
   });
 
+  it("keeps a reader's cursor and a database's apart, and each refuses the other's by its place", async () => {
+    // A request is the wire's own body in every member but this one. A page's cursor belongs to
+    // whoever returned the page: the database's is a sort key into a list it holds, and the
+    // reader's wraps that database's token. Handed across, each used to get past the check that
+    // should have refused it — here as a read that failed later with no place in the request, and
+    // there as a fault.
+    const { w, root } = await many();
+    const bare = root.slice(root.indexOf("#") + 1);
+    const post = (body: unknown) =>
+      w.f.fetch(`${PACKAGES}/read`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    const wire = (await (await post({ ids: [bare], hops: [{ edge: "packages.supersedes", limit: 2 }] })).json()) as {
+      lists: Record<string, { cursor: string }>;
+    };
+    const theirs = Object.values(wire.lists)[0]!.cursor;
+    for (const omit of [undefined, { databases: {} }]) {
+      const err = (await w.reader
+        .read(root, { hops: [{ edge: "packages.supersedes", limit: 2, after: theirs }] }, { omit })
+        .then(() => null, (e: Error) => e)) as Refused;
+      assert.ok(err instanceof Refused, String(err));
+      assert.equal(err.at, "hops[0].after");
+    }
+
+    const [row] = await w.reader.read(root, { hops: [{ edge: "packages.supersedes", as: "older", limit: 2 }] });
+    const ours = page(row, "older").cursor!;
+    const res = await post({ ids: [bare], hops: [{ edge: "packages.supersedes", limit: 2, after: ours }] });
+    assert.equal(res.status, 400);
+    assert.equal(((await res.json()) as { at: string }).at, "hops[0]");
+  });
+
   it("filters on the far side's fields", async () => {
     const { w, root } = await many();
     const [row] = await w.reader.read(root, {

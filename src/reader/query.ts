@@ -136,6 +136,11 @@ export class ReadBuilder<S = unknown> {
    *
    * It is what `Reader.read` takes, and the body `POST {db}/read` takes once its `ids` are added,
    * so a read written here can be stored, sent, priced or run by something else.
+   *
+   * With one member that stays the reader's: an `after`. A cursor belongs to whoever returned the
+   * page it came from, and a reader's page is not a database's — it continues from that database's
+   * token, wrapped, or from a place inside one of its pages. So a request that carries a reader's
+   * cursor runs on a reader, and a database refuses it as a reader refuses a database's.
    */
   request(): Request {
     return structuredClone(this.#request);

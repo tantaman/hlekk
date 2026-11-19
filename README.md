@@ -265,9 +265,12 @@ as data: {"counts":[{"as":"cited","edge":"notes.cites"}],"hops":[{"edge":"notes.
 ```
 
 - **A read is data.** `read.request()` is the body `POST {db}/read` takes, without its `ids`: the
-  same hops, counts, filters, limits and cursors, under the same rules, and refused the same way.
-  `db.reader.read(ref, request)` runs one directly, so a read can be stored, sent, or written by
-  something else. The chained form writes that request and can say nothing it cannot.
+  same hops, counts, filters and limits, under the same rules, and a mistake in one is refused with
+  its place in the request. `db.reader.read(ref, request)` runs one directly, so a read can be
+  stored, sent, or written by something else. The chained form writes that request and can say
+  nothing it cannot. The one member that does not travel is `after`: a cursor goes back to whoever
+  returned the page, so a reader's continues a read on a reader and a database's continues one on
+  that database, and each refuses the other's.
 - **A row is the object's fields beside `id`, `$type` and `$version`.** `id` is always a full
   reference. A hop comes back as a page: `{ items, cursor, more }`.
 - **Nothing is declared.** Each database is read by its own vocabulary, so one request may name edges

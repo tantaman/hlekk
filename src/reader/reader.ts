@@ -44,7 +44,7 @@ import { canonicalDb, formatRef, parseRef } from "../query/ref.ts";
 import type { Ref } from "../query/ref.ts";
 import { DEFAULT_HOP_LIMIT, OPS, PROTOCOL_ALIASING, Refused, checkAliases, countEdge } from "../query/request.ts";
 import type { Cmp, Cost, CountSpec, Hop, Request } from "../query/request.ts";
-import type { Cond, Frame, Id, Json, Miss, Plan, Source } from "../query/types.ts";
+import type { Cond, Cursor, Frame, Id, Json, Miss, Plan, Source } from "../query/types.ts";
 import { systemClock } from "../runtime/runtime.ts";
 import type { Clock } from "../runtime/runtime.ts";
 import { decodeCursor, pageEnd } from "../schema/query.ts";
@@ -407,9 +407,10 @@ export class Reader {
    * Reads objects by reference, and whatever the request hangs under them.
    *
    * The request is the body `POST {db}/read` takes, without its `ids`: the same hops, counts,
-   * filters, limits and cursors, under the same rules. What differs is that it does not stop at the
+   * filters and limits, under the same rules. What differs is that it does not stop at the
    * database it entered. A hop is asked of whichever database holds the object it starts from, so
-   * one request may name edges from several vocabularies.
+   * one request may name edges from several vocabularies. And a cursor is this reader's: the one a
+   * page of this list returned here, not the one a database's own answer carries (`cursorOf`).
    */
   async read(refs: Ref | readonly Ref[], request: Request = {}, opts: ReadOptions = {}): Promise<Row[]> {
     const roots = typeof refs === "string" ? [refs] : [...refs];
@@ -501,14 +502,31 @@ export class Reader {
   }
 }
 
-/** A cursor this reader handed back in an earlier page. One from anywhere else is refused here,
- *  with its place in the request, rather than reaching a database as a position it never gave. */
-function cursorOf(after: string, at: string) {
+/**
+ * A cursor this reader handed back in an earlier page. One from anywhere else is refused here,
+ * with its place in the request, rather than reaching a database as a position it never gave.
+ *
+ * That includes a cursor a database's own answer carries, which decodes and is still not one of
+ * these. It is a sort key into a list the process reading it holds, and a reader holds no list:
+ * every page it returns continues from the token of the database that does, wrapped, or from a
+ * place inside one of that database's pages. So a reader's cursor and a database's are not one
+ * string, in either direction, and the one request member that is not the wire's own is `after`.
+ */
+function cursorOf(after: string, at: string): Cursor {
+  let cursor: Cursor;
   try {
-    return decodeCursor(after);
+    cursor = decodeCursor(after);
   } catch (e) {
     throw new Refused(at, `${(e as Error).message}; a cursor is the one a page of this list returned`);
   }
+  if (cursor.token === undefined && cursor.resume === undefined) {
+    throw new Refused(
+      at,
+      "this is a database's own cursor, from an answer read off the wire, and a reader cannot place it;" +
+        " a cursor here is the one a reader's page of this list returned",
+    );
+  }
+  return cursor;
 }
 
 function condOf(where: Cmp[] | undefined, at: string): Cond | undefined {
