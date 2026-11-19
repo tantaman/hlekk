@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Two Ways to Shard SQLite</title>
+<meta name="description" content="hlekk's architecture read against Zerodha's Blobasaur: both spread data over many single-writer SQLite files, one under keys the client chooses and one under ids the database mints.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap">
+<style>
+:root{
+  --paper:#f2eee7;--panel:#fcfaf5;--white:#fff;
+  --ink:#171411;--ink-d:#5f564b;--ink-f:#746a5d;
+  --line:#d8cebc;--line2:#c7baa3;--dot:#d8d0bd;
+  --orange:#ff4d00;--orange-ink:#c23a00;--cobalt:#2a4ddb;--teal:#04756b;
+  --code-bg:#17140f;--code-edge:#2a251d;--code-fg:#e9e2d2;--code-dim:#9d927f;
+  --font-sans:'Hanken Grotesk',system-ui,sans-serif;
+  --font-mono:'DM Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#14120e;--panel:#1c1914;--white:#221e18;
+    --ink:#efe8da;--ink-d:#bdb19e;--ink-f:#9a8f7d;
+    --line:#352f26;--line2:#4a4236;--dot:#2c271f;
+    --orange:#ff6a2b;--orange-ink:#ff8a57;--cobalt:#8ea2ff;--teal:#4cc2b3;
+    --code-bg:#0d0b08;--code-edge:#2a251d;--code-fg:#e9e2d2;--code-dim:#8f8572;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#14120e;--panel:#1c1914;--white:#221e18;
+  --ink:#efe8da;--ink-d:#bdb19e;--ink-f:#9a8f7d;
+  --line:#352f26;--line2:#4a4236;--dot:#2c271f;
+  --orange:#ff6a2b;--orange-ink:#ff8a57;--cobalt:#8ea2ff;--teal:#4cc2b3;
+  --code-bg:#0d0b08;--code-edge:#2a251d;--code-fg:#e9e2d2;--code-dim:#8f8572;
+  color-scheme:dark;
+}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--font-sans);
+  font-size:18px;line-height:1.62;-webkit-font-smoothing:antialiased}
+a{color:var(--cobalt);text-underline-offset:2px;text-decoration-thickness:1px}
+a:hover{text-decoration-thickness:2px}
+::selection{background:var(--orange);color:#fff}
+
+/* ---- masthead: the project's dot-grid paper, brand mark and orange accent */
+.mast{border-bottom:1px solid var(--line);
+  background-image:radial-gradient(var(--dot) 1.1px,transparent 1.1px);background-size:26px 26px}
+.mast-in{max-width:760px;margin:0 auto;padding:28px 16px 44px}
+.brand{display:inline-flex;align-items:center;gap:11px;color:var(--ink);text-decoration:none}
+.mark{width:20px;height:20px;border-radius:6px;border:2px solid var(--ink);position:relative;flex:none}
+.mark::after{content:"";position:absolute;right:-4px;bottom:-4px;width:8px;height:8px;border-radius:50%;background:var(--orange)}
+.brand span{font-family:var(--font-mono);font-size:17px;font-weight:500;letter-spacing:-.01em}
+.eyebrow{font-size:13px;letter-spacing:.2em;text-transform:uppercase;color:var(--orange-ink);margin:40px 0 12px;font-weight:600}
+h1{font-weight:800;font-size:clamp(36px,7vw,54px);line-height:1.04;letter-spacing:-.025em;margin:0 0 18px;max-width:18ch}
+.dek{font-size:clamp(18px,2.6vw,21px);line-height:1.5;color:var(--ink-d);margin:0;max-width:40ch}
+.byline{font-family:var(--font-mono);font-size:13.5px;color:var(--ink-f);margin-top:22px;letter-spacing:.01em}
+.byline a{color:inherit}
+
+/* ---- article */
+main{max-width:760px;margin:0 auto;padding:8px 16px 80px}
+main > p, main > ul, main > ol{max-width:68ch}
+h2{font-size:clamp(25px,3.6vw,30px);line-height:1.15;letter-spacing:-.018em;font-weight:800;margin:64px 0 14px}
+h2 .n{font-family:var(--font-mono);font-weight:400;font-size:.55em;color:var(--orange-ink);vertical-align:.35em;margin-right:10px;letter-spacing:0}
+h3{font-size:19px;font-weight:700;margin:34px 0 8px;letter-spacing:-.005em}
+p{margin:0 0 18px}
+ul,ol{padding-left:24px;margin:0 0 20px}
+li{margin:0 0 8px}
+li::marker{color:var(--ink-f)}
+strong{font-weight:700}
+code{font-family:var(--font-mono);font-size:.86em;background:var(--white);border:1px solid var(--line);
+  border-radius:5px;padding:.08em .34em;overflow-wrap:anywhere}
+pre code{white-space:pre;background:none;border:0;padding:0;font-size:inherit}
+pre{font-family:var(--font-mono);font-size:13.5px;line-height:1.6;background:var(--code-bg);color:var(--code-fg);
+  border:1px solid var(--code-edge);border-radius:10px;padding:16px 18px;margin:0 0 8px;overflow-x:auto}
+pre .c{color:var(--code-dim)}
+.cap{font-size:14.5px;color:var(--ink-f);margin:0 0 24px;line-height:1.5}
+.lede{font-size:20px;line-height:1.58}
+.lede:first-of-type{margin-top:40px}
+blockquote{margin:24px 0;padding:2px 0 2px 20px;border-left:3px solid var(--orange);font-size:20px;line-height:1.5;color:var(--ink)}
+blockquote p{margin:0}
+hr{border:0;border-top:1px solid var(--line);margin:56px 0}
+
+/* ---- tables */
+.tw{overflow-x:auto;margin:6px 0 10px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:15px;line-height:1.45}
+th,td{text-align:left;vertical-align:top;padding:10px 14px;border-bottom:1px solid var(--line)}
+tr:last-child td,tr:last-child th{border-bottom:0}
+thead th{font-size:12.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-f);font-weight:600;background:var(--white)}
+tbody th{font-weight:600;color:var(--ink-d);white-space:nowrap}
+td.num,th.num{text-align:right;font-family:var(--font-mono);font-size:14px;white-space:nowrap}
+.glance td{min-width:200px}
+.glance td:first-of-type{border-right:1px solid var(--line)}
+
+/* ---- the routing figure, as HTML so it reflows on a phone */
+.routes{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:28px 0 8px}
+.lane{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 18px 20px}
+.lane h4{margin:0 0 14px;font-family:var(--font-mono);font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-f);font-weight:500}
+.node{background:var(--white);border:1px solid var(--line2);border-radius:8px;padding:9px 12px;
+  font-family:var(--font-mono);font-size:15px;font-weight:500}
+.node span{display:block;font-family:var(--font-sans);font-weight:400;font-size:13.5px;color:var(--ink-f);margin-top:1px}
+.edge{position:relative;margin-left:22px;padding:12px 0 14px 22px;border-left:2px solid var(--line2);
+  font-family:var(--font-mono);font-size:13px;color:var(--ink-d);line-height:1.45}
+.edge::after{content:"";position:absolute;left:-7px;bottom:0;border:6px solid transparent;border-top:8px solid var(--line2);border-bottom:0}
+.edge em{display:block;font-style:normal;font-family:var(--font-sans);font-size:13.5px;font-weight:600;margin-top:3px}
+.edge.hot{border-left-color:var(--orange)}
+.edge.hot::after{border-top-color:var(--orange)}
+.edge.hot em{color:var(--orange-ink)}
+.edge.cool{border-left-color:var(--teal)}
+.edge.cool::after{border-top-color:var(--teal)}
+.edge.cool em{color:var(--teal)}
+@media (max-width:640px){
+  body{font-size:17px}
+  .routes{grid-template-columns:1fr}
+  .lede{font-size:18.5px}
+  blockquote{font-size:18px}
+}
+
+/* ---- the id layout strip */
+.bits{display:grid;grid-template-columns:28px 16fr 47fr;border:1px solid var(--line2);border-radius:8px;overflow:hidden;
+  font-family:var(--font-mono);font-size:13px;margin:22px 0 8px;background:var(--white)}
+.bits div{padding:10px 10px 9px;border-right:1px solid var(--line2);min-width:0}
+.bits div:last-child{border-right:0}
+.bits b{display:block;font-weight:500;font-size:14px;color:var(--ink)}
+.bits i{font-style:normal;color:var(--ink-f);font-size:12px}
+.bits .v{background:color-mix(in srgb,var(--orange) 12%,var(--white))}
+.bits .r{writing-mode:vertical-rl;transform:rotate(180deg);text-align:center;padding:8px 4px;font-size:11px;color:var(--ink-f)}
+
+/* ---- footer */
+.notes{font-size:15px;color:var(--ink-d);line-height:1.55}
+.notes p{max-width:68ch}
+footer{border-top:1px solid var(--line);margin-top:24px}
+footer .in{max-width:760px;margin:0 auto;padding:24px 16px 48px;font-family:var(--font-mono);font-size:13px;color:var(--ink-f)}
+footer a{color:inherit}
+</style>
+</head>
+<body>
+
+<header class="mast">
+  <div class="mast-in">
+    <a class="brand" href="https://github.com/tantaman/hlekk"><i class="mark" aria-hidden="true"></i><span>hlekk</span></a>
+    <div class="eyebrow">Architecture</div>
+    <h1>Two ways to shard SQLite</h1>
+    <p class="dek">Zerodha's Blobasaur and hlekk both spread data over many SQLite files with one writer each. Blobasaur stores blobs under keys the client chooses. Hlekk stores a graph under ids the database mints. Most of their other differences follow from that.</p>
+    <div class="byline">19 Nov 2026 · a reading of <a href="https://zerodha.tech/blog/high-performance-distributed-blob-storage/">“Distributed, high-performance blob storage on SQLite”</a></div>
+  </div>
+</header>
+
+<main>
+
+<p class="lede">Zerodha's tech blog has a good write-up of Blobasaur, the store behind the charts, layouts and preferences that Kite's users save. It's a sharded blob server on SQLite, written in Rust and speaking the Redis Cluster protocol. In production it serves reads and writes at a p99 of about 2&nbsp;ms on three 4-vCPU machines. If you haven't read it, read it first, because this post follows its sections one by one.</p>
+
+<p>Hlekk is built from the same parts. A database is many SQLite files, each file has exactly one writer, and a routing layer above them says which file holds what. What it stores is different. Hlekk is a TAO-style graph database: typed objects with JSON payloads, plus typed edges between them that are ordered by time and counted. A read starts from objects you already hold and follows edges as a tree of hops. It runs on Cloudflare Durable Objects, or in one Node process over a directory of files.</p>
+
+<p>Read the two designs side by side and most decisions turn on one question: <strong>who names the data?</strong></p>
+
+<blockquote><p>In Blobasaur the client does. <code>HSET prefs user42 …</code> stores under a key the application already had, and the server hashes that key to find it a place. In hlekk the database does. <code>create</code> returns an id, the id says where the object lives, and the application keeps it.</p></blockquote>
+
+<p>The rest of this post follows that split through sharding, schema, durability and rebalancing, and through the bugs each team hit.</p>
+
+<h2><span class="n">00</span>At a glance</h2>
+
+<div class="tw">
+<table class="glance">
+<thead><tr><th></th><th>Blobasaur</th><th>hlekk</th></tr></thead>
+<tbody>
+<tr><th>Stores</th><td>Opaque blobs, mostly JSON, from a few KB to several MB</td><td>Typed objects (JSON, up to 2&nbsp;MB) and typed edges, ordered and counted</td></tr>
+<tr><th>Addressed by</th><td>A key the client chooses</td><td>A 64-bit id the database mints</td></tr>
+<tr><th>Key to shard</th><td>A hash: CRC16 to one of 16,384 slots, then multi-probe consistent hashing to a file</td><td>A bit shift: the id's high 16 bits are its vshard</td></tr>
+<tr><th>Shard to machine</th><td>Slot ranges in static config, gossip, <code>MOVED</code></td><td>A directory table with epochs, cached by readers. The owner answers <code>moved</code></td></tr>
+<tr><th>Writers</th><td>One writer task per file, with group commit</td><td>One actor per host, one transaction per mutation</td></tr>
+<tr><th>Durability</th><td><code>synchronous = NORMAL</code>, with an optional ack before commit</td><td>Replies only after the commit is durable</td></tr>
+<tr><th>Compression</th><td>zstd, about 11x on average</td><td>None</td></tr>
+<tr><th>Expiry</th><td>Per-key TTL</td><td>None</td></tr>
+<tr><th>Changing shard count</th><td>Offline. About 20% of keys move</td><td>Never happens. Whole vshards move between hosts, online</td></tr>
+<tr><th>Interface</th><td>Redis and Redis Cluster</td><td>A typed client for writes. An HTTP read protocol with a spec</td></tr>
+<tr><th>Written in</th><td>Rust, one static binary</td><td>TypeScript, no runtime dependencies</td></tr>
+<tr><th>Status</th><td>In production for Kite</td><td>Version 0.1.0. Measured on deployed Durable Objects, no production users</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="n">01</span>What each one needed</h2>
+
+<p>Blobasaur's list: Redis compatibility, so the existing Go and Python clients don't change. Single-digit-millisecond latency for both 2&nbsp;KB settings and 5&nbsp;MB chart layouts. Built-in compression. Simple CRUD with TTLs. Partitioning across machines. And relaxed durability, because the data is UI state: losing a recent write is “annoying” but “never affects trading.”</p>
+
+<p>Hlekk's list, from its <a href="https://github.com/tantaman/hlekk/blob/main/docs/design.md">design document</a>: stable 64-bit ids that survive moves between hosts and regions. Graph reads in as few network round trips as the data's locality allows. A database that grows from one host to many with no change to the application. Transactions within a colocation group, and inverse edges that are guaranteed to arrive eventually. And a small database that costs exactly one host.</p>
+
+<p>Both lists keep the API small, for the same reason. Blobasaur rules out server-side scripting, complex data structures and secondary queries. Hlekk rules out scans, ad-hoc joins and arbitrary SQL. An operation that names its key, or its id, can be routed to exactly one place.</p>
+
+<p>The lists part ways on durability and on what “grow” means. Blobasaur's data can afford to lose a recent write and hlekk's can't, for reasons covered under <a href="#durability">Durability</a>. Blobasaur grows when an operator adds shards or nodes. Hlekk is meant to grow without anyone deciding to, which is why its shard layout is fixed when the database is created.</p>
+
+<h2><span class="n">02</span>Why SQLite</h2>
+
+<p>Both teams picked SQLite because it already does the hard parts of a storage engine: atomic commits, crash recovery and B-trees. You can also open any shard with the <code>sqlite3</code> CLI to see what's in it. Blobasaur adds a performance argument: SQLite beats raw files for small blobs, and compressing first keeps 99% of stored values under the ~100&nbsp;KiB point where raw files start to win.</p>
+
+<p>Hlekk chose SQLite indirectly. What it chose was actors with durable local storage, and on Cloudflare a Durable Object's storage is SQLite. The design depends on two things the actor provides: one SQLite database per host, and one request at a time. The engine reaches storage through a small <code>Sql</code> interface (synchronous statements, one local transaction, and a size figure), so the Node adapter replaces a Durable Object's database with a file and changes nothing above it.</p>
+
+<p>On language, Blobasaur left Go for Rust because Go's SQLite driver needs cgo, pins OS threads and adds GC pressure on multi-megabyte buffers. The result is a static binary with predictable memory. Hlekk is TypeScript with no runtime dependencies. The platform it was designed for runs JavaScript, and Node 22 ships <code>node:sqlite</code>. Hlekk's rows are capped at 2&nbsp;MB, so multi-megabyte buffers on every request aren't its problem.</p>
+
+<h2><span class="n">03</span>Splitting data into shards</h2>
+
+<p>Blobasaur hashes twice. <code>CRC16(key) % 16384</code> picks a Redis Cluster slot, and the slot picks a machine. Inside the machine, multi-probe consistent hashing picks one of N SQLite files. Each file has a dedicated writer task fed by a bounded queue, and a pool of read-only connections runs reads alongside it in WAL mode.</p>
+
+<p>Hlekk doesn't hash anything, because an object's location is part of its id:</p>
+
+<div class="bits" role="img" aria-label="A 64-bit id: bit 63 reserved, bits 62 to 47 the vshard, bits 46 to 0 the sequence">
+  <div class="r">63</div>
+  <div class="v"><b>vshard</b><i>bits 62–47 · 16 bits</i></div>
+  <div><b>sequence</b><i>bits 46–0 · 47 bits, allocated per vshard</i></div>
+</div>
+<p class="cap">Bit 63 is always zero, which keeps every id below 2<sup>63</sup>. Above that, SQLite turns an integer into a float and two different ids can compare equal. Ids are stored as 8-byte big-endian BLOBs.</p>
+
+<p>Finding an object's vshard is a bit shift. Finding the host that holds the vshard is a binary search in a cached shard map. One host holds many vshards, and by default a new database starts with 64 vshards on a single host. So hlekk also routes in two steps. The difference is that its second step is a table rather than a function, and that's what makes moving data an online operation.</p>
+
+<div class="routes" role="figure" aria-label="How each system gets from a name to a SQLite file">
+  <div class="lane">
+    <h4>Blobasaur</h4>
+    <div class="node">key<span>chosen by the client</span></div>
+    <div class="edge">CRC16(key) mod 16384</div>
+    <div class="node">slot<span>one of 16,384</span></div>
+    <div class="edge">slot ranges in static config</div>
+    <div class="node">node<span>one machine</span></div>
+    <div class="edge hot">consistent hash over N files<em>changing N is an offline migration</em></div>
+    <div class="node">shard file<span>one writer task, group commit</span></div>
+  </div>
+  <div class="lane">
+    <h4>hlekk</h4>
+    <div class="node">id<span>minted by the database</span></div>
+    <div class="edge">high 16 bits, a shift</div>
+    <div class="node">vshard<span>64 by default, up to 65,536</span></div>
+    <div class="edge cool">shard map row: host and epoch<em>a move rewrites this row, online</em></div>
+    <div class="node">host<span>one actor, one request at a time</span></div>
+    <div class="edge">always the host's own file</div>
+    <div class="node">SQLite<span>many vshards, one writer</span></div>
+  </div>
+</div>
+<p class="cap">The step marked in orange is a function of the key, so changing it moves keys. The step marked in teal is a row in a table, so changing it moves one vshard and leaves every other one where it is.</p>
+
+<p>What the id costs you is the ability to store an object under a key you chose. Zerodha's post gives exactly this as one reason it turned down SeaweedFS, which assigns its own ids and so needs a separate database to map them back to user keys. For Blobasaur that would put a second lookup on every read, since every read is by key.</p>
+
+<p>Hlekk makes that trade deliberately and keeps the mapping inside the database: a global unique index, sharded by <code>hash(value)</code>, whose entries are reserved first and confirmed once the object exists. The trade works for a graph because most reads never touch the index. You use it once to find where to start, and from there each edge carries the id of the next object.</p>
+
+<p>In return, no object needs a lookup to find its shard, and a stale route gets corrected instead of returning a wrong answer. Because the vshard sits in the high bits, one vshard's rows form one contiguous key range in every table, so a move can copy a range without needing an index.</p>
+
+<p>The sequence got most of the bits because it's the one field that can never be widened later: widening it would shift the vshard field and change the meaning of every id already minted. At 100,000 creates a second into one vshard (a bulk import, say), a 40-bit sequence runs out in about four months. A 47-bit one lasts about 45 years.</p>
+
+<h2><span class="n">04</span>How much sharding helps</h2>
+
+<p>In Blobasaur's benchmark, going from one shard file to sixteen on a single machine raised write throughput from 7,740 to 25,324 HSET/s. Reads barely moved, from 67,128 to 70,884 HGET/s, because WAL already let readers run alongside the writer. Shard files are how Blobasaur gets write concurrency on one machine.</p>
+
+<p>In hlekk, vshards aren't a concurrency mechanism. All the vshards on a host share one actor, and the actor handles one request at a time. A Durable Object has a soft limit of about 1,000 requests a second. Hlekk gets more write concurrency by adding hosts, and uses vshards as the unit that moves between them. A vshard is closer to a Redis Cluster slot than to a Blobasaur shard file.</p>
+
+<p>The two designs reached the same conclusion about commits. Blobasaur's writer takes a batch off its queue and commits it in one <code>BEGIN IMMEDIATE … COMMIT</code>. Hlekk commits each mutation in its own transaction. That's right for an application's write and wrong for a bulk load, as loading Simple English Wikipedia showed. Measured on one host over real SQLite, writing 20,000 edges:</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Backing</th><th class="num">One commit per edge</th><th class="num">1,000 edges per commit</th></tr></thead>
+<tbody>
+<tr><td>File-backed SQLite</td><td class="num">791/s</td><td class="num">95,080/s</td></tr>
+<tr><td>Durable Object SQLite on workerd, through the ingest endpoint</td><td class="num">525/s</td><td class="num">4,425/s</td></tr>
+</tbody>
+</table>
+</div>
+<p class="cap">From <a href="https://github.com/tantaman/hlekk/blob/main/docs/wikimedia-demo.md">docs/wikimedia-demo.md</a>. A deployed host measured about 570 edges a second one at a time, close to the workerd figure.</p>
+
+<p>So <code>assocAddMany</code> writes many edges in one transaction. With it, the full load of 950,421 pages and 42,817,596 edges onto 43 deployed hosts took 21.1 minutes, at 33,832 edge writes a second across all hosts.</p>
+
+<p>These numbers don't compare with Blobasaur's. Blobasaur's benchmark ran on tmpfs with the load generator on the same laptop, while hlekk's go over a network to Durable Objects. What carries over is the lesson: the commit is the expensive part, so batch it.</p>
+
+<p>Hlekk has a placement question that Blobasaur doesn't. A hash has no locality to lose, and a blob store doesn't need any, since one GET reads one key. A graph read touches many objects, so placing related objects on the same host can save requests. On the Wikipedia link graph, the saving turned out to be small:</p>
+
+<ul>
+  <li>Placing each page by its first category, instead of by a hash of its title, cut the hosts that one page's links touched from 34.2 to 27.0 out of 43. That's 1.27x.</li>
+  <li>The same placement put 20.9% of all edges on one host. The loader keeps one batch in flight per host, so ingest ran 4.8x slower.</li>
+</ul>
+
+<p>A page's categories describe the page, but its links point away from it, so there's little to colocate. For this graph, placing for locality cost a lot on writes and saved little on reads.</p>
+
+<h2><span class="n">05</span>Schema</h2>
+
+<p>A Blobasaur shard, from the columns its post lists:</p>
+
+<pre><code>CREATE TABLE blobs (
+  key        TEXT PRIMARY KEY,
+  data       BLOB,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER,
+  version    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_expires_at ON blobs(expires_at) WHERE expires_at IS NOT NULL;
+<span class="c">-- plus one blobs_&lt;namespace&gt; table per HSET namespace: HSET prefs … writes blobs_prefs</span></code></pre>
+<p class="cap">Reconstructed from the post's description, not copied from Blobasaur's source.</p>
+
+<p>A hlekk host, from <a href="https://github.com/tantaman/hlekk/blob/main/src/host/schema.ts"><code>src/host/schema.ts</code></a>, trimmed:</p>
+
+<pre><code>CREATE TABLE objects (
+  id      BLOB PRIMARY KEY,        <span class="c">-- 8-byte big-endian u64</span>
+  otype   INTEGER NOT NULL,
+  version INTEGER NOT NULL,
+  data    TEXT NOT NULL            <span class="c">-- JSON, at most 2 MB</span>
+) WITHOUT ROWID;
+
+CREATE TABLE assocs (
+  id1   BLOB NOT NULL,
+  atype INTEGER NOT NULL,
+  db    INTEGER NOT NULL DEFAULT 0, <span class="c">-- 0 is this database; otherwise another one</span>
+  id2   BLOB NOT NULL,
+  time  INTEGER NOT NULL,           <span class="c">-- sort key: newest first</span>
+  data  TEXT,
+  PRIMARY KEY (id1, atype, db, id2)
+) WITHOUT ROWID;
+CREATE INDEX assocs_range ON assocs (id1, atype, time);
+
+CREATE TABLE assoc_counts (id1 BLOB, atype INTEGER, n INTEGER, PRIMARY KEY (id1, atype)) WITHOUT ROWID;
+CREATE TABLE vshards (vshard INTEGER PRIMARY KEY, epoch INTEGER, state TEXT, next_seq INTEGER);
+CREATE TABLE outbox (vshard INTEGER, seq INTEGER, target_vshard INTEGER, op TEXT,
+                     PRIMARY KEY (vshard, seq)) WITHOUT ROWID;
+<span class="c">-- and index_entries, for global unique lookups</span></code></pre>
+
+<p>Three differences matter.</p>
+
+<p><strong>Ids are 8-byte big-endian BLOBs, not integers.</strong> Big-endian bytes sort in numeric order, so one vshard is one contiguous range of the primary key. On Durable Objects an INTEGER column comes back as a JavaScript number and rounds silently above 2<sup>53</sup>. If a BLOB misses a conversion, it fails loudly instead.</p>
+
+<p><strong>One table for every object type.</strong> Blobasaur gives each HSET namespace its own table, which fits well when the namespace is the only structure there is. Hlekk stores every object type in one <code>objects</code> table with a JSON payload, and its schema catalog works as a lens over that JSON. Seven of the eleven kinds of schema change it supports touch no rows at all, including adding a type, removing a field and renaming one. With a table per type, each of those would become DDL on every host, and a vshard would no longer be one key range across a fixed set of tables.</p>
+
+<p><strong>Counts are rows.</strong> <code>COUNT(*)</code> over a million-edge list is O(n), so <code>assoc_counts</code> is updated in the same transaction as the edge write.</p>
+
+<p>On indexes, Blobasaur's single partial index on <code>expires_at</code> is the right size, and rows without a TTL cost it nothing. Hlekk measured what happens when a shared table collects many partial indexes, as it would if every team added one per type. SQLite checks every partial index's <code>WHERE</code> clause on every row written, whatever the row's type:</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Partial indexes on one table</th><th class="num">0</th><th class="num">64</th><th class="num">256</th><th class="num">1,024</th></tr></thead>
+<tbody>
+<tr><td>Microseconds per insert</td><td class="num">1.1</td><td class="num">15.7</td><td class="num">128.3</td><td class="num">3,257</td></tr>
+</tbody>
+</table>
+</div>
+<p class="cap">SQLite 3.45.1, in memory, inserts only. The shape carries to other builds; the absolute figures may not.</p>
+
+<p>At 1,024 indexes, one insert takes about 3.3&nbsp;ms, which limits a single-threaded host to about 300 writes a second. So hlekk keeps index entries as rows in an <code>index_entries</code> table. The write path already knows the object's type, so it writes only that type's entries.</p>
+
+<h2><span class="n">06</span>Compression</h2>
+
+<p>Blobasaur compresses with zstd. An average payload of 63.6&nbsp;KiB is stored in 5.5&nbsp;KiB, about 11x smaller. The post also does the page arithmetic: at SQLite's default 4&nbsp;KiB page, that value shrinks from about 16 pages to about 2, which eases pressure on the page cache and the WAL.</p>
+
+<p>Hlekk compresses nothing, because its rows are small. Across all 43.8 million rows of the Simple English Wikipedia load, storage came to 61.5 bytes per row and 2.69&nbsp;GB in total. That's 1.04x what the payload sizes alone predict.</p>
+
+<p>Hlekk had to do page arithmetic too, for a different reason. Each vshard is capped at 9&nbsp;GB, just under a Durable Object's 10&nbsp;GB storage limit. The cap only works if it's measured the same way the limit is enforced, and adding up payload sizes undercounted real storage by 1.05x to 4.7x. A payload sum misses keys, indexes and page overhead. It also misses overflow: a <code>WITHOUT ROWID</code> row too big for its page spills onto an overflow page and costs a whole page. At 4,096-byte pages, a 980-byte object cost 1.03&nbsp;KB and a 1,000-byte object cost 4.7&nbsp;KB. So hlekk compares <code>page_count × page_size</code> against the limit.</p>
+
+<p>The 2&nbsp;MB row cap is also the plainest reason not to use hlekk for Kite's workload. A 5&nbsp;MB chart layout doesn't fit in one object.</p>
+
+<h2 id="durability"><span class="n">07</span>Durability</h2>
+
+<p>Blobasaur relaxes durability on purpose. It runs WAL with <code>synchronous = NORMAL</code>, so a power loss can drop recent commits while leaving each file consistent. Its optional <code>async_write</code> mode goes further and acknowledges a write as soon as it's queued, before the batch commits. For UI preferences that's a reasonable call.</p>
+
+<p>Hlekk can't make that call, because its writes depend on each other. A single mutation commits the ownership check, the object or edge, the edge count, and any outbox row for the inverse edge, all in one local transaction. The host replies only after that commit is durable. On Durable Objects that's the platform's storage. The Node adapter sets no pragmas at all, so every commit gets SQLite's defaults: a rollback journal and <code>synchronous = FULL</code>.</p>
+
+<p>Losing a recent write in hlekk could break two things:</p>
+
+<ul>
+  <li><strong>Half of an edge pair.</strong> When an edge's inverse lives on another host, the forward edge and an outbox row commit together, and an alarm delivers the row later. Delivery is ordered per pair of vshards and safe to repeat: an add is an upsert and a remove only deletes what's there. That survives a crash only because the outbox row is part of the same durable commit as the edge.</li>
+  <li><strong>A minted id.</strong> Ids get handed out and stored in other objects. Through hlekk's protocol they're also stored in other people's databases, as references like <code>https://notes.example/db#281474976710691</code>. If an acknowledged id were lost, it could be minted again for a different object.</li>
+</ul>
+
+<p>Hlekk has a durability gap of its own, in the client rather than in storage. When a write lands but its reply is lost, the caller can't tell. Every mutation except <code>create</code> can be retried blindly. An edge add is an upsert, a remove only deletes what's there, and an update that carries the version it read comes back as a conflict. A retried <code>create</code> would make a second object, so the client reports the error instead of retrying. Whether <code>create</code> needs an idempotency key is still an open question.</p>
+
+<h2><span class="n">08</span>Scaling across machines</h2>
+
+<p>This is where the two designs come closest. Redis Cluster pre-shards the key space into 16,384 fixed slots and assigns slot ranges to nodes. A node asked about a slot it doesn't own answers <code>MOVED</code>. Hlekk pre-shards each database into vshards (64 by default, up to 65,536) and assigns them to hosts. A host asked about a vshard it doesn't own answers <code>moved</code>. Both put many small, fixed units behind a table, and both correct a stale route with a redirect rather than a wrong answer.</p>
+
+<p>The differences are in who keeps the table:</p>
+
+<ul>
+  <li><strong>One directory per database, not gossip.</strong> Each hlekk database has a directory that maps every vshard to a host and an epoch. It publishes the map in chunks, to Workers KV on Cloudflare or to a file on Node, and each reader caches only the chunks it has routed through. Even fully fragmented at 65,536 vshards, the map is about 786&nbsp;KB.</li>
+  <li><strong>Epochs, checked by the owner.</strong> Every request carries the epoch it routed with. The host compares that epoch with its own <code>vshards</code> row and refuses on a mismatch. The refusal doesn't say who the new owner is, so the caller asks the directory, which is the authority. A route is only ever a hint, and the owning host makes the decision.</li>
+  <li><strong>The table changes at runtime.</strong> Blobasaur's slot assignment is static config, and its post says live rebalancing and automatic failover aren't built yet. Hlekk's map changes whenever the directory moves a vshard or opens new ones.</li>
+</ul>
+
+<p>Neither system replicates data itself. Blobasaur's post doesn't describe a replication scheme. Hlekk leaves the durability and availability of a host's storage to the platform on Cloudflare. On Node it's one process over a directory, which you back up. Regional read followers are on hlekk's deferred list.</p>
+
+<h2><span class="n">09</span>Changing the number of shards</h2>
+
+<p>Blobasaur chose multi-probe consistent hashing so that going from 4 shard files to 5 moves about 20% of keys, instead of the ~80% that <code>hash % n</code> would move. The change is offline: stop the server, run <code>blobasaur shard migrate 4 5 --verify</code>, set <code>num_shards</code>, and start it again.</p>
+
+<p>Hlekk never changes the mapping from an id to a vshard, because no function computes it. The design principle is “move, never split.” Capacity comes from moving whole vshards between hosts and from opening new vshards for new objects. An existing vshard is never divided. A move is a five-step state machine that the directory drives and resumes after a crash:</p>
+
+<ol>
+  <li><strong>Fence.</strong> The source host marks the vshard <code>fenced</code>. It refuses writes and keeps serving reads.</li>
+  <li><strong>Copy.</strong> The target host pulls the vshard's key range from each table, with its outbox rows and its <code>vshards</code> row.</li>
+  <li><strong>Install.</strong> The target marks the vshard <code>owned</code> at epoch + 1.</li>
+  <li><strong>Flip.</strong> The directory compare-and-sets the route to the target at epoch + 1.</li>
+  <li><strong>Retire.</strong> The source marks the vshard <code>moved</code>, answers <code>moved</code> from then on, and deletes the rows after a grace period.</li>
+</ol>
+
+<p>Writes to that one vshard pause while it's copied. Reads keep working, and no other vshard is affected.</p>
+
+<p>A placement controller in the directory watches each host's bytes and request rate. When a host crosses a threshold, the controller sheds a contiguous run of its vshards, so each move adds only one entry to the map. New objects go to an active set of vshards. A vshard leaves that set at half its cap and saves the other half for objects created alongside ones already in it. When the active set runs out, the allocator opens the next batch of vshards together (64 by default) and spreads them across hosts, so new writes don't all land on one host.</p>
+
+<p>Blobasaur's approach is simpler and works today at its scale. Hlekk's has more moving parts and a known ceiling. The copy is stop-the-world for its vshard, and today the snapshot is built as one in-memory object and installed in a single transaction. On a Durable Object that limits a move to a few hundred megabytes, well short of the 9&nbsp;GB cap. A larger move fails and leaves the vshard fenced. Chunking the snapshot is on the list of work still owed.</p>
+
+<p>Blobasaur already has hlekk's answer, one level up. Redis Cluster's slots can move between nodes without rehashing a single key, because a slot is a fixed unit behind a table. Blobasaur hasn't built live slot moves yet, but the protocol allows them. The offline step comes from the level inside a node, where a consistent hash maps keys to N files. If a node's files held slot ranges instead, changing how many files a node has would be just another slot move.</p>
+
+<h2><span class="n">10</span>Proving the move was safe</h2>
+
+<p>Blobasaur moved off SSDB in phases. New workloads went straight to Blobasaur. Existing workloads then wrote to both stores for a month, with historical keys backfilled and reads falling back to SSDB on a miss, before the final cutover. The result was “zero discrepancies.” A month of production traffic checked against the old store is a strong test.</p>
+
+<p>Hlekk has no predecessor to check against, so its test suite builds its own references. There are four kinds, across 675 tests:</p>
+
+<ul>
+  <li><strong>A differential oracle.</strong> A query over a database spread across hosts must equal the same query against one host that holds every vshard. It's fuzzed over random graphs, queries and schemas.</li>
+  <li><strong>A reference model.</strong> The write path, rebuilt in one process with no vshards, epochs or outbox, so every inverse edge and cascade lands immediately. Replaying the same workload into both catches a count that drifted or a cascade that stopped early.</li>
+  <li><strong>Invariants across the whole cluster</strong>, checked during operations and at rest. For example: exactly one host serves each vshard, at the epoch the directory names, and every count equals the length of the list it counts.</li>
+  <li><strong>A seeded simulation</strong> that interleaves writes, reads, partial outbox delivery, moves, moves that crash partway, rebalancing, and a network that drops and reorders messages.</li>
+</ul>
+
+<p>Storage format changes work the same way. There's no in-place upgrade. Moving a vshard onto a host that uses the new format is the migration.</p>
+
+<h2><span class="n">11</span>What both teams learned</h2>
+
+<p>Each of Blobasaur's three lessons has a close counterpart in hlekk, and two of them are the same lesson.</p>
+
+<h3>Deletes don't shrink SQLite files</h3>
+
+<p>Blobasaur found freed pages piling up on SQLite's freelist. It fixed this with <code>auto_vacuum = INCREMENTAL</code>, a vacuum subcommand and a WAL checkpoint. Hlekk doesn't vacuum yet. Instead it budgets for the freelist: the 9&nbsp;GB vshard cap leaves 1&nbsp;GB of a host's 10&nbsp;GB for things no vshard owns, including the freelist that deletes and retired vshards leave behind. A host also starts shedding at 8&nbsp;GB, so the controller can act before a write hits <code>SQLITE_FULL</code>. Because size is measured in pages, the freelist counts against the host.</p>
+
+<h3>Pending writes have to be visible to every read</h3>
+
+<p>Some of Blobasaur's read paths skipped its map of pending writes, so a <code>DEL</code> followed by a <code>GET</code> could return the old value. Explicit tombstones, checked on every read path, fixed it.</p>
+
+<p>Hlekk's simulation found the same kind of bug in the outbox. When an inverse edge's target vshard is on the same host, hlekk writes it inline in the same transaction, which makes colocated pairs atomic. But a move can bring two vshards onto one host while an operation between them is still queued, and then the inline write ran ahead of the queued one. Hlekk now writes inline only when nothing for that pair is queued. In both systems, a fast path skipped work that the slow path still had pending.</p>
+
+<h3>Cleanup has to share the writer</h3>
+
+<p>Blobasaur's TTL cleanup ran on its own write connection, as one large <code>DELETE</code> that held the lock. That pushed p99 write latency from under 5&nbsp;ms to 30–50&nbsp;ms. Running cleanup through the shard's own writer, in bounded chunks, fixed it.</p>
+
+<p>Hlekk hit the general form of this rule and made it part of the schema: every row has exactly one writer. A pair of inverse edge types used to be writable from both sides, so the same row could be written from two vshards with nothing ordering the writes. A remove from one side and an add from the other could land in either order, and two adds with different times overwrote each other's sort key. Now exactly one side of every pair is marked <code>maintained</code>. The host refuses direct writes to that side, and the catalog rejects a schema that marks neither side or both.</p>
+
+<p>Blobasaur's version of the lesson is about a lock and hlekk's is about ordering. Both come down to giving each piece of data one writer and sending every path through it.</p>
+
+<h2><span class="n">12</span>In production, and not</h2>
+
+<p>Blobasaur runs Kite on three nodes, each with 4 vCPUs and 8&nbsp;GB of RAM. Through a trading session it holds p99 near 2&nbsp;ms and p50 between 250 and 550&nbsp;µs on every node.</p>
+
+<p>Hlekk is at version 0.1.0 and has no production users. Its numbers come from deployed Durable Objects, and they measure a different operation: a Blobasaur GET reads one key from one file, while a hlekk read assembles a tree from several hosts.</p>
+
+<ul>
+  <li>In the Wikipedia pilot (2,000 pages on 43 hosts), the page card for “Country” showed 25 links from 17 hosts. It took 17 host requests and 95&nbsp;ms, plus 28&nbsp;ms to turn the title into an id.</li>
+  <li>In the fan-out test, a two-level read of about 500 objects over 128 vshards on 50 hosts took 61–81 host requests. The number of requests depends on hosts and rounds, not on how many objects come back.</li>
+  <li>The known slow case: a selective filter on a high-degree page reads the page's whole edge list. A filter over Country's links took 1,393&nbsp;ms and 12 host requests, and there's no per-query scan cap yet.</li>
+  <li>All of Simple English Wikipedia is 2.69&nbsp;GB across 43 hosts, about 63&nbsp;MB each. At $0.20 per GB-month, Durable Objects storage for a 300&nbsp;GB database would cost about $60 a month.</li>
+</ul>
+
+<h2><span class="n">13</span>The part Blobasaur doesn't need</h2>
+
+<p>Blobasaur speaks Redis so that existing clients don't have to change. Hlekk defines a new protocol so that databases run by different people can be read together. An edge can point into another database as <code>&lt;database URI&gt;#&lt;id&gt;</code>, and a read can follow it over HTTP into a database that decides for itself what to expose. The protocol has a <a href="https://github.com/tantaman/hlekk/blob/main/spec/protocol.md">normative spec</a>, JSON Schemas, and a conformance suite that imports nothing from the implementation.</p>
+
+<p>That's a separate subject from storage, but it explains some storage decisions above. It's why hlekk's ids have to be permanent, why an acknowledged id can never be lost, and why a database's URI can't change once it's been handed out.</p>
+
+<h2><span class="n">14</span>Which to pick</h2>
+
+<p><strong>Use Blobasaur's design</strong> when values are opaque, addressed by keys you already have, sometimes several megabytes, and allowed to expire. Hlekk is the wrong tool there. It has a 2&nbsp;MB row cap, no TTL, no compression, and no way to store a value under a key you chose.</p>
+
+<p><strong>Use hlekk's</strong> when the data is relationships, reads are trees of hops from things you hold, and the database needs to grow from one host to many without anyone resharding it.</p>
+
+<p>On the rest, the two designs agree. Use SQLite as the unit of storage and give each file one writer. Batch your commits. Count pages, not bytes. And send every write to a given row through one place.</p>
+
+<hr>
+
+<div class="notes">
+  <p><strong>Sources.</strong> Blobasaur's figures and design come from Zerodha's post, <a href="https://zerodha.tech/blog/high-performance-distributed-blob-storage/">“Distributed, high-performance blob storage on SQLite”</a>. Blobasaur's source is at <a href="https://github.com/iamd3vil/blobasaur">github.com/iamd3vil/blobasaur</a> under AGPLv3. Hlekk's figures come from <a href="https://github.com/tantaman/hlekk/blob/main/docs/design.md">docs/design.md</a>, <a href="https://github.com/tantaman/hlekk/blob/main/docs/wikimedia-demo.md">docs/wikimedia-demo.md</a>, <a href="https://github.com/tantaman/hlekk/blob/main/docs/wikimedia-import.md">docs/wikimedia-import.md</a> and <a href="https://github.com/tantaman/hlekk/blob/main/PLAN.md">PLAN.md</a>, which say how each was measured. None of the numbers here come from running both systems on the same hardware.</p>
+</div>
+
+</main>
+
+<footer><div class="in">hlekk · Apache-2.0 · <a href="https://github.com/tantaman/hlekk">github.com/tantaman/hlekk</a></div></footer>
+
+</body>
+</html>
