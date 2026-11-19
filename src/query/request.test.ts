@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe as suite, it } from "node:test";
 
 import type { FieldSpec } from "../catalog/catalog.ts";
-import { DEFAULT_LIMITS, Refused, check } from "./request.ts";
+import { DEFAULT_LIMITS, Refused, check, checkShape, compile } from "./request.ts";
 import type { Request, Vocabulary } from "./request.ts";
 
 // A vocabulary with more than one object type, which is the case `examples/wiki/wiki-query.test.ts` cannot
@@ -120,6 +120,56 @@ suite("a bounded request", () => {
     for (const limit of [0, -5, 1.5, DEFAULT_LIMITS.maxLimit + 1]) {
       assert.match(refusal({ hops: [{ edge: "issues.issue_labels", limit }] }).message, /limit must be/);
     }
+  });
+});
+
+// What is wrong with a request whichever database it is asked of. A caller with no single
+// vocabulary to check against makes these on their own, and they have to be the checks `check`
+// makes: a second copy of them had already let through a count this one refuses.
+suite("a request checked without a vocabulary", () => {
+  const shape = (req: unknown): Refused => {
+    try {
+      checkShape(req as Request);
+    } catch (e) {
+      assert.ok(e instanceof Refused, `expected Refused, got ${String(e)}`);
+      return e;
+    }
+    throw new Error("expected the request to be refused");
+  };
+
+  it("refuses what `check` refuses of the same request, at the same place", () => {
+    const wrong: unknown[] = [
+      { hops: [{ edge: "issues.issue_labels", limitt: 2 }] },
+      { counts: [{ as: "n", edge: "issues.issue_labels", extra: 1 }] },
+      { hops: [{ edge: "issues.issue_labels", counts: [{ as: "n", edge: "issues.issue_labels", extra: 1 }] }] },
+      { hops: [{ edge: "issues.issue_labels", where: [{ field: "title", op: "~", value: "x" }] }] },
+      { hops: [{ edge: "issues.issue_labels", where: [{ field: "title", op: "=" }] }] },
+      { hops: [{ edge: "issues.issue_labels", hops: [{ edge: "issues.issue_owner", where: [{ field: "name", op: "=", value: "a", not: 1 }] }] }] },
+    ];
+    for (const req of wrong) {
+      const [alone, checked] = [shape(req), refusal(req)];
+      assert.deepEqual([alone.at, alone.message], [checked.at, checked.message], JSON.stringify(req));
+    }
+  });
+
+  it("names no edge and no field, so a request for several databases passes where it is well formed", () => {
+    checkShape({ counts: ["an.edge.nobody.has"], hops: [{ edge: "another", limit: 5000, where: [{ field: "anything", op: "=", value: 1 }] }] });
+    assert.equal(shape({ hops: [{ edge: "x", limit: 0 }] }).at, "hops[0].limit");
+    assert.equal(shape({ hops: [{ edge: "x", after: 7 }] }).at, "hops[0].after");
+  });
+
+  it("compiles a request the way a name resolves, and tells each frame where it came from", () => {
+    const seen: [number, string][] = [];
+    const plan = compile(
+      { counts: ["c"], hops: [{ edge: "a", as: "first", hops: [{ edge: "b", limit: 3, where: [{ field: "f", op: ">", value: 1 }] }] }] },
+      { source: (hop) => ({ kind: "edge", atype: hop.edge.charCodeAt(0) }), counted: () => 9, cursor: () => ({ time: 0, db: 0, id2: "0" }) },
+      undefined,
+      (frame, _node, at) => seen.push([frame, at]),
+    );
+    assert.deepEqual(seen, [[0, ""], [1, "hops[0]"], [2, "hops[0].hops[0]"]]);
+    assert.deepEqual(plan.frames[0], { source: { kind: "ids" }, limit: undefined, after: undefined, children: [{ alias: "first", frame: 1 }], counts: [{ alias: "c", atype: 9 }], where: undefined });
+    assert.deepEqual([plan.frames[1]!.limit, plan.frames[2]!.limit], [25, 3], "a hop with no limit takes the default; the entry takes none");
+    assert.deepEqual(plan.frames[2]!.where, { cmp: ">", on: "obj", field: "f", value: 1 });
   });
 });
 

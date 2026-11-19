@@ -14,9 +14,9 @@ import { parseId } from "../host/ids.ts";
 import { decodeCursor } from "../schema/query.ts";
 import { normalize } from "./normalize.ts";
 import type { ListEntry, QueryResult } from "./normalize.ts";
-import { DEFAULT_HOP_LIMIT, DEFAULT_LIMITS, REQUEST_MEMBERS, Refused, check, checkAliases, countEdge } from "./request.ts";
-import type { Cmp, Cost, CountSpec, Hop, Limits, Request, Vocabulary } from "./request.ts";
-import type { Cond, Frame, Id, Plan, Source } from "./types.ts";
+import { DEFAULT_LIMITS, REQUEST_MEMBERS, Refused, check, checkAliases, compile, countEdge } from "./request.ts";
+import type { Cost, Hop, Limits, Request, Vocabulary } from "./request.ts";
+import type { Id, Plan } from "./types.ts";
 
 /** A request as it arrives over the wire.
  *
@@ -129,17 +129,6 @@ export function vocabularyOf(catalog: Catalog, exposed?: Iterable<string>): Voca
   };
 }
 
-const aliasOf = (hop: Hop): string => (hop.as !== undefined && hop.as.length > 0 ? hop.as : hop.edge);
-const countAlias = (c: CountSpec): string => (typeof c === "string" ? c : c.as);
-
-/** Filters as one condition. Every filter is on the target object's fields, which is what `check`
- *  validates them against. */
-function condOf(where: Cmp[] | undefined): Cond | undefined {
-  const cmps = (where ?? []).map((w): Cond => ({ cmp: w.op, on: "obj", field: w.field, value: w.value }));
-  if (cmps.length === 0) return undefined;
-  return cmps.length === 1 ? cmps[0] : { and: cmps };
-}
-
 /**
  * Compiles a checked request into a plan, from the catalog alone.
  *
@@ -147,37 +136,19 @@ function condOf(where: Cmp[] | undefined): Cond | undefined {
  * plain data, so a name from the catalog is enough. That is what lets a served boundary exist without
  * the serving deployment having generated code for the caller's projection.
  *
- * Call `check` first; this assumes every name resolves. Children are emitted after their parent's
- * frame is reserved, as `Query.compile` does, so indices are stable.
+ * Call `check` first; this assumes every name resolves. What a request means as a plan is
+ * `compile`'s, which the reader shares; what is this database's own is how a name resolves.
  */
 export function planOf(req: ReadRequest, catalog: Catalog): Plan {
-  const frames: Frame[] = [];
-  const emit = (source: Source, node: Partial<Hop> & Request, isRoot: boolean): number => {
-    const index = frames.length;
-    frames.push({
-      source,
-      limit: isRoot ? undefined : (node.limit ?? DEFAULT_HOP_LIMIT),
-      // `check` has already decoded this one, so a cursor here is known to be well formed. The root
-      // takes none: the entry is ids, and a list of ids is not a page.
-      after: isRoot || node.after === undefined ? undefined : decodeCursor(node.after),
-      children: [],
-      counts: [],
-    });
-    const children = (node.hops ?? []).map((hop) => {
+  return compile(req, {
+    source: (hop) => {
       const edge = catalog.edgeNamed(hop.edge)!;
-      const child: Source =
-        edge.atype === undefined ? { kind: "field", field: edge.field! } : { kind: "edge", atype: edge.atype };
-      return { alias: aliasOf(hop), frame: emit(child, hop, false) };
-    });
-    const counts = (node.counts ?? []).map((c) => ({
-      alias: countAlias(c),
-      atype: catalog.edgeNamed(countEdge(c))!.atype!,
-    }));
-    frames[index] = { ...frames[index], children, counts, where: condOf(node.where) };
-    return index;
-  };
-  emit({ kind: "ids" }, req, true);
-  return { frames };
+      return edge.atype === undefined ? { kind: "field", field: edge.field! } : { kind: "edge", atype: edge.atype };
+    },
+    counted: (c) => catalog.edgeNamed(countEdge(c))!.atype!,
+    // `check` has already decoded this one, so a cursor here is known to be well formed.
+    cursor: (after) => decodeCursor(after),
+  });
 }
 
 /**
