@@ -57,6 +57,9 @@ This README is written to be executed, and the steps are in the order you need t
 - **Empty is not unreachable.** A `200` with no object means absent or hidden, and the two are
   indistinguishable on purpose. A failed connection means you could not ask. Report them differently.
 - **A cursor is opaque.** Send a list's `cursor` back as the hop's `after`. Never build or parse one.
+- **A short page is not the end.** A filtered list reads at most its share of the database's
+  `maxScan` (the price's `scan`) and stops there, so it can come back short of its limit, or empty,
+  with `more: true`. Continue it with `after` rather than reading it as the end.
 - **A URI is permanent.** A database's URI is its identity, recorded the first time its storage is
   opened and refused if it ever changes. Choose the name before you hand out a reference.
 - **Anything mounted is public.** Reads need no credential by default and no protocol route writes.

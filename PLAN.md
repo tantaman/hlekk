@@ -24,7 +24,7 @@ Figures marked **measured** were read off a real artifact and say how.
 
 ## Where this stands
 
-Built, with typecheck clean and **702 of 702 tests passing under both storage formats**
+Built, with typecheck clean and **714 of 714 tests passing under both storage formats**
 (`npm run test:formats`), **48 of 48** conformance checks against the published fixture
 (`npm run conformance:fixture`) and **35 of 35** without one (`npm run conformance:node`):
 
@@ -60,6 +60,12 @@ Built, with typecheck clean and **702 of 702 tests passing under both storage fo
   same request written by chaining (`src/reader/query.ts`), which compiles to that data and can say
   nothing it cannot. `hlekk/reader` runs wherever `fetch` does, and `hlekk/adapters/node` wraps it
   with the address guard.
+- **After step 7.** A scan cap. A filter reads past its limit, so a selective one over a
+  high-degree object read the whole list, and reads are public by default. A responder now states
+  `maxScan` in its descriptor, shares it evenly over a request's filtered lists before any I/O, and
+  prices the share as `scan`; a list that reaches it ends with a cursor past the last row it read
+  (`spec/protocol.md` §5.2 and §5.5). Both are optional members, so wire version 1 holds. The wiki
+  query box runs with the same share.
 
 Not built: step 8, below.
 

@@ -116,8 +116,8 @@ anything.
   different one.
 - `wire` **MUST** list every wire version this database speaks. A caller **MUST NOT** send a request
   it cannot read the answer to.
-- `limits` **MUST** state every limit in the schema. A caller **SHOULD** clamp its requests to them
-  rather than being refused.
+- `limits` **MUST** state every required limit in the schema, and **SHOULD** state `maxScan`
+  (§5.2). A caller **SHOULD** clamp its requests to them rather than being refused.
 - `keys` **MUST** be present. An empty list means this database authenticates nobody (§7.1), which a
   caller **MUST** be able to tell from a database that does and did not say so.
 
@@ -200,6 +200,20 @@ NOT** read any storage to produce it.
 > while storage reads stay flat. A budget on reads, requests or rounds never fires, and nothing about
 > the I/O reveals it.
 
+A filter reads past its limit. It keeps reading until the limit is filled or the list ends, so a
+selective filter over a long list reads all of it, and nothing in the request's text bounds that. A
+responder that states `maxScan` **MUST** bound it:
+
+- Each filtered list **MUST** examine at most `floor(maxScan / F)` rows, where `F` is the most
+  filtered lists the request can produce: one for every row that can reach a hop with `where`, by
+  the same arithmetic as `nodes`. Every row read counts, whether the filter keeps it or not.
+- The responder **MUST** report that share as the cost's `scan`, and **MUST** refuse a request whose
+  share would be less than one row.
+- The share **MUST** be fixed by the request's text and not spent as the read proceeds, so that an
+  answer does not depend on the order in which the responder's storage replied.
+
+A list that reaches its share stops there and says so (§5.5).
+
 ### 5.3 The entry is ids
 
 A request enters from `ids`, which **MUST** be bare local ids of the database answering, and **MUST**
@@ -230,6 +244,12 @@ as a hop's `after`.
 
 A cursor is **opaque to the caller**. A caller **MUST NOT** construct one, **MUST NOT** parse one,
 and **MUST NOT** continue a list from anything but a cursor that database gave it.
+
+A list **MAY** hold fewer members than its limit and still say `more`, and **MAY** be empty and say
+it: a filtered list that reaches its scan share (§5.2) stops there. Its `cursor` **MUST** continue
+after the last row the list examined rather than the last one it holds, so that continuing it makes
+progress even when nothing it examined passed. A caller **MUST NOT** read an empty list as the end of
+one that says `more`.
 
 > Why: a responder drops rows its policy hides, so the last row the caller can see is not where the
 > list resumes. The rows in between are exactly the ones that were removed.

@@ -61,6 +61,11 @@
         "maxBody": {
           "type": "integer",
           "minimum": 1
+        },
+        "maxScan": {
+          "description": "Rows a request's filtered lists may examine between them. Optional: a responder that states none sets no bound, and a caller cannot assume one.",
+          "type": "integer",
+          "minimum": 1
         }
       },
       "required": [

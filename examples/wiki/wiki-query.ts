@@ -27,9 +27,12 @@
 // the type its field declares -- an unknown field is refused rather than matching nothing, because
 // in an editor a silently empty answer is a worse bug than an error message.
 //
-// What this does NOT fix, and nothing here can: a selective filter walks its whole edge list, so
-// `where` over a page with a million backlinks reads the million. design.md's "A scan cap per
-// query, returning a cursor, is not built yet" is still true, and `maxLimit` is not a bound on it.
+// A selective filter walks its edge list until its limit is filled, so `where` over a page with a
+// million backlinks would read the million, and `maxLimit` is not a bound on it. The price therefore
+// carries `scan` — `maxScan` shared over the query's filtered lists — and `/query` runs with it, so a
+// filtered list stops at its share. What this editor does not yet show is that it stopped: its
+// relations are plain lists rather than pages, so a list cut short at its share carries no cursor,
+// and the share in the price is what says how far each list read.
 
 import type { Cond, Json, Plan } from "../../src/query/types.ts";
 import type { CmpOp } from "../../src/query/types.ts";

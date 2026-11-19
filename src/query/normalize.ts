@@ -10,6 +10,7 @@
 // throws it away on the way out.
 
 import { pageEnd } from "../schema/query.ts";
+import { stoppedAt } from "./ops.ts";
 import type { Cache } from "./stores.ts";
 import { RESERVED_KEYS } from "./types.ts";
 import type { Fields, Id, Json, Plan } from "./types.ts";
@@ -84,7 +85,9 @@ export function normalize(plan: Plan, _rootIds: readonly Id[], rows: readonly Js
         if (edge) sawEdge = true;
         edges.push(edge);
       }
-      const entry: ListEntry = { ids, ...pageEnd(id, plan.frames[child.frame].source, plan.frames[child.frame].after, items.at(-1), graph) };
+      // A list stopped at the scan cap continues after the last row it read, not the last it kept.
+      const last = (stoppedAt(got) as Json | undefined) ?? items.at(-1);
+      const entry: ListEntry = { ids, ...pageEnd(id, plan.frames[child.frame].source, plan.frames[child.frame].after, last, graph) };
       if (sawEdge) entry.edges = edges;
       out.lists[`${child.frame}:${id}`] = entry;
     }

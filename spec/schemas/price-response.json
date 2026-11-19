@@ -18,6 +18,11 @@
         "nodes": {
           "type": "integer",
           "minimum": 0
+        },
+        "scan": {
+          "description": "Rows each filtered list may examine before it stops with a cursor. Present only when the request filters a list.",
+          "type": "integer",
+          "minimum": 1
         }
       },
       "required": [

@@ -51,6 +51,7 @@
 import { Catalog, CatalogError } from "../catalog/catalog.ts";
 import type { FieldSpec, Lock, ObjectType } from "../catalog/catalog.ts";
 import { runAsync, runRounds } from "../query/driver.ts";
+import { stoppedAt } from "../query/ops.ts";
 import type { Answer, HostClient, Stats } from "../query/driver.ts";
 import { canonicalDb, formatRef, parseRef } from "../query/ref.ts";
 import type { Ref } from "../query/ref.ts";
@@ -594,7 +595,8 @@ export class Reader {
         const below = row[child.alias];
         const items = Array.isArray(below) ? below.map((item) => page(item, child.frame)) : [];
         const spec = plan.frames[child.frame]!;
-        row[child.alias] = { items, ...pageEnd(row.id, spec.source, spec.after, items.at(-1) as Json | undefined, answer.graph) };
+        const last = (stoppedAt(below) as Json | undefined) ?? (items.at(-1) as Json | undefined);
+        row[child.alias] = { items, ...pageEnd(row.id, spec.source, spec.after, last, answer.graph) };
       }
       return row;
     };

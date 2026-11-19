@@ -301,6 +301,39 @@ if (anyEdge) {
   );
 }
 
+// ---- the scan a filter may spend
+//
+// A filter reads past its limit, so a responder that states `maxScan` gives each filtered list a share
+// of it, fixed by the request's text, and prices that share as `scan` (§5.2). Built from the
+// vocabulary: any edge landing on a type with a field a filter can compare.
+
+const SAMPLE = { string: "x", number: 0, boolean: true };
+const filterable = edges
+  .map(([name, e]) => {
+    const fields = Object.entries(vocabulary?.types?.[e.to]?.fields ?? {});
+    const field = fields.find(([, f]) => f.type in SAMPLE);
+    return field && e.counted !== false ? { name, field: field[0], value: SAMPLE[field[1].type] } : undefined;
+  })
+  .find((x) => x !== undefined);
+if (filterable && Number.isInteger(limits.maxScan)) {
+  const request = { ids: [SOME_ID], hops: [{ edge: filterable.name, limit: 1, where: [{ field: filterable.field, op: "=", value: filterable.value }] }] };
+  const priced = await send("price", request);
+  const read = await send("read", request);
+  const scan = priced.body?.cost?.scan;
+  check(
+    "a filtered list is priced a share of the stated maxScan",
+    Number.isInteger(scan) && scan >= 1 && scan <= limits.maxScan,
+    `scan ${JSON.stringify(scan)} against maxScan ${limits.maxScan}`,
+  );
+  check(
+    "and the read reports the share it was priced at",
+    JSON.stringify(priced.body?.cost) === JSON.stringify(read.body?.cost),
+    `priced ${JSON.stringify(priced.body?.cost)}, read ${JSON.stringify(read.body?.cost)}`,
+  );
+} else {
+  check("a filtered list is priced a share of the stated maxScan", true, "skipped: no maxScan stated, or nothing to filter on");
+}
+
 // ---- a body over the stated cap
 
 const big = await fetch(`${uri}/read`, {

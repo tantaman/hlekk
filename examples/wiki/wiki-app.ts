@@ -810,6 +810,9 @@ export default {
         const rows = await buildQuery(spec, id).run(db, {
           driver: url.searchParams.get("driver") === "rounds" ? "rounds" : "async",
           stats,
+          // The share the price fixed. An authored query is a stranger's like a protocol read is, and
+          // a filter over a page with a million backlinks would otherwise read the million.
+          scan: cost.scan,
         });
         const ms = Date.now() - started;
         const ids = idsIn(rows as unknown as Json);

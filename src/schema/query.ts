@@ -8,7 +8,7 @@ import { parseRef } from "../query/ref.ts";
 import { targetOf } from "../query/types.ts";
 import type { KnownRun } from "../query/stores.ts";
 import { parseId } from "../host/ids.ts";
-import { DEFAULT_LIMIT } from "../query/ops.ts";
+import { DEFAULT_LIMIT, stoppedAt } from "../query/ops.ts";
 import type { Stats } from "../query/driver.ts";
 import type { Cond, CmpOp, Cursor, Id, Json, Plan, Source } from "../query/types.ts";
 import type { EdgeType, FieldMap, FieldRel, IsSingle, ObjectType, Relation, RowOf, TargetOf } from "./define.ts";
@@ -247,7 +247,9 @@ export class Query<F extends FieldMap, Shape> {
   /** Runs the query. The database resolves hosts; this names none. */
   async run(db: Runner, opts?: RunOptions): Promise<Shape[]> {
     if (this.#roots.length === 0) throw new Error("a query needs a root: start it from Type.gen(id)");
-    const { plan, root } = this.compile();
+    const compiled = this.compile();
+    const { root } = compiled;
+    const plan = opts?.scan === undefined ? compiled.plan : { ...compiled.plan, scan: opts.scan };
     const answer = await db.answer(plan, [...this.#roots], opts);
     return answer.rows.map((r) => reshape(r, root, answer.graph)) as Shape[];
   }
@@ -263,6 +265,9 @@ export interface RunOptions {
   /** Filled in with what the read cost: rounds, and requests to hosts. The runner has always
    *  reported it; a query built through the builder had no way to ask. */
   stats?: Stats;
+  /** Rows each filtered list may examine before it stops (`Plan.scan`). For a query someone else
+   *  wrote — a public query box — passed the share `check` priced. Absent, nothing is capped. */
+  scan?: number;
 }
 
 /** What a query needs from a database: the answer, and the graph it was read from. The graph is where
@@ -305,7 +310,9 @@ function reshape(row: Json, node: Node, graph: ListSource): Json {
       out[c.alias] = list;
       continue;
     }
-    out[c.alias] = { items: list, ...pageEnd(out.id as Id, c.node.source, c.node.after, list.at(-1), graph) } as unknown as Json;
+    // A list stopped at the scan cap continues after the last row it read, not the last it kept.
+    const last = (stoppedAt(got) as Json | undefined) ?? list.at(-1);
+    out[c.alias] = { items: list, ...pageEnd(out.id as Id, c.node.source, c.node.after, last, graph) } as unknown as Json;
   }
   return out;
 }

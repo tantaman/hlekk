@@ -251,10 +251,13 @@ catalog lacks. What it completes is not tested, though, and that is worth knowin
 as one inline string with no build step, so there is no module for a test to import. The grammar is
 tested on the server; the caret-context logic is not.
 
-**What is still true and unfixed:** a selective filter walks its whole edge list, so `where` on a
-high-degree page reads the whole list — `len > 20000` over `Country` took 1,393 ms and 12 host
-requests on the pilot. `maxLimit` is not a bound on that, and *A scan cap per query, returning a
-cursor* is still not built.
+**What was true and is now bounded:** a selective filter walked its whole edge list, so `where` on a
+high-degree page read the whole list — `len > 20000` over `Country` took 1,393 ms and 12 host
+requests on the pilot. `maxLimit` was not a bound on that. A protocol read is now capped by the
+responder's `maxScan`, shared over its filtered lists, and a list that reaches its share ends with a
+cursor (`design.md`, *Filtered limits across hosts*). The demo's query box runs with the same
+share, priced the same way; its relations are plain lists rather than pages, so a list cut short
+there carries no cursor, and the share in its price is what says how far each list read.
 
 ## Not needed for this
 

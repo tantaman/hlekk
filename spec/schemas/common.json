@@ -36,7 +36,12 @@
       "type": "object",
       "properties": {
         "frames": { "type": "integer", "minimum": 1 },
-        "nodes": { "description": "The upper bound on answer nodes.", "type": "integer", "minimum": 0 }
+        "nodes": { "description": "The upper bound on answer nodes.", "type": "integer", "minimum": 0 },
+        "scan": {
+          "description": "Rows each filtered list may examine before it stops with a cursor. Present only when the request filters a list.",
+          "type": "integer",
+          "minimum": 1
+        }
       },
       "required": ["frames", "nodes"],
       "additionalProperties": false

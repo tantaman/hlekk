@@ -73,6 +73,22 @@ reappearing behind a guard that reported it was satisfied. So the entry is valid
 width is passed into the price, and the quoted `cost` describes the request that will actually run
 rather than a single-root version of it.
 
+**A filter's reads are the one cost the tree does not show.** The node count bounds what a list
+*keeps*. A filter keeps reading until its limit is filled, so a selective one over a high-degree
+object reads the whole list — `len > 20000` over the Wikipedia pilot's `Country` took 1,393 ms and 12
+host requests — and the limit says nothing about it. So `maxScan` is a budget on rows examined, shared
+evenly over every filtered list the request can produce and fixed by the same arithmetic as the node
+count, before any I/O. The price states the share as `scan`. A list that reaches it stops with what it
+found and a cursor past the last row it read, so a caller that wants the rest continues it, and every
+continuation makes progress even when a page comes back empty.
+
+The share is fixed rather than spent as the read goes for a reason that is not obvious. A budget
+spent first-come across a request's lists is spent in the order the lists happen to be read, and in
+an engine whose reads wait on whichever host replies first, that order is timing. The same request
+would then return different pages depending on how the data is spread. A share fixed by the text
+returns the same pages wherever the data lives, which is the property the engine's differential
+oracle already holds every other answer to.
+
 Three consequences for the protocol:
 
 - **A `Plan` can never cross.** Principle 3 is that the query rides and the hosts resolve, but that is

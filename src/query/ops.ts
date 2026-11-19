@@ -8,7 +8,7 @@
 // the rest.
 
 import { isQualified } from "./ref.ts";
-import { UNKNOWN, cursorOf, isReference, referenceRow, targetOf, tokenCursor } from "./types.ts";
+import { UNKNOWN, cursorOf, isCapped, isReference, referenceRow, targetOf, tokenCursor } from "./types.ts";
 import type { Cond, Cursor, Edge, End, Fields, Id, Json, Maybe, Miss, Node, Obj, Plan, Ref, Row, Store, Stream, Unknown } from "./types.ts";
 
 export const DEFAULT_LIMIT = 50;
@@ -177,8 +177,19 @@ export class EdgeHop implements Op {
     let after = req.after ?? this.from;
     const seenTokens = new Set<string>();
     if (after?.token) seenTokens.add(after.token);
+    // A filtered list is the one whose reads its limit does not bound: a selective filter keeps
+    // reading until it has filled its limit, which over a high-degree object is the whole list. So
+    // where the plan carries a scan cap, a filtered list reads at most that many rows. Every row read
+    // counts, kept or not — a filter that rejects it and an edge to a deleted object both cost a
+    // read — and the list then ends where it stopped, with a cursor past the last of them.
+    const cap = p.plan.scan !== undefined && p.plan.frames[this.frame]?.where !== undefined ? p.plan.scan : undefined;
+    let scanned = 0;
+    let last: Ref | undefined;
     for (let n = req.want ?? DEFAULT_LIMIT; ; n = Math.min(MAX_PAGE, n * 2)) {
-      const page = await p.store.edges(id1, this.atype, after, n, this.frame);
+      // Checked only when a row past the last page is wanted: a consumer that has what it needs
+      // stops pulling first, and its list then ends at its last row like any other.
+      if (cap !== undefined && scanned >= cap && last !== undefined) return { capped: last };
+      const page = await p.store.edges(id1, this.atype, after, cap === undefined ? n : Math.min(n, cap - scanned), this.frame);
       if (page === UNKNOWN) {
         p.miss({ kind: "edges", id1, atype: this.atype, frame: this.frame, after, n });
         return "short";
@@ -205,6 +216,13 @@ export class EdgeHop implements Op {
         }
         if (o !== null) yield node({ obj: o, edge: e }); // an edge to a deleted object is dropped
       }
+      // Counted after the page is handed on, so a cap reached here stops the list only once every
+      // row it read has been offered downstream. The last one is the last row this pass kept as a
+      // row of the frame — the graph holds it, so a cursor can be made after it. A host drops a
+      // foreign row instead, and has no target to name for one, but a host's stop is only ever a
+      // prefetch's: the coordinator, which keeps every row, is the one whose stop is an answer.
+      scanned += page.rows.length;
+      if (ids.length > 0) last = ids[ids.length - 1]!;
       if (page.complete) return "done";
       if (page.next !== undefined) {
         if (seenTokens.has(page.next)) throw new Error("a foreign page repeated its continuation");
@@ -411,6 +429,12 @@ export async function evalCond(p: Pass, c: Cond, row: Row): Promise<Truth> {
 async function exists(p: Pass, frame: number, parent: Row): Promise<Truth> {
   const rows = p.frameOp(frame).fetch(p, { parent, want: 1 });
   const r = await rows.next();
+  // A scan that stopped at the cap without a match has not shown there is none. Reading it as false
+  // is a wrong answer that looks right; UNKNOWN would send the coordinator for data it already has.
+  // The protocol cannot express `exists`, so only a plan someone wrote with both reaches this.
+  if (r.done && isCapped(r.value)) {
+    throw new ScanExhausted(frame, p.plan.scan ?? 0);
+  }
   if (r.done) return r.value === "short" ? UNKNOWN : false;
   p.background(rows.return("done"));
   return true;
@@ -566,7 +590,39 @@ export async function materialize(rows: Stream): Promise<Maybe<Json[]>> {
   let r = await rows.next();
   for (; !r.done; r = await rows.next()) out.push(quiet(materializeNode(r.value)));
   const nodes = await Promise.all(out);
-  return r.value === "done" && allKnown(nodes) ? nodes : UNKNOWN;
+  if (r.value === "short" || !allKnown(nodes)) return UNKNOWN;
+  // A capped list is a whole answer: a page that ends early. Where it stopped goes beside it rather
+  // than into it, since a list is the caller's rows and nothing else.
+  if (isCapped(r.value)) STOPPED.set(nodes, r.value.capped);
+  return nodes;
+}
+
+const STOPPED = new WeakMap<readonly unknown[], Ref>();
+
+/**
+ * Where a list stopped, if it stopped at the scan cap: the row to make its cursor after, in the shape
+ * `pageEnd` takes its last row in. Undefined for a list that ended at its limit or its end, whose
+ * cursor is made after its last item as always.
+ *
+ * Keyed by the array `materialize` returned, so ask with that array and not a copy of it.
+ */
+export function stoppedAt(list: unknown): { id: Ref } | undefined {
+  if (!Array.isArray(list)) return undefined;
+  const at = STOPPED.get(list);
+  return at === undefined ? undefined : { id: at };
+}
+
+/** An `exists` whose subquery stopped at the scan cap without deciding. */
+export class ScanExhausted extends Error {
+  readonly frame: number;
+  constructor(frame: number, cap: number) {
+    super(
+      `an exists over frame ${frame} read the ${cap} rows its scan cap allows without finding a match, ` +
+        "which does not show there is none. Narrow the list it reads, or run it without a cap",
+    );
+    this.name = "ScanExhausted";
+    this.frame = frame;
+  }
 }
 
 async function materializeNode(n: Node): Promise<Maybe<Json>> {

@@ -372,7 +372,9 @@ export async function serve(req: ReadRequest, opts: ServeOptions): Promise<Serve
   const { catalog, source, exposes, policy = PUBLIC } = opts;
   const cost = price(req, opts);
 
-  const plan = planOf(req, catalog);
+  // The scan share the price fixed travels with the plan, to the coordinator and to every host, so
+  // a host's prefetch stops where the answer will.
+  const plan: Plan = cost.scan === undefined ? planOf(req, catalog) : { ...planOf(req, catalog), scan: cost.scan };
   // A database answering a read never follows a reference out of itself. It would be fetching from
   // a third party on the caller's behalf, under its own identity, with the caller unable to tell
   // whose answer it got — the deputy `docs/protocol.md` rules out. So the reference is listed and

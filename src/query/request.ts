@@ -22,9 +22,12 @@
 // 3. **A refusal names where.** `at` is a path into the request, so a caller can correct the part
 //    that was wrong instead of retrying blind, and an editor can put a caret on it.
 //
-// What this does NOT bound, and nothing here can: a selective filter walks its whole edge list, so a
-// `where` over an object with a million edges reads the million. `maxLimit` is not a bound on that;
-// the per-query scan cap design.md still owes is.
+// 4. **What a filter reads is bounded too.** A selective filter walks its edge list until its limit
+//    is filled, so a `where` over an object with a million edges reads the million, and `maxLimit`
+//    bounds what a list keeps rather than what it reads. So `maxScan` is shared across the request's
+//    filtered lists here, before any I/O, and a list that reaches its share stops with a cursor past
+//    the last row it read (`EdgeHop` in `ops.ts`). Fixed by the text rather than spent as the read
+//    goes, because a budget spent in the order hosts reply is an answer that depends on timing.
 
 import type { FieldSpec } from "../catalog/catalog.ts";
 import { decodeCursor } from "../schema/query.ts";
@@ -44,7 +47,7 @@ export const DEFAULT_HOP_LIMIT = 25;
 export interface Limits {
   /** Hop nesting. Depth 10 at limit 3 was already 177,145 nodes in the probe. */
   maxDepth: number;
-  /** Rows one hop may read. Not a bound on what a filter scans underneath it. */
+  /** Rows one hop may keep. Not a bound on what a filter reads to find them: that is `maxScan`. */
   maxLimit: number;
   /** Frames, counting `exists` subqueries. A plan is compiled once and cached per host. */
   maxFrames: number;
@@ -55,6 +58,17 @@ export interface Limits {
   maxCounts: number;
   /** Filters per hop. */
   maxWhere: number;
+  /**
+   * Rows the request's filtered lists may examine between them. A filter reads until it has filled
+   * its limit, so a selective one over a high-degree object reads the whole list, and nothing about
+   * the request's text bounds that — `maxLimit` bounds what a list keeps, not what it reads.
+   *
+   * Shared evenly, and fixed before any I/O: each filtered list may examine this divided by the most
+   * filtered lists the request could produce. A list that reaches its share stops with what it has
+   * and a cursor past the last row it read, so the total is a hard bound and the caller continues
+   * where it stopped. The share is in the price, as `scan`.
+   */
+  maxScan: number;
 }
 
 export const DEFAULT_LIMITS: Limits = {
@@ -64,6 +78,11 @@ export const DEFAULT_LIMITS: Limits = {
   maxNodes: 20_000,
   maxCounts: 4,
   maxWhere: 4,
+  // Each row a filter examines is an edge read and a read of the object it lands on. At pages of up
+  // to 256 that is about twenty dependent host requests for one list given the whole allowance, and
+  // a fraction of a second — against the 1,393 ms and 12 requests one unbounded filter over a single
+  // high-degree page took on the Wikipedia pilot.
+  maxScan: 5_000,
 };
 
 // ---- what a caller may submit
@@ -147,6 +166,9 @@ export interface Cost {
   frames: number;
   /** The upper bound on answer nodes, which is what the budget is spent on. */
   nodes: number;
+  /** Rows each filtered list may examine before it stops and hands back a cursor. Present only when
+   *  the request filters a list, since otherwise nothing reads past a limit. */
+  scan?: number;
 }
 
 /** How a field spec reads to a person, and what a value for it has to be. */
@@ -344,6 +366,8 @@ interface Counted {
   frames: number;
   /** Answer nodes it can materialize, given its ancestors' limits. */
   nodes: number;
+  /** Filtered lists it can produce: one per row reaching each hop that filters. */
+  filtered: number;
 }
 
 /** Validates one hop and everything under it, and counts what it would cost. */
@@ -412,12 +436,15 @@ function checkHop(
   const produced = reaching * limit;
   let frames = 1;
   let nodes = produced;
+  // Each row reaching this hop is a list of its own, and a filtered one reads past its limit.
+  let filtered = (hop.where ?? []).length > 0 ? reaching : 0;
   for (const [i, child] of (hop.hops ?? []).entries()) {
     const under = checkHop(child, `${at}.hops[${i}]`, depth + 1, produced, vocab, limits, edge.to);
     frames += under.frames;
     nodes += under.nodes;
+    filtered += under.filtered;
   }
-  return { frames, nodes };
+  return { frames, nodes, filtered };
 }
 
 /**
@@ -445,6 +472,7 @@ export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_
 
   let frames = 1;
   let nodes = roots; // the root objects themselves
+  let filtered = 0;
   for (const [i, hop] of (req.hops ?? []).entries()) {
     // `reaching` is how many rows arrive at this hop, which at the top is one per root.
     //
@@ -456,6 +484,7 @@ export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_
     const under = checkHop(hop, `hops[${i}]`, 1, roots, vocab, limits, undefined);
     frames += under.frames;
     nodes += under.nodes;
+    filtered += under.filtered;
   }
   if (frames > limits.maxFrames) {
     throw new Refused("query", `compiles to ${frames} frames, the maximum is ${limits.maxFrames}`);
@@ -469,7 +498,20 @@ export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_
         `lower a limit${roots === 1 ? "" : ", enter from fewer ids"} or remove a hop.`,
     );
   }
-  return { frames, nodes };
+  if (filtered === 0) return { frames, nodes };
+  // The share is fixed here rather than spent as the read goes, because a budget spent in the order
+  // lists happen to be read is an answer that depends on which host replied first. Fixed per list,
+  // it is the same answer however the data is spread and whichever driver runs it.
+  const scan = Math.floor(limits.maxScan / filtered);
+  if (scan < 1) {
+    throw new Refused(
+      "query",
+      `could filter ${filtered.toLocaleString()} lists, and ${limits.maxScan.toLocaleString()} rows examined is the most ` +
+        "a request may spend on filters between them, which leaves none a row. Filter fewer lists, " +
+        `lower a limit above a filtered hop${roots === 1 ? "" : " or enter from fewer ids"}.`,
+    );
+  }
+  return { frames, nodes, scan };
 }
 
 // ---- from a request to a plan

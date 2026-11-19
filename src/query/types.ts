@@ -50,8 +50,18 @@ export interface Node {
 }
 
 /** How a stream ended. "short": it stopped at something its store didn't know, so its rows are a
- *  prefix of the answer, not the answer. */
-export type End = "done" | "short";
+ *  prefix of the answer, not the answer. `Capped`: it stopped at the plan's scan cap, so its rows are
+ *  a whole page that ends early, and the list continues after the last row it examined. */
+export type End = "done" | "short" | Capped;
+
+/** A list that stopped at the scan cap. `at` is the target of the last row it examined, which is
+ *  where a page of it resumes: past every row it read, kept or not, so continuing makes progress
+ *  even when nothing passed. */
+export interface Capped {
+  capped: Ref;
+}
+
+export const isCapped = (end: End): end is Capped => typeof end === "object";
 
 /** Ordered rows, pulled one at a time. Async everywhere: a host's reads settle at once, while the
  *  coordinator's may wait on a host. */
@@ -213,6 +223,13 @@ export interface EdgePage {
 /** A compiled query: one frame per `related` level, addressed by index. Frame 0 is the root. */
 export interface Plan {
   frames: Frame[];
+  /**
+   * Rows each filtered list may examine before it stops and hands back a cursor. Absent, a filter
+   * reads until its limit is filled or its list ends, which is right for the engine's own caller and
+   * wrong for a stranger: a selective filter over a million edges reads the million. A responder
+   * sets this from its `maxScan`, shared across the request's filtered lists (`request.ts`).
+   */
+  scan?: number;
 }
 
 export interface Frame {
