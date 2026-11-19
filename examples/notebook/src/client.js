@@ -10,6 +10,7 @@ export const nodeTitle = (n) => n?.title || blockText(n) || "Empty block";
 async function request(path, init) {
   const response = await fetch("/api/" + path, init);
   if (!response.ok) {
+    if (response.status === 401) globalThis.window?.dispatchEvent(new Event("folio:unauthorized"));
     const data = await response.json().catch(() => null);
     throw Object.assign(new Error(data?.error || `Notebook request failed (HTTP ${response.status}).`), {
       status: response.status,
@@ -25,9 +26,10 @@ function post(command, cursor) {
 }
 
 export class NotebookClient {
-  constructor(cache) {
+  constructor(cache, ownerId) {
     try {
-      this.cache = cache ?? new WorkspaceCache(globalThis.indexedDB);
+      this.cache =
+        cache ?? new WorkspaceCache(globalThis.indexedDB, ownerId ? "folio-workspace-" + ownerId : undefined);
     } catch {
       // Some browser privacy settings prevent even accessing indexedDB.
       this.cache = null;

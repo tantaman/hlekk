@@ -1,25 +1,41 @@
 import { parseCursor } from "../workspace.js";
 
-// One cache per origin. The server-issued cursor also identifies the notebook.
+// Hosted caches are scoped to the verified GitHub owner. Local notebooks retain their original cache.
 export class WorkspaceCache {
-  constructor(factory) {
+  constructor(factory, name = "folio-workspace") {
     this.factory = factory;
+    this.name = name;
   }
 
   async open() {
     if (!this.factory) return null;
     if (!this.connection) {
       this.connection = new Promise((resolve, reject) => {
-        const req = this.factory.open("folio-workspace", 1);
+        const req = this.factory.open(this.name, 1);
         req.onupgradeneeded = () => {
           req.result.createObjectStore("meta");
           req.result.createObjectStore("nodes", { keyPath: "id" });
         };
-        req.onsuccess = () => resolve(req.result);
+        req.onsuccess = () => {
+          req.result.onversionchange = () => req.result.close();
+          resolve(req.result);
+        };
         req.onerror = () => reject(req.error);
       });
     }
     return this.connection;
+  }
+
+  async clear() {
+    const db = await this.open();
+    if (!db) return;
+    const tx = db.transaction(["meta", "nodes"], "readwrite");
+    tx.objectStore("meta").clear();
+    tx.objectStore("nodes").clear();
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = resolve;
+      tx.onabort = () => reject(tx.error);
+    });
   }
 
   async read() {

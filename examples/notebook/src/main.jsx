@@ -1,9 +1,10 @@
-import React, { useEffect, useState, useSyncExternalStore } from "react";
+import React, { createContext, useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { createRootRoute, createRoute, createRouter, RouterProvider, Outlet } from "@tanstack/react-router";
 import {
   Activity,
   MessageSquareText,
+  LogOut,
   PanelLeftClose,
   PanelLeftOpen,
   BookOpen,
@@ -32,14 +33,15 @@ import "@fontsource/spectral/latin-400-italic.css";
 import "@fontsource/spectral/latin-500.css";
 import "@fontsource/spectral/latin-600.css";
 import { parseCursor } from "../workspace.js";
-import { NotebookClient, allOf, nodeTitle, blockText, parentsOf } from "./client";
+import { allOf, nodeTitle, blockText, parentsOf } from "./client";
+import { SessionGate } from "./session";
 import { ActivityFeed, Thoughts } from "./streams";
 import { Editor } from "./editor";
 import { Dialog } from "./dialog";
 import { Inspector, FullGraph } from "./graph";
 import "./style.css";
 
-const client = new NotebookClient();
+const NotebookSession = createContext(null);
 const rootRoute = createRootRoute({ component: Outlet });
 const page = createRoute({
   getParentRoute: () => rootRoute,
@@ -77,6 +79,7 @@ function SectionLabel({ label, onClick }) {
   );
 }
 function Sidebar({ collapsed, verified, workspace, selected, view, nav, go, openDialog, mobile, close }) {
+  const { owner, signOut } = useContext(NotebookSession);
   const { nodes, home } = workspace;
   const docs = allOf(nodes, "document").sort((a, b) =>
     a.id === home ? -1 : b.id === home ? 1 : b.edited - a.edited || a.title.localeCompare(b.title),
@@ -147,11 +150,16 @@ function Sidebar({ collapsed, verified, workspace, selected, view, nav, go, open
             <BookOpen size={18} />
           </div>
           <span>
-            <strong>Personal workspace</strong>
+            <strong>{owner ? "@" + owner.login : "Personal workspace"}</strong>
             <small>
               <i /> {verified ? "Hlekk connected" : "Cached notebook"}
             </small>
           </span>
+          {owner && (
+            <IconButton className="sign-out" label="Sign out" onClick={signOut}>
+              <LogOut size={17} />
+            </IconButton>
+          )}
         </div>
       </aside>
       {mobile && <button className="scrim" aria-label="Close navigation" onClick={close} />}
@@ -159,6 +167,7 @@ function Sidebar({ collapsed, verified, workspace, selected, view, nav, go, open
   );
 }
 function DocumentView(props) {
+  const { client } = props;
   const [open, setOpen] = useState(() => ({ session: client.draft(props.doc), generation: 0 }));
   // Own saves advance this session in place. A newer remote version needs a
   // fresh editor only when the user has no outstanding edits to preserve.
@@ -167,7 +176,7 @@ function DocumentView(props) {
   }
   return <DocumentEditor key={open.generation} {...props} initial={open.session} />;
 }
-function DocumentEditor({ initial, doc, nodes, go, showDialog, jump, status, readOnly }) {
+function DocumentEditor({ client, initial, doc, nodes, go, showDialog, jump, status, readOnly }) {
   const [title, setTitle] = useState(initial.title),
     [blocks, setBlocks] = useState(initial.blocks);
   const collection = allOf(nodes, "collection").find((n) => n.members.includes(doc.id));
@@ -352,6 +361,7 @@ function Listing({ view, collection, nodes, go, showDialog, remove }) {
   );
 }
 function Notebook() {
+  const { client, owner } = useContext(NotebookSession);
   const state = useSyncExternalStore(client.listen, client.snapshot);
   const search = page.useSearch(),
     navigate = page.useNavigate();
@@ -373,7 +383,8 @@ function Notebook() {
     [inspecting, setInspecting] = useState(() => window.innerWidth >= 1150),
     [generation, setGeneration] = useState(0);
   useEffect(() => {
-    client.load();
+    if (client.drafts.size) client.flush().catch(() => {});
+    else client.load();
     const keys = (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
@@ -397,7 +408,7 @@ function Notebook() {
       window.removeEventListener("beforeunload", unload);
       document.removeEventListener("visibilitychange", hidden);
     };
-  }, []);
+  }, [client]);
   const w = state.workspace;
   if (!w)
     return (
@@ -524,7 +535,7 @@ function Notebook() {
               nodes={nodes}
               go={go}
               verified={state.verified}
-              notebookKey={parseCursor(w.cursor)?.feedId ?? w.home}
+              notebookKey={[owner?.id, parseCursor(w.cursor)?.feedId ?? w.home].filter(Boolean).join("/")}
             />
           ) : view === "activity" ? (
             <ActivityFeed client={client} cursor={w.cursor} go={go} />
@@ -532,7 +543,7 @@ function Notebook() {
             <DocumentView
               key={[parseCursor(w.cursor)?.feedId ?? w.home, doc.id, state.verified, generation].join("/")}
               readOnly={!state.verified}
-              {...{ doc, nodes, go }}
+              {...{ client, doc, nodes, go }}
               showDialog={setDialog}
               jump={search.block}
               status={state.status}
@@ -579,4 +590,12 @@ function Notebook() {
     </div>
   );
 }
-createRoot(document.getElementById("root")).render(<RouterProvider router={router} />);
+createRoot(document.getElementById("root")).render(
+  <SessionGate>
+    {(session) => (
+      <NotebookSession.Provider key={session.owner?.id ?? "local"} value={session}>
+        <RouterProvider router={router} />
+      </NotebookSession.Provider>
+    )}
+  </SessionGate>,
+);

@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "node --watch server/main.mjs --dev",
     "build": "vite build",
+    "preview": "node server/main.mjs --local",
     "start": "node server/main.mjs",
     "test": "node --test server/*.test.mjs"
   },

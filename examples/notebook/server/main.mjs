@@ -3,12 +3,19 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, sep, extname } from "node:path";
 import { openNotebook, fail } from "./store.mjs";
+import { allowedHost, authConfig, githubAuth } from "./auth.mjs";
 
 const base = dirname(dirname(fileURLToPath(import.meta.url)));
 const port = Number(process.env.PORT ?? 5173);
-const notebook = await openNotebook(process.env.NOTEBOOK_DIR ?? resolve(base, ".local/notebook"));
 const dev = process.argv.includes("--dev");
+const config = authConfig(process.env, dev || process.argv.includes("--local"));
+const auth = config && githubAuth(config);
+const host = process.env.HOST ?? "127.0.0.1";
+if (!config && host !== "127.0.0.1") throw new Error("Local mode requires HOST=127.0.0.1.");
 const dist = resolve(base, "dist");
+const dataDir = resolve(process.env.NOTEBOOK_DIR ?? resolve(base, ".local/notebook"));
+if (dataDir === dist || dataDir.startsWith(dist + sep)) throw new Error("Keep NOTEBOOK_DIR outside dist/.");
+const notebook = await openNotebook(dataDir);
 const mime = {
   ".html": "text/html",
   ".js": "text/javascript",
@@ -25,11 +32,31 @@ const send = (res, value, status = 200) => {
 let vite;
 const server = createServer(async (req, res) => {
   try {
-    if (!/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(req.headers.host ?? ""))
-      fail("Use the local notebook address.", 403);
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("referrer-policy", "no-referrer");
+    res.setHeader("x-content-type-options", "nosniff");
+    res.setHeader("x-frame-options", "DENY");
+    if (!allowedHost(req, config)) fail("Unrecognized notebook host.", 403);
     const url = new URL(req.url, "http://localhost");
     const path = url.pathname;
+    if (path.startsWith("/auth/")) {
+      if (!auth) fail("GitHub sign-in is disabled in local mode.", 404);
+      return await auth.handle(req, res, url);
+    }
     if (path.startsWith("/api/")) {
+      const owner = auth?.session(req);
+      if (req.method === "GET" && path === "/api/session")
+        return send(
+          res,
+          auth
+            ? {
+                mode: "github",
+                owner: owner ? { id: owner.id, login: owner.login } : null,
+                validFor: owner ? Math.max(0, owner.expiresAt - Date.now()) : 0,
+              }
+            : { mode: "local" },
+        );
+      if (auth && !owner) fail("Sign in to open this notebook.", 401);
       if (req.method === "GET" && path === "/api/workspace") return send(res, await notebook.workspace());
       if (req.method === "GET" && path === "/api/activity")
         return send(res, await notebook.activity(url.searchParams.get("before")));
@@ -38,8 +65,8 @@ const server = createServer(async (req, res) => {
       if (req.method === "GET" && /^\/api\/history\/\d+$/.test(path))
         return send(res, await notebook.history(path.split("/").pop()));
       if (req.method === "POST" && path === "/api/command") {
-        if (req.headers.origin && new URL(req.headers.origin).host !== req.headers.host)
-          fail("Different origin.", 403);
+        const origin = config?.origin.origin ?? "http://" + req.headers.host;
+        if ((auth || req.headers.origin) && req.headers.origin !== origin) fail("Different origin.", 403);
         if (!req.headers["content-type"]?.startsWith("application/json")) fail("Expected JSON.", 415);
         const chunks = [];
         let size = 0;
@@ -63,6 +90,8 @@ const server = createServer(async (req, res) => {
     if (!file.startsWith(dist + sep) && file !== dist) fail("Invalid path.");
     if (!extname(file)) file = resolve(dist, "index.html");
     const data = await readFile(file);
+    if (file.startsWith(resolve(dist, "assets") + sep))
+      res.setHeader("cache-control", "public, max-age=31536000, immutable");
     res.writeHead(200, { "content-type": mime[extname(file)] ?? "application/octet-stream" });
     res.end(data);
   } catch (err) {
@@ -75,8 +104,10 @@ if (dev) {
   const { createServer: createVite } = await import("vite");
   vite = await createVite({ root: base, server: { middlewareMode: true, hmr: { server } }, appType: "spa" });
 }
-server.listen(port, "127.0.0.1", () =>
-  console.log(`Notebook running at http://127.0.0.1:${server.address().port}`),
+server.listen(port, host, () =>
+  console.log(
+    `Notebook listening on ${host}:${server.address().port} (${config?.origin.origin ?? "local access"})`,
+  ),
 );
 async function close() {
   await vite?.close();

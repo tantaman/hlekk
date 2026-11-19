@@ -14,7 +14,27 @@ npm run dev
 
 Open [the notebook](http://127.0.0.1:5173). The first run creates a small linked notebook. Drafts, graph edges, and commits persist in `.local/notebook/` inside this example. Set `NOTEBOOK_DIR` to choose a different directory and `PORT` to change the port. Run one server per directory.
 
-To serve a production build locally, run `npm run build` followed by `npm start`. Run `npm test` for persistence, concurrency, and revision checks.
+To preview a production build on this computer, run `npm run build` followed by `npm run preview`. Both local commands bind to loopback. Use `npm test` to run the notebook tests.
+
+## Publish your notebook with GitHub sign-in
+
+1. Choose a dedicated HTTPS origin, for example `https://notes.example.com`. Register a [GitHub OAuth App](https://github.com/settings/applications/new) with that homepage URL and `https://notes.example.com/auth/github/callback` as its **Authorization callback URL**. Generate a client secret.
+2. Get your numeric GitHub account ID by running `gh api user --jq .id` while signed in as the intended owner. Folio checks this ID on every sign-in, so renaming your GitHub account preserves access.
+3. Set the following **server runtime** variables on your host. Store the client secret in the host’s secret settings.
+
+   | Variable | Value |
+   | --- | --- |
+   | `PUBLIC_ORIGIN` | The HTTPS homepage origin registered above |
+   | `GITHUB_CLIENT_ID` | The OAuth app’s client ID |
+   | `GITHUB_CLIENT_SECRET` | The OAuth app’s client secret |
+   | `GITHUB_OWNER_ID` | Your numeric GitHub account ID |
+   | `NOTEBOOK_DIR` | An absolute directory on a persistent volume, outside the web assets |
+   | `HOST`, `PORT` | Defaults are `127.0.0.1` and `5173`. Set `HOST=0.0.0.0` if your container host requires it. |
+
+4. Deploy the repository with Node.js 24 or newer. The server imports Hlekk from the repository’s `src/` directory. From `examples/notebook`, run `npm ci`, `npm run build`, then `npm start`. Run one instance behind an HTTPS reverse proxy that preserves the public `Host` header. To publish your existing notebook, stop its local server and copy the entire `.local/notebook/` directory to the persistent volume before the first hosted start.
+5. Open the public URL and choose **Continue with GitHub**. A bookmarked document reopens after sign-in. Other GitHub accounts cannot read or edit the notebook. To test the flow on your computer, register a separate OAuth app with a loopback origin such as `http://127.0.0.1:5173` and use the same callback path.
+
+Folio requests identity access without repository scopes. Sessions last seven days and end when the server restarts. Each device checks its session before opening its owner-specific browser cache. **Sign out** in the sidebar ends that browser’s session and clears its local notebook cache. The notebook and its history stay on the server.
 
 ## Write and connect
 
