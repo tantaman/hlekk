@@ -23,7 +23,9 @@
 // **Failure is stated, never inferred.** A timeout, a refusal or a malformed answer is a named error
 // and fails the query. A caller that would rather have a partial answer opts in with `omit`, and
 // then gets a report of which databases could not be reached and how many references were left
-// unresolved — because an empty list must never be the way a failure is reported.
+// unresolved — because an empty list must never be the way a failure is reported. That covers a
+// database out of reach, and not a request that was wrong: one refused as a bad request fails the
+// query with `omit` or without it, since nothing was missing but a correct request.
 
 import { BudgetSpent } from "../client/budget.ts";
 import { Catalog, idFieldsOf } from "../catalog/catalog.ts";
@@ -54,10 +56,15 @@ export const DEFAULT_BATCH = 100;
 
 export class ForeignRefused extends Error {
   readonly database: string;
-  constructor(database: string, why: string) {
+  /** The status it was refused with: 400 where the request is wrong, 401 or 403 where the caller is
+   *  not one this database answers. Absent for an answer that arrived and could not be accepted.
+   *  The two are not the same failure, and `omit` covers only the second: see `mistaken`. */
+  readonly status?: number;
+  constructor(database: string, why: string, status?: number) {
     super(`${database} refused a read: ${why}`);
     this.name = "ForeignRefused";
     this.database = database;
+    if (status !== undefined) this.status = status;
   }
 }
 
@@ -96,6 +103,22 @@ export class NotFollowed extends Error {
   }
 }
 
+/**
+ * Whether a failure is the request's own, and not a database being out of reach.
+ *
+ * `omit` leaves out what could not be reached. A database that was reached and answered that the
+ * request is wrong — an edge it has no count for, a cost over its budget — was not unreachable, and
+ * neither is a read this client could not turn into a request at all. Both are the caller's to
+ * correct. Left out instead, they came back as an answer missing a database that was up the whole
+ * time, with the objects the request entered from reported as the ones that could not be read: the
+ * loudest thing a responder says, turned into the quietest.
+ *
+ * A 401 or a 403 is the other kind. The request may be a good one; this caller is not one the
+ * database answers, and for the caller that is a database it cannot read.
+ */
+const mistaken = (e: unknown): boolean =>
+  e instanceof NotFollowed || (e instanceof ForeignRefused && e.status === 400);
+
 /** What could not be reached, for a caller that opted into an answer without it. */
 export interface Omitted {
   /** Databases that failed, and how many references were left unresolved in each. */
@@ -125,7 +148,9 @@ export interface ForeignOptions {
   /** Refuses a URI before it is reached, where the platform can tell. See `adapters/node/guard.ts`. */
   guard?: ((database: string) => Promise<void>) & { fetch?: typeof fetch };
   /** Collects what could not be reached instead of failing the query. Absent, a failure throws,
-   *  which is the default [`PLAN.md`](../../PLAN.md) settled on and the one this leaves reversible. */
+   *  which is the default [`PLAN.md`](../../PLAN.md) settled on and the one this leaves reversible.
+   *  A request the database refused as wrong is not something it could not be reached for, and
+   *  throws either way. */
   omit?: Omitted;
   /**
    * The asking database's own URI, when it has one.
@@ -325,8 +350,9 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
       } catch (e) {
         // `omit` covers a database that could not be reached. A repudiated one was reached and
         // answered — with a key that is not the one it proved before — and omitting that would turn
-        // the loudest signal in the design into an empty list.
-        if (opts.omit === undefined || e instanceof Repudiated || e instanceof BudgetSpent) throw e;
+        // the loudest signal in the design into an empty list. A request that was wrong is the same
+        // case from the other side: see `mistaken`.
+        if (opts.omit === undefined || e instanceof Repudiated || e instanceof BudgetSpent || mistaken(e)) throw e;
         // Opted into an answer without it. Every reference this batch asked for comes back null and
         // the database is named in the report, so the answer says what is missing instead of
         // looking complete.
@@ -739,7 +765,7 @@ async function readJson(db: string, url: string, opts: TransportOptions, init: R
     const res = await call(url, { ...init, signal, redirect: "error", cache: "no-store" });
     if ([400, 401, 403].includes(res.status)) {
       const refusal = await text(res, cap).then(parse).catch(() => null) as { error?: string; at?: string } | null;
-      throw new ForeignRefused(db, `${refusal?.at ?? "?"}: ${refusal?.error ?? `status ${res.status}`}`);
+      throw new ForeignRefused(db, `${refusal?.at ?? "?"}: ${refusal?.error ?? `status ${res.status}`}`, res.status);
     }
     if (!res.ok) {
       void res.body?.cancel().catch(() => {});

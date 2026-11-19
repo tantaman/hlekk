@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 
 import { Catalog, plan as planLock } from "../catalog/catalog.ts";
 import type { Lock } from "../catalog/catalog.ts";
-import { ForeignUnreachable, Repudiated } from "../protocol/client.ts";
+import { ForeignRefused, ForeignUnreachable, Repudiated } from "../protocol/client.ts";
 import { generateKeyPair } from "../protocol/identity.ts";
 import { surfaceOf } from "../protocol/surface.ts";
 import { Refused } from "../query/request.ts";
@@ -428,6 +428,18 @@ describe("a database that cannot be reached", () => {
     assert.deepEqual(page(row, "about").items.map((r) => r.id), [w.incident]);
     assert.deepEqual(omit.databases, { [GONE]: 1 });
     assert.deepEqual(omit.references, [`${GONE}#7`], "and which reference, so a caller can say what is missing");
+  });
+
+  it("is not what a refused request is, whatever the caller asked to have left out", async () => {
+    // `notes.author_of` follows an id in a payload and has no count, so the notes database refuses
+    // the request: reached, and answering. `omit` once took that for an outage, and the read came
+    // back empty with the note it entered from reported as the thing that could not be read.
+    const w = await world();
+    const omit = { databases: {} as Record<string, number>, references: [] as string[] };
+    const err = await w.reader.read(w.first, { counts: ["notes.author_of"] }, { omit }).then(() => null, (e: Error) => e);
+    assert.ok(err instanceof ForeignRefused, String(err));
+    assert.match(err.message, /has no count/);
+    assert.deepEqual(omit, { databases: {}, references: [] });
   });
 
   it("is bounded by how many databases one read may reach", async () => {
