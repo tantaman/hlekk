@@ -407,6 +407,7 @@ npm run conformance:fixture   # the conformance suite, against the published fix
 | [`src/reader/`](src/reader/reader.ts) | The standalone client: reads across databases from a process that runs none |
 | [`src/adapters/`](src/adapters/) | The two adapters: Node.js over files, and Cloudflare Workers with Durable Objects |
 | [`PLAN.md`](PLAN.md) | What is done and what is not |
+| [`site/index.html`](site/index.html) | The product page: one file, no build |
 
 The documents are the point. Every decision that was hard is written down with the reading or the
 argument that settled it, and the ones still open are listed as open.
@@ -422,11 +423,13 @@ npm install /path/to/hlekk                     # in your project
 
 ## What it does not do
 
-- **Cross-database writes, inverses and cascades.** Reads only, and that is a decision rather than a
-  gap: delivery routes through a host's own client, which is scoped to one database and never gives
-  up, so writing the other half of a cross-database edge would mean holding credentials to write into
-  someone else's database inside a path with no give-up. A target database that wants a backlink
-  subscribes; it does not get written into.
+- **Cross-database writes, inverses and cascades.** No foreign writes in version 1: a database
+  writes to itself and reads from others. Foreign writes are deferred rather than ruled out, and
+  adding them later is additive (`docs/protocol.md`). They cannot ride the machinery that exists:
+  delivery routes through a host's own client, which is scoped to one database and never gives up,
+  so writing the other half of a cross-database edge would mean holding credentials to write into
+  someone else's database inside a path with no give-up. For now, a target database that wants a
+  backlink subscribes; it does not get written into.
 - **Backlinks across databases.** A subscription protocol with its own threat model.
 - **A global directory of databases.** A URI is the name and DNS arbitrates it. Discovery is not
   identity.
@@ -448,9 +451,9 @@ npm install /path/to/hlekk                     # in your project
   all. What makes it safe is that **mounting the handler is the act of exposure**: a database that
   exists and is not mounted is reachable by nobody. `src/query/serve.ts` records the one thing that
   would invert that argument.
-- **Writes are nobody's but yours.** There is no write operation in the protocol and there is not
-  going to be one. Writing is your own client, inside your own deployment, behind whatever you
-  already have.
+- **Writes are nobody's but yours.** A database is written locally, by your own client, inside your
+  own deployment, behind whatever you already have. The protocol between databases has no write
+  operation in version 1.
 
 ## Contributing
 

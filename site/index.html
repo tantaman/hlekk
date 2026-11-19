@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!--
+  The product page, set as a technical report that somebody has read with a pen in hand.
+
+  ONE FILE, NO BUILD. Open it, or serve the directory; nothing here is generated and nothing runs.
+  The only requests it makes are for three typefaces, and it reads correctly without them.
+
+  WHAT THE NUMBERS ARE. Table 1 is the Wikimedia demo's, and the figures are the ones
+  `scripts/og-card.html` records: 950,421 pages and 42,817,596 edges are measured, and 43 hosts and
+  192 vshards follow from `/admin/init?hosts=50&indexVshards=64`. If the demo changes, this table is
+  stale and nothing will say so.
+
+  WHAT THE MARGINALIA ARE. The handwriting is a reader's, and each note sits beside the line it is
+  about. Below 900px there is no margin to write in, so a note drops under its section and loses its
+  arrow rather than pointing at nothing.
+
+  THE RUNES in the footer are the name in Younger Futhark, which has no separate e: they read
+  h-l-i-k-k. They are drawn rather than set, so they do not depend on a font that has the block.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hlekk: An open and global graph database</title>
+<meta name="description" content="An object has a type and payload. Edges between objects can span databases. Queries are hops between objects. The engine spreads a database over as many hosts as required.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Hlekk: An open and global graph database">
+<meta property="og:description" content="An object has a type and payload. Edges between objects can span databases. Queries are hops between objects.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'%3E%3Cg fill='none' stroke='%23161614' stroke-width='9'%3E%3Crect x='50' y='45' width='60' height='30' rx='15'/%3E%3Crect x='10' y='45' width='60' height='30' rx='15'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Old+Standard+TT:ital,wght@0,400;0,700;1,400&family=Courier+Prime:ital,wght@0,400;0,700;1,400&family=Reenie+Beanie&display=swap">
+<style>
+:root{
+  --paper:#efefeb;--ink:#161614;--grey:#55554f;
+  --pen:#1c3fa8;      /* the reader's ballpoint */
+  --ribbon:#a3231c;   /* the red half of a two-colour typewriter ribbon */
+  --serif:'Old Standard TT','Times New Roman',Times,serif;
+  --mono:'Courier Prime','Courier New',Courier,monospace;
+  --hand:'Reenie Beanie','Bradley Hand',cursive;
+  --measure:660px;
+  color-scheme:light;
+}
+*{box-sizing:border-box}
+html{background:var(--paper);-webkit-text-size-adjust:100%}
+body{margin:0;padding:22px clamp(20px,6%,96px) 64px;color:var(--ink);
+  font-family:var(--serif);font-size:1.1875rem;line-height:1.5}
+a{color:var(--ink)}
+a:hover{color:var(--pen)}
+a:focus-visible{outline:2px solid var(--pen);outline-offset:3px}
+p{margin:0}
+[id]{scroll-margin-top:16px}
+
+/* ---- the running head, typewritten */
+.strip{max-width:1040px;margin:0 auto;display:flex;flex-wrap:wrap;align-items:center;
+  justify-content:space-between;gap:0 28px;border-bottom:3px double var(--ink);
+  font-family:var(--mono);font-size:.875rem;letter-spacing:.06em;text-transform:uppercase}
+.strip span,.strip a{padding:13px 0}
+.strip nav{display:flex;flex-wrap:wrap;gap:0 26px}
+.strip nav a{text-decoration:none}
+.strip nav a:last-child{text-decoration:underline}
+
+/* ---- the title block */
+.title{max-width:1040px;margin:0 auto;padding:68px 0 54px;text-align:center}
+h1{margin:0 auto;max-width:20em;font-weight:400;font-size:clamp(1.9375rem,4.3vw,3.375rem);
+  line-height:1.13;letter-spacing:-.012em;text-wrap:balance}
+h1 sup{font-size:.5em;line-height:0}
+h1 sup a{text-decoration:none}
+.author{margin-top:30px;font-size:1.3125rem;font-variant:small-caps;letter-spacing:.09em}
+.date{margin-top:2px;font-style:italic;font-size:1.125rem}
+.obtain{margin:34px 0 10px;font-style:italic;font-size:1.125rem}
+.clone{display:inline-block;background:var(--ink);color:var(--paper);font-family:var(--mono);
+  font-size:1.0625rem;line-height:1.3;padding:13px 22px;text-decoration:none;overflow-wrap:anywhere}
+.clone:hover{color:var(--paper);background:var(--pen)}
+
+/* ---- the body: one measure, with a margin either side of it for the reader's pen */
+.row{max-width:1040px;margin:52px auto 0;display:grid;
+  grid-template-columns:minmax(0,1fr) minmax(0,var(--measure)) minmax(0,1fr);column-gap:30px}
+.row > .col{grid-column:2;min-width:0}
+.row > .note{grid-column:3}
+.row.first{margin-top:0}
+.row.tight{margin-top:22px}
+h2{margin:0 0 8px;font-size:1.375rem;font-weight:700;line-height:1.25}
+.col > p{text-align:justify;hyphens:auto}
+.col > p + p{margin-top:16px}
+code{font-family:var(--mono);font-size:.86em}
+
+.fn{margin-top:34px}
+.fn::before{content:"";display:block;width:130px;border-top:1px solid var(--ink);margin-bottom:8px}
+.fn p{font-size:1rem;line-height:1.4;text-align:left}
+.fn a{text-decoration:none}
+
+/* ---- listings, typed in two colours */
+pre{margin:16px 0 0;padding:14px 16px;border:1px solid var(--ink);overflow-x:auto;
+  font-family:var(--mono);font-size:.9375rem;line-height:1.45;tab-size:2}
+pre code{font-size:inherit}
+h2 + pre{margin-top:4px}
+.c{font-style:italic;color:var(--grey)}   /* comment */
+.k{font-weight:700}                        /* keyword, or the command */
+.s{color:var(--ribbon)}                    /* a literal: string, number, path, address */
+.p{color:var(--grey)}                      /* the prompt */
+.cap{margin-top:10px;font-size:1rem;line-height:1.4;text-align:center !important}
+
+/* ---- Figure 1 */
+figure{margin:28px 0 0}
+.wire{display:flex;align-items:center}
+.box{flex:0 1 180px;min-width:0;border:1.5px solid var(--ink);padding:10px 12px;
+  font-family:var(--mono);font-size:.875rem;line-height:1.4;overflow-wrap:anywhere}
+.box.far{flex-basis:262px}
+.hop{flex:1 1 90px;min-width:60px;display:flex;flex-direction:column;align-items:center;gap:3px;
+  font-size:1rem;font-style:italic;line-height:1.2}
+.hop small{font-size:.875rem}
+.arrow{align-self:stretch;display:flex;align-items:center}
+.arrow::before{content:"";flex:1 1 auto;border-top:1.5px solid var(--ink)}
+.arrow::after{content:"";flex:none;border-left:11px solid var(--ink);
+  border-top:5.5px solid transparent;border-bottom:5.5px solid transparent}
+figcaption{margin-top:12px;font-size:1rem;line-height:1.4;text-align:center}
+
+/* ---- Table 1, ruled the way a typeset table is: above, below, and under the head */
+table{margin:24px auto 0;min-width:min(100%,24rem);border-collapse:collapse;font-size:1.125rem;
+  line-height:1.3;font-variant-numeric:tabular-nums}
+caption{caption-side:top;padding-bottom:10px;font-size:1rem}
+th{font-weight:400;font-style:italic;padding:7px 4px;
+  border-top:2px solid var(--ink);border-bottom:1px solid var(--ink)}
+td{padding:3px 4px}
+th:first-child,td:first-child{text-align:left;padding-right:56px}
+th:last-child,td:last-child{text-align:right;padding-left:56px}
+tbody tr:first-child td{padding-top:7px}
+tbody tr:last-child td{padding-bottom:8px;border-bottom:2px solid var(--ink)}
+
+/* ---- lists */
+ol{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:6px}
+ol li{display:flex;gap:12px}
+ol li > :first-child{flex:none;width:28px}
+.refs{font-size:1.0625rem;line-height:1.42}
+.close{margin-top:22px;font-style:italic}
+
+/* ---- the reader's pen */
+.note{font-family:var(--hand);font-size:1.9375rem;line-height:.92;color:var(--pen);
+  min-width:0;transform:rotate(var(--tilt,-3deg));transform-origin:left center}
+.note svg{display:block;margin-bottom:2px;fill:none;stroke:var(--pen);stroke-width:2;
+  stroke-linecap:round;stroke-linejoin:round}
+.pen{text-decoration:underline;text-decoration-color:var(--pen);text-decoration-thickness:2px;
+  text-underline-offset:5px;text-decoration-skip-ink:none}
+
+/* ---- the colophon */
+footer{max-width:var(--measure);margin:60px auto 0;border-top:3px double var(--ink);
+  padding-top:26px;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;
+  gap:20px 28px}
+footer svg{display:block;flex:none;fill:none;stroke:var(--ink);stroke-width:2.6;stroke-linecap:square}
+footer .clone{font-size:1rem;padding:13px 20px}
+footer p{flex:1 1 100%;font-family:var(--mono);font-size:.875rem;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--grey)}
+
+/* ---- no margin to write in: a note follows its section, and has nothing to point at */
+@media (max-width:899px){
+  .row{display:block}
+  .note{margin:14px 0 0 !important;transform-origin:left top}
+  .note svg{display:none}
+  .note br{display:none}
+}
+@media (max-width:559px){
+  .clone,footer .clone{font-size:.8125rem;padding:13px 14px;overflow-wrap:normal}
+  .wire{flex-direction:column;align-items:stretch}
+  .box,.box.far{flex:none}
+  .hop{flex:none;flex-direction:row;justify-content:center;gap:12px;padding:6px 0}
+  .arrow{align-self:center;flex-direction:column;height:30px}
+  .arrow::before{border-top:0;border-left:1.5px solid var(--ink)}
+  .arrow::after{border-left:5.5px solid transparent;border-right:5.5px solid transparent;
+    border-bottom:0;border-top:11px solid var(--ink)}
+}
+
+/* ---- it is a report, so it should print as one */
+@media print{
+  html{background:#fff}
+  body{padding:0;font-size:11pt}
+  .strip nav,.obtain,.clone{display:none}
+  .title{padding:24pt 0 20pt}
+  pre,figure,table,li{break-inside:avoid}
+  h2{break-after:avoid}
+  a{text-decoration:none}
+}
+</style>
+</head>
+<body>
+
+<header class="strip">
+  <span>hlekk &middot; Technical Report &middot; Version 0.1.0</span>
+  <nav aria-label="Sections">
+    <a href="#abstract">Abstract</a>
+    <a href="#running">Running one</a>
+    <a href="#references">References</a>
+    <a href="https://github.com/tantaman/hlekk">Source</a>
+  </nav>
+</header>
+
+<main>
+
+<div class="title">
+  <h1>Hlekk<sup><a href="#name" aria-label="Footnote on the name">&dagger;</a></sup>: An open and global graph database</h1>
+  <p class="author">Matt Wonlaw</p>
+  <p class="date">November 2026</p>
+  <p class="obtain">Copies may be obtained by typing:</p>
+  <a class="clone" href="https://github.com/tantaman/hlekk">git clone https://github.com/tantaman/hlekk</a>
+</div>
+
+<section class="row first" id="abstract">
+  <div class="col">
+    <p><b>Abstract.</b> An object has a type and payload. <span class="pen">Edges between objects can span databases.</span> Queries are hops between objects. The engine spreads a database over as many hosts as required.</p>
+    <div class="fn" id="name"><p><sup>&dagger;</sup> Old Norse for a chain link.</p></div>
+  </div>
+  <aside class="note" style="--tilt:-4deg">
+    <svg aria-hidden="true" width="62" height="26" viewBox="0 0 62 26"><path d="M58 5C42 1 22 8 5 19"/><path d="M16 18 5 19l5-10"/></svg>
+    the whole idea
+  </aside>
+</section>
+
+<section class="row">
+  <div class="col">
+    <h2>1&ensp;Introduction</h2>
+    <p>Hlekk is a TAO-style [<a href="#ref1">1</a>] object-and-edge database. The application gives locality hints, such as creating a comment <code>with</code> its issue. The engine owns capacity and moves shards between hosts. A database starts on one host and grows to many with no application changes.</p>
+  </div>
+</section>
+
+<section class="row" id="edge">
+  <div class="col">
+    <h2>2&ensp;An edge into another database</h2>
+    <p>An edge&rsquo;s target may be a reference: another database&rsquo;s URI, a number sign, and a local id.</p>
+<pre><code><span class="c">// In the notes database. The target is a reference, not an id.</span>
+<span class="k">await</span> notes.assocAdd(noteAbout, note,
+  <span class="s">"https://wiki.example/db#281474976710691"</span>);
+
+<span class="c">// And one query brings the page back from the wiki.</span>
+<span class="k">const</span> [row] = <span class="k">await</span> Note.gen(note)
+  .related(<span class="s">"about"</span>, noteAbout).run(notes);
+row.about[<span class="s">0</span>].title; <span class="c">// "Country"</span></code></pre>
+    <p class="cap"><b>Listing 1.</b> One edge out, one query back.</p>
+  </div>
+  <aside class="note" style="--tilt:3deg;align-self:center;margin-top:52px">
+    <svg aria-hidden="true" width="62" height="26" viewBox="0 0 62 26"><path d="M57 20C44 6 22 3 5 11"/><path d="M15 5 5 11l11 5"/></svg>
+    a URI,<br> not an id!
+  </aside>
+</section>
+
+<div class="row tight">
+  <div class="col">
+    <p>Different people run the two databases. The query crosses over HTTP, and the wiki decides what the notes database may see.</p>
+    <figure>
+      <div class="wire">
+        <div class="box"><b>the notes database</b><br>a note</div>
+        <div class="hop"><span>about</span><span class="arrow" aria-hidden="true"></span><small>over HTTP</small></div>
+        <div class="box far"><b>https://wiki.example/db</b><br>#281474976710691, &ldquo;Country&rdquo;</div>
+      </div>
+      <figcaption><b>Figure 1.</b> Reads cross. In version 1, writes stay local.</figcaption>
+    </figure>
+  </div>
+</div>
+
+<section class="row" id="running">
+  <div class="col">
+    <h2>3&ensp;Running one</h2>
+<pre><code><span class="p">$ </span><span class="k">npm</span> install
+<span class="p">$ </span><span class="k">node</span> src/adapters/node/serve.ts --dir <span class="s">./my-database</span> \
+    --port <span class="s">8080</span> --path <span class="s">/db</span>
+<span class="p">$ </span><span class="k">curl</span> <span class="s">http://127.0.0.1:8080/db</span>              <span class="c"># the descriptor</span>
+<span class="p">$ </span><span class="k">curl</span> <span class="s">http://127.0.0.1:8080/db/vocabulary</span>   <span class="c"># types and edges</span></code></pre>
+    <p class="cap"><b>Listing 2.</b> A whole database.</p>
+    <p>A directory of SQLite files, one process, and the protocol on a port. No account anywhere. A second one, with an edge drawn at its URI, is a federation. It also runs on Cloudflare Durable Objects, Rivet and celld.</p>
+  </div>
+  <aside class="note" style="--tilt:-3deg;align-self:end;margin-bottom:34px">
+    no account.<br> good.
+  </aside>
+</section>
+
+<section class="row">
+  <div class="col">
+    <h2>4&ensp;A measurement</h2>
+    <p>Table&nbsp;1 is a mirror of Simple English Wikipedia, queried read-only. One read assembles a page&rsquo;s neighbourhood from many hosts at once.</p>
+    <table>
+      <caption><b>Table 1.</b> A simplewiki mirror on Durable Objects.</caption>
+      <thead><tr><th scope="col">Quantity</th><th scope="col">Measured</th></tr></thead>
+      <tbody>
+        <tr><td>Pages</td><td>950,421</td></tr>
+        <tr><td>Edges</td><td>42,817,596</td></tr>
+        <tr><td>Host objects</td><td>43</td></tr>
+        <tr><td>Vshards</td><td>192</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="row">
+  <div class="col">
+    <h2>5&ensp;What it does not do</h2>
+    <ol>
+      <li><span>(a)</span><span><i>Foreign writes.</i> Not in version 1. A database writes only to itself.</span></li>
+      <li><span>(b)</span><span><i>Backlinks across databases.</i> A database that wants one subscribes.</span></li>
+      <li><span>(c)</span><span><i>A global directory.</i> A URI is the name; DNS arbitrates it.</span></li>
+      <li><span>(d)</span><span><i>Many databases in one deployment.</i> One deployment, one database.</span></li>
+      <li><span>(e)</span><span><i>A permission model.</i> The caller is a trusted server.</span></li>
+    </ol>
+  </div>
+  <aside class="note" style="--tilt:-2deg;margin-top:34px">
+    <svg aria-hidden="true" width="62" height="26" viewBox="0 0 62 26"><path d="M57 20C44 6 22 3 5 11"/><path d="M15 5 5 11l11 5"/></svg>
+    no foreign writes<br> in version 1.
+  </aside>
+</section>
+
+<section class="row" id="references">
+  <div class="col">
+    <h2>References</h2>
+    <ol class="refs">
+      <li id="ref1"><span>[1]</span><span>N. Bronson et al. <a href="https://www.usenix.org/conference/atc13/technical-sessions/presentation/bronson">TAO: Facebook&rsquo;s distributed data store for the social graph</a>. In <i>2013 USENIX Annual Technical Conference</i>.</span></li>
+      <li><span>[2]</span><span><a href="https://github.com/tantaman/hlekk/blob/main/spec/protocol.md">spec/protocol.md</a>. The normative specification.</span></li>
+      <li><span>[3]</span><span><a href="https://github.com/tantaman/hlekk/blob/main/docs/design.md">docs/design.md</a>. The engine, and what was rejected.</span></li>
+      <li><span>[4]</span><span><a href="https://github.com/tantaman/hlekk/blob/main/docs/protocol.md">docs/protocol.md</a>. The rationale, and what cannot be revised.</span></li>
+      <li><span>[5]</span><span><a href="https://github.com/tantaman/hlekk/blob/main/docs/global-ids.md">docs/global-ids.md</a>. How a reference is stored and named.</span></li>
+    </ol>
+    <p class="close">The documents are the point. Every hard decision is written down, and the open ones are listed as open.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <svg role="img" aria-label="hlekk, written in Younger Futhark runes" width="106" height="40" viewBox="0 0 106 40"><path d="M10 2V38M3 12L17 28M17 12L3 28M30 2V38M30 2L41 14M54 2V38M67 2V38M67 24L78 11M91 2V38M91 24L102 11"/></svg>
+  <a class="clone" href="https://github.com/tantaman/hlekk">git clone https://github.com/tantaman/hlekk</a>
+  <p>Apache-2.0 &middot; The runes spell the name</p>
+</footer>
+
+</body>
+</html>
