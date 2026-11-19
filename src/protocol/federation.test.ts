@@ -5,7 +5,7 @@ import { Catalog, plan as planLock } from "../catalog/catalog.ts";
 import type { Lock } from "../catalog/catalog.ts";
 import { federate } from "../testkit/federation.ts";
 import type { Federation } from "../testkit/federation.ts";
-import { ForeignUnreachable, NotFollowed, ResponseCache, foreignClient } from "./client.ts";
+import { ForeignRefused, ForeignUnreachable, NotFollowed, ResponseCache, foreignClient } from "./client.ts";
 import { defineObject, edge, str } from "../schema/define.ts";
 import { objField } from "../schema/query.ts";
 import { DEFAULT_LIMITS } from "../query/request.ts";
@@ -513,6 +513,27 @@ describe("a foreign hop that fails", () => {
       assert.deepEqual(f.omitted.databases, { [WIKI]: 1 });
     });
   }
+
+  it("omits a database that will not answer this caller, and never one that said the request was wrong", async () => {
+    // Both arrive as a refusal, and only one of them is a database out of reach. A 403 is: the
+    // request may be a good one, and this caller is not one it answers. A 400 is a request to
+    // correct, and leaving the database out instead reports an outage that did not happen.
+    const refusing = (status: number) => (inner: typeof fetch): typeof fetch => async (input, init) =>
+      String(input).endsWith("/read")
+        ? new Response(JSON.stringify({ error: "refused", at: "hops[0]" }), { status })
+        : inner(input, init);
+
+    const closed = await two({ wrap: refusing(403), omit: true });
+    const rows = (await closed.f.member(NOTES).db.query(ABOUT_PLAN, [closed.note])) as { about: unknown[] }[];
+    assert.deepEqual(rows[0].about, []);
+    assert.deepEqual(closed.f.omitted.databases, { [WIKI]: 1 });
+
+    const wrong = await two({ wrap: refusing(400), omit: true });
+    const err = await wrong.f.member(NOTES).db.query(ABOUT_PLAN, [wrong.note]).then(() => null, (e: Error) => e);
+    assert.ok(err instanceof ForeignRefused, String(err));
+    assert.equal(err.status, 400);
+    assert.deepEqual(wrong.f.omitted.databases, {}, "and nothing is reported as out of reach");
+  });
 
   it("gives up on a deadline rather than waiting on a database that never answers", async () => {
     const { f, note } = await two({ wrap: faulty("hang"), foreign: { deadlineMs: 50 } });
