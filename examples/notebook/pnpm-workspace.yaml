@@ -1,0 +1,5 @@
+minimumReleaseAgeExclude:
+  - lucide-react@1.76.0
+  - prosemirror-history@1.5.2
+  - prosemirror-inputrules@1.7.0
+  - prosemirror-view@1.43.0
