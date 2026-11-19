@@ -29,7 +29,7 @@
 import type { FieldSpec } from "../catalog/catalog.ts";
 import { decodeCursor } from "../schema/query.ts";
 import { isReservedKey } from "./types.ts";
-import type { CmpOp, Json } from "./types.ts";
+import type { CmpOp, Cond, Cursor, Frame, Json, Plan, Source } from "./types.ts";
 
 export const OPS: readonly CmpOp[] = ["=", "!=", "<", "<=", ">", ">="];
 
@@ -157,7 +157,14 @@ export function describe(spec: FieldSpec): { type: string; optional: boolean } {
   return { type: spec, optional: false };
 }
 
-function checkValue(at: string, field: string, value: Json, objectType: string, vocab: Vocabulary): void {
+/**
+ * Refuses a filter over a field the type does not have, or a value the field could not hold.
+ *
+ * Exported for a caller that only learns what an object is once a database has said so, and has to
+ * make this same refusal then (`reader/reader.ts`). It needs the fields of one type and nothing
+ * else of a vocabulary, which is all it is given.
+ */
+export function checkValue(at: string, field: string, value: Json, objectType: string, vocab: Pick<Vocabulary, "fields">): void {
   const fields = vocab.fields(objectType);
   if (fields === undefined) throw new Refused(at, `no object type "${objectType}" is exposed`);
   const spec = fields[field];
@@ -182,10 +189,10 @@ function checkValue(at: string, field: string, value: Json, objectType: string, 
  * the whole `at` path exists to avoid. The cost is that a new optional field needs a version rather
  * than arriving unannounced, and a protocol whose bodies already carry a version can afford that.
  */
-function onlyKnown(value: object, known: readonly string[], at: string): void {
+export function onlyKnown(value: object, known: readonly string[], at: string, hint = ""): void {
   for (const name of Object.keys(value)) {
     if (!known.includes(name)) {
-      throw new Refused(at, `no such member "${name}"; this one takes ${known.join(", ")}`);
+      throw new Refused(at, `no such member "${name}"; this one takes ${known.join(", ")}${hint}`);
     }
   }
 }
@@ -272,8 +279,59 @@ const COUNT_MEMBERS = ["as", "edge"] as const;
 /** Every member a read request itself may carry, for a caller that validates the entry too. */
 export const REQUEST_MEMBERS = ["ids", "counts", "hops"] as const;
 
-function checkCount(c: CountSpec, at: string, vocab: Vocabulary): void {
+// ---- what is wrong with a request whichever database it is asked of
+//
+// One function per kind of node, called from `check` at the point it reaches that node and from
+// `checkShape` on their own. They are separate so that there is one of each: a caller with no
+// single vocabulary to check against (`reader/reader.ts`) once kept its own copies of these, and
+// the copies had already stopped agreeing with the originals — a count with a member this protocol
+// does not define was refused here and taken there.
+
+function hopShape(hop: Hop, at: string): void {
+  if (hop === null || typeof hop !== "object") throw new Refused(at, "expected an object");
+  onlyKnown(hop, HOP_MEMBERS, at);
+}
+
+function cmpShape(c: Cmp, at: string): void {
+  if (c === null || typeof c !== "object") throw new Refused(at, "expected an object");
+  onlyKnown(c, CMP_MEMBERS, at);
+  if (typeof c.field !== "string" || !c.field || !("value" in c)) throw new Refused(at, "a comparison requires a field and value");
+  if (!OPS.includes(c.op)) throw new Refused(at, `operator must be one of ${OPS.join(" ")}`);
+}
+
+function countShape(c: CountSpec, at: string): void {
   if (typeof c === "object" && c !== null) onlyKnown(c, COUNT_MEMBERS, at);
+}
+
+/**
+ * Refuses what is wrong with a request whichever database it is asked of.
+ *
+ * `check` needs a vocabulary: whether an edge exists, where it starts, what a filter's field holds.
+ * A caller that puts one request to several databases has no single vocabulary to check it
+ * against, and still has to refuse the rest — a member this protocol does not define, a filter that
+ * is not a comparison, a limit that is not a number of rows — or a mistake `check` would have
+ * named comes back as an answer. With `checkAliases`, which stands apart for the same reason and is
+ * to be called first, this is everything about a request that is not a question for a database.
+ */
+export function checkShape(req: Request): void {
+  const level = (node: Request, at: string): void => {
+    for (const [i, c] of (node.counts ?? []).entries()) countShape(c, `${at}counts[${i}]`);
+    for (const [i, hop] of (node.hops ?? []).entries()) {
+      const path = `${at}hops[${i}]`;
+      hopShape(hop, path);
+      if (hop.limit !== undefined && (!Number.isInteger(hop.limit) || hop.limit < 1)) {
+        throw new Refused(`${path}.limit`, "limit must be an integer of at least 1");
+      }
+      if (hop.after !== undefined && typeof hop.after !== "string") throw new Refused(`${path}.after`, "expected a cursor");
+      for (const [j, c] of (hop.where ?? []).entries()) cmpShape(c, `${path}.where[${j}]`);
+      level(hop, `${path}.`);
+    }
+  };
+  level(req, "");
+}
+
+function checkCount(c: CountSpec, at: string, vocab: Vocabulary): void {
+  countShape(c, at);
   const edge = vocab.edge(countEdge(c));
   if (edge === undefined) throw new Refused(at, `no edge "${countEdge(c)}"`);
   if (edge.counted === false) {
@@ -299,8 +357,7 @@ function checkHop(
   /** The type the rows this hop is hung under are, where it is known. */
   parent: string | undefined,
 ): Counted {
-  if (hop === null || typeof hop !== "object") throw new Refused(at, "expected an object");
-  onlyKnown(hop, HOP_MEMBERS, at);
+  hopShape(hop, at);
   if (depth > limits.maxDepth) {
     throw new Refused(at, `hops nest ${depth} deep, the maximum is ${limits.maxDepth}`);
   }
@@ -337,10 +394,7 @@ function checkHop(
     }
   }
   for (const [i, c] of (hop.where ?? []).entries()) {
-    if (c === null || typeof c !== "object") throw new Refused(`${at}.where[${i}]`, "expected an object");
-    onlyKnown(c, CMP_MEMBERS, `${at}.where[${i}]`);
-    if (typeof c.field !== "string" || !c.field || !("value" in c)) throw new Refused(`${at}.where[${i}]`, "a comparison requires a field and value");
-    if (!OPS.includes(c.op)) throw new Refused(`${at}.where[${i}]`, `operator must be one of ${OPS.join(" ")}`);
+    cmpShape(c, `${at}.where[${i}]`);
     checkValue(`${at}.where[${i}]`, c.field, c.value, edge.to, vocab);
   }
   if ((hop.where ?? []).length > limits.maxWhere) {
@@ -416,4 +470,75 @@ export function check(req: Request, vocab: Vocabulary, limits: Limits = DEFAULT_
     );
   }
   return { frames, nodes };
+}
+
+// ---- from a request to a plan
+
+/** A hop's filters as one condition: their conjunction. Every filter is on the target object's
+ *  fields, which is what a filter's value is checked against. */
+export function condOf(where: Cmp[] | undefined): Cond | undefined {
+  const cmps = (where ?? []).map((w): Cond => ({ cmp: w.op, on: "obj", field: w.field, value: w.value }));
+  if (cmps.length === 0) return undefined;
+  return cmps.length === 1 ? cmps[0] : { and: cmps };
+}
+
+/**
+ * How the names in a request become what a plan carries.
+ *
+ * It is the one thing two compilers of the same request do differently. A database answering a
+ * read resolves a name through its catalog. A caller with no catalog of its own resolves it
+ * through whatever numbers it is reading by. Everything else — which frame a hop becomes, what a
+ * hop with no limit gets, that the entry takes no cursor — is the request's own meaning, and there
+ * is one of it.
+ */
+export interface Naming {
+  /** What a hop reads from: a stored edge, or the payload field a relationship follows. */
+  source(hop: Hop, at: string): Source;
+  /** The edge type a count reads. */
+  counted(count: CountSpec, at: string): number;
+  /** A hop's `after`, decoded. */
+  cursor(after: string, at: string): Cursor;
+}
+
+/**
+ * Compiles a request into a plan.
+ *
+ * Run the checks first: this assumes a well-formed request. Children are emitted after their
+ * parent's frame is reserved, as `Query.compile` does, so indices are stable. `each` is told of
+ * every frame as it is reserved, with the node it came from and that node's path, for a caller
+ * that has to say where in the request something was once it is able to say what was wrong with it.
+ */
+export function compile(
+  req: Request,
+  naming: Naming,
+  aliasing: Aliasing = PROTOCOL_ALIASING,
+  each?: (frame: number, node: Request & Partial<Hop>, at: string) => void,
+): Plan {
+  const frames: Frame[] = [];
+  const emit = (source: Source, node: Request & Partial<Hop>, at: string): number => {
+    const index = frames.length;
+    const root = source.kind === "ids";
+    frames.push({
+      source,
+      limit: root ? undefined : (node.limit ?? DEFAULT_HOP_LIMIT),
+      // The root takes none: the entry is ids, and a list of ids is not a page.
+      after: root || node.after === undefined ? undefined : naming.cursor(node.after, `${at}.after`),
+      children: [],
+      counts: [],
+    });
+    each?.(index, node, at);
+    const under = at === "" ? "" : `${at}.`;
+    const children = (node.hops ?? []).map((hop, i) => {
+      const path = `${under}hops[${i}]`;
+      return { alias: aliasing.hop(hop), frame: emit(naming.source(hop, path), hop, path) };
+    });
+    const counts = (node.counts ?? []).map((c, i) => ({
+      alias: aliasing.count(c),
+      atype: naming.counted(c, `${under}counts[${i}]`),
+    }));
+    frames[index] = { ...frames[index]!, children, counts, where: condOf(node.where) };
+    return index;
+  };
+  emit({ kind: "ids" }, req, "");
+  return { frames };
 }
