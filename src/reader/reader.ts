@@ -11,8 +11,8 @@
 // to that is a catalog — the integers a plan is written in, and the names they stand for. So that is
 // the one thing this file supplies, and it supplies it two ways:
 //
-// - **From the responder.** Each database is read by its own `/vocabulary`, numbered here. A name
-//   keeps one number for the life of the reader, so a plan means the same thing in every database
+// - **From the responder.** Each database is read by its own `/vocabulary`, numbered for the read.
+//   A name has one number for the whole of a read, so a plan means the same thing in every database
 //   it reaches, while the fields behind the name are whatever that database says they are. Nothing
 //   has to be declared to read a database nobody described.
 // - **From a lock**, for a caller that has one and a module generated from it. Its numbers are kept,
@@ -33,18 +33,31 @@
 // cannot follow one by reading the payload itself. It does not need to: a hop names the edge, and
 // the responder answers a field relationship as a list of at most one.
 //
+// **Some of a request can only be refused once it has been asked.** Whether a filter's field
+// exists, and whether a name the caller chose is one the object already has, are questions about a
+// type, and a reader learns what an object is from the database holding it. So those two refusals
+// come after the read instead of before it (`#late`). They still come, with their place in the
+// request, and not as an empty page or a field that went missing.
+//
+// **What a reader keeps is bounded.** Between reads it keeps a vocabulary per database, for as many
+// databases as `vocabularies` allows, and what each database proved about itself. It does not keep
+// the numbers. They were once given for the life of the reader, which kept every name any request
+// had ever used — and a request written by someone guessing at names is mostly names no database
+// has. Given per read, they go when the read does.
+//
 // A reader is the anonymous caller. A signature names a database (`spec/protocol.md` §7.2), and
 // this is not one.
 
 import { Catalog, CatalogError } from "../catalog/catalog.ts";
-import type { FieldSpec, Lock } from "../catalog/catalog.ts";
+import type { FieldSpec, Lock, ObjectType } from "../catalog/catalog.ts";
 import { runAsync, runRounds } from "../query/driver.ts";
 import type { Answer, HostClient, Stats } from "../query/driver.ts";
 import { canonicalDb, formatRef, parseRef } from "../query/ref.ts";
 import type { Ref } from "../query/ref.ts";
-import { DEFAULT_HOP_LIMIT, OPS, PROTOCOL_ALIASING, Refused, checkAliases, countEdge } from "../query/request.ts";
-import type { Cmp, Cost, CountSpec, Hop, Request } from "../query/request.ts";
-import type { Cond, Cursor, Frame, Id, Json, Miss, Plan, Source } from "../query/types.ts";
+import { PROTOCOL_ALIASING, Refused, checkAliases, checkShape, checkValue, compile, countEdge, onlyKnown } from "../query/request.ts";
+import type { Cmp, Cost, CountSpec, Request } from "../query/request.ts";
+import { listKey, targetOf } from "../query/types.ts";
+import type { Cursor, Id, Json, Miss, Obj, Plan, Source } from "../query/types.ts";
 import { systemClock } from "../runtime/runtime.ts";
 import type { Clock } from "../runtime/runtime.ts";
 import { decodeCursor, pageEnd } from "../schema/query.ts";
@@ -52,11 +65,11 @@ import {
   ForeignUnreachable,
   NotFollowed,
   ResponseCache,
-  VOCABULARY_TTL_MS,
   askPrice,
   discoverPinned,
   discoverVocabulary,
   foreignClient,
+  vocabularyHeld,
 } from "../protocol/client.ts";
 import type { ForeignOptions, Omitted, Pins } from "../protocol/client.ts";
 import type { Descriptor } from "../protocol/http.ts";
@@ -94,6 +107,14 @@ export interface ReaderOptions {
   cache?: ResponseCache | false;
   /** What one read may spend. A read may narrow or widen it. */
   budget?: Budget;
+  /**
+   * How many databases' vocabularies are kept between reads.
+   *
+   * One past it is forgotten, the one longest unread first, and asked for again when a read next
+   * reaches that database. Without a bound, a reader that follows references wherever they lead
+   * keeps a document for every database it ever met.
+   */
+  vocabularies?: number;
   clock?: Clock;
   /** Milliseconds since the epoch, for the cache and the vocabulary's age. */
   now?: () => number;
@@ -108,6 +129,9 @@ export interface ReadOptions {
    * this says which databases and how many references — an answer that is missing something has to
    * say so, because an empty list is never how a failure is reported. Give it a `references` array
    * and it names them too: `{ databases: {}, references: [] }`.
+   *
+   * It covers a database out of reach, and not a request that is wrong. One a database refuses as
+   * a bad request fails the read either way: nothing was missing but a correct request.
    */
   omit?: Omitted;
   driver?: "async" | "rounds";
@@ -164,8 +188,11 @@ export function memoryPins(): Pins {
   };
 }
 
-/** A name's number, for the life of a reader. Objects and edges are numbered separately, as a lock
- *  numbers them. */
+/** How many vocabularies a reader keeps unless it is told otherwise. */
+export const VOCABULARIES_KEPT = 128;
+
+/** A name's number, for one read. Objects and edges are numbered separately, as a lock numbers
+ *  them, and a lock's own numbers are the ones every read starts from. */
 class Names {
   readonly #numbers = new Map<string, number>();
   readonly #names = new Map<number, string>();
@@ -209,44 +236,76 @@ function specOf(described: { type: string; optional: boolean }): FieldSpec {
   return described.optional ? { optional: spec } : spec;
 }
 
+/** A vocabulary, as it is kept between reads. */
 interface Learned {
   /** The descriptor's catalog version this was read under. */
   version: number;
   at: number;
   doc: VocabularyDoc;
-  catalog: Catalog;
 }
 
-const REQUEST_MEMBERS = ["counts", "hops"] as const;
-const HOP_MEMBERS = ["as", "edge", "limit", "after", "where", "counts", "hops"] as const;
-const CMP_MEMBERS = ["field", "op", "value"] as const;
+/** One read: the numbers it reads by, and each database as this read met it. */
+interface Reading {
+  types: Names;
+  edges: Names;
+  /**
+   * One vocabulary per database and the catalog built from it, held for the read.
+   *
+   * The pair is what a request to that database was grouped by, so it is what the answer is read
+   * by: a vocabulary another read learns meanwhile, or one this reader has since forgotten, is not
+   * seen half-way through this one.
+   */
+  met: Map<string, { doc: VocabularyDoc; catalog: Catalog }>;
+}
 
-function onlyKnown(value: object, known: readonly string[], at: string, hint = ""): void {
-  for (const name of Object.keys(value)) {
-    if (!known.includes(name)) throw new Refused(at, `no such member "${name}"; this one takes ${known.join(", ")}${hint}`);
-  }
+/** A request as a plan, and what of the request has to be remembered to refuse it later. */
+interface Asked {
+  plan: Plan;
+  /** Per frame, the names its rows will carry beside their payload, each with its place. */
+  names: { name: string; at: string; what: string }[][];
+  /** Per frame, the filters over its rows, each with its place. */
+  where: { cmp: Cmp; at: string }[][];
+}
+
+/** What a request to a reader may carry. Not `ids`: the references to enter from are an argument. */
+const REQUEST_MEMBERS = ["counts", "hops"] as const;
+
+/**
+ * Refuses what can be refused of a request before any database is asked: a member the protocol
+ * does not define, names that would collide in the answer (`spec/protocol.md` §5.1.1), a filter
+ * that is not a comparison. The checks are `query/request.ts`'s own, which is what makes a mistake
+ * here the mistake it would have been on the wire.
+ */
+function wellFormed(request: Request): void {
+  if (request === null || typeof request !== "object" || Array.isArray(request)) throw new Refused("query", "expected an object");
+  onlyKnown(request, REQUEST_MEMBERS, "query", "; the references to enter from are the first argument");
+  checkAliases(request, PROTOCOL_ALIASING, Infinity);
+  checkShape(request);
 }
 
 export class Reader {
   readonly clock: Clock;
   readonly #opts: ReaderOptions;
   readonly #declared: Catalog | undefined;
-  readonly #types: Names;
-  readonly #edges: Names;
+  /** The numbers a lock gave its names, which every read starts from. */
+  readonly #numbered: { types: [string, number][]; edges: [string, number][] };
   readonly #pins: Pins;
   readonly #cache: ResponseCache | undefined;
   readonly #now: () => number;
+  /** In the order last read, oldest first, which is the order they are forgotten in. */
   readonly #learned = new Map<string, Learned>();
+  readonly #kept: number;
 
   constructor(opts: ReaderOptions = {}) {
     this.#opts = opts;
     this.clock = opts.clock ?? systemClock;
     this.#now = opts.now ?? (() => Date.now());
     this.#declared = opts.lock === undefined ? undefined : Catalog.compile(opts.lock);
-    this.#types = new Names(Object.entries(opts.lock?.objects ?? {}).map(([name, o]) => [name, o.otype]));
-    this.#edges = new Names(
-      Object.entries(opts.lock?.edges ?? {}).flatMap(([name, e]) => (e.atype === undefined ? [] : [[name, e.atype] as [string, number]])),
-    );
+    this.#numbered = {
+      types: Object.entries(opts.lock?.objects ?? {}).map(([name, o]) => [name, o.otype]),
+      edges: Object.entries(opts.lock?.edges ?? {}).flatMap(([name, e]) => (e.atype === undefined ? [] : [[name, e.atype] as [string, number]])),
+    };
+    this.#kept = Math.max(1, opts.vocabularies ?? VOCABULARIES_KEPT);
     this.#pins = opts.pins ?? memoryPins();
     this.#cache = opts.cache === false ? undefined : (opts.cache ?? new ResponseCache(this.#now));
   }
@@ -262,49 +321,62 @@ export class Reader {
   async database(uri: string): Promise<Database> {
     const db = canonicalDb(uri);
     const descriptor = await discoverPinned(db, this.#transport);
-    const { doc } = await this.#learn(db, descriptor);
-    return new Database(this, descriptor, doc);
+    return new Database(this, descriptor, await this.#learn(db, descriptor));
   }
 
   /**
-   * The catalog one database is read by: its vocabulary, numbered here.
+   * A database's vocabulary, asked for or kept from an earlier read.
    *
-   * Asked for again when the descriptor reports a different catalog version, and after
-   * `VOCABULARY_TTL_MS` whatever it reports.
+   * Asked for again when the descriptor reports a different catalog version, after
+   * `VOCABULARY_TTL_MS` whatever it reports, and when this reader has met `vocabularies` other
+   * databases since and forgotten it.
    */
-  async #learn(db: string, descriptor: Descriptor, spend?: () => AbortSignal): Promise<Learned> {
+  async #learn(db: string, descriptor: Descriptor, spend?: () => AbortSignal): Promise<VocabularyDoc> {
     const held = this.#learned.get(db);
     const now = this.#now();
-    if (held !== undefined && held.version === descriptor.catalog && now - held.at < VOCABULARY_TTL_MS) return held;
-    const doc = await discoverVocabulary(db, this.#transport, spend);
-    const learned: Learned = { version: descriptor.catalog, at: now, doc, catalog: this.#catalogOf(db, doc) };
+    const doc = vocabularyHeld(held, descriptor, now) ? held.doc : await discoverVocabulary(db, this.#transport, spend);
+    const learned = doc === held?.doc ? held : { version: descriptor.catalog, at: now, doc };
+    // Taken out and put back, so that it is the newest: what is forgotten is what was read longest ago.
+    this.#learned.delete(db);
     this.#learned.set(db, learned);
-    return learned;
+    while (this.#learned.size > this.#kept) this.#learned.delete(this.#learned.keys().next().value!);
+    return doc;
   }
 
-  #catalogOf(db: string, doc: VocabularyDoc): Catalog {
-    const objects: Lock["objects"] = {};
+  /** What a read starts with: a lock's numbers if there is one, and no database met yet. */
+  #begin(): Reading {
+    return { types: new Names(this.#numbered.types), edges: new Names(this.#numbered.edges), met: new Map() };
+  }
+
+  /** The catalog one database is read by, in one read: its vocabulary, in that read's numbers. */
+  #catalogOf(db: string, doc: VocabularyDoc, reading: Reading): Catalog {
+    // Maps, and not objects keyed by a stranger's names. To `in`, every object already has a
+    // `constructor`, so an edge landing on a type of that name found it declared and never added
+    // it; and assigning under `__proto__` sets an object's prototype rather than adding a type.
+    const objects = new Map<string, Lock["objects"][string]>();
     const type = (name: string, fields: Record<string, FieldSpec>): void => {
       // A type the caller declared is read through the caller's fields. Whether the responder can
       // fill them is `agree`'s to decide, with this same document.
-      objects[name] = { otype: this.#types.of(name), fields: this.#declared?.objectNamed(name)?.fields ?? fields };
+      objects.set(name, { otype: reading.types.of(name), fields: this.#declared?.objectNamed(name)?.fields ?? fields });
     };
     for (const [name, entry] of Object.entries(doc.types)) {
       type(name, Object.fromEntries(Object.entries(entry.fields).map(([field, described]) => [field, specOf(described)])));
     }
-    const edges: Lock["edges"] = {};
+    const edges = new Map<string, Lock["edges"][string]>();
     for (const [name, entry] of Object.entries(doc.edges)) {
       // An edge may land on a type the vocabulary names and does not list. It is still somewhere a
       // hop can arrive, so it is a type with nothing to read.
-      for (const end of [entry.from, entry.to]) if (!(end in objects)) type(end, {});
+      for (const end of [entry.from, entry.to]) if (!objects.has(end)) type(end, {});
       const field = this.#declared?.edgeNamed(name)?.field;
-      edges[name] =
-        field !== undefined && field in objects[entry.from]!.fields
+      edges.set(
+        name,
+        field !== undefined && Object.hasOwn(objects.get(entry.from)!.fields, field)
           ? { from: entry.from, to: entry.to, field }
-          : { from: entry.from, to: entry.to, atype: this.#edges.of(name), ...(entry.foreign === true ? { foreign: true } : {}) };
+          : { from: entry.from, to: entry.to, atype: reading.edges.of(name), ...(entry.foreign === true ? { foreign: true } : {}) },
+      );
     }
     try {
-      return Catalog.compile({ version: 1, objects, edges });
+      return Catalog.compile({ version: 1, objects: Object.fromEntries(objects), edges: Object.fromEntries(edges) });
     } catch (e) {
       if (!(e instanceof CatalogError)) throw e;
       throw new ForeignUnreachable(db, `invalid vocabulary: ${e.message}`);
@@ -320,6 +392,10 @@ export class Reader {
    * is a query against databases you do not run.
    */
   async answer(plan: Plan, rootIds: Id[], opts: ReadOptions = {}): Promise<Answer> {
+    return this.#gather(plan, rootIds, opts, this.#begin());
+  }
+
+  async #gather(plan: Plan, rootIds: Id[], opts: ReadOptions, reading: Reading): Promise<Answer> {
     for (const id of rootIds) {
       if (parseRef(id).db === null) {
         throw new TypeError(
@@ -334,24 +410,29 @@ export class Reader {
       const { db } = parseRef(id);
       if (db === null) throw new TypeError(`an answer led to the bare id ${id}, which names no database`);
       let client = clients.get(db);
-      if (client === undefined) clients.set(db, (client = spending(db, this.#client(db, opts.omit))));
+      if (client === undefined) clients.set(db, (client = spending(db, this.#client(db, opts.omit, reading))));
       return client;
     };
     const answer =
       opts.driver === "rounds"
         ? await runRounds(plan, rootIds, route, opts.stats)
         : await runAsync(plan, rootIds, route, opts.stats, (f) => this.clock.defer(f));
-    for (const row of answer.rows) this.#stamp(plan, answer, row, 0);
+    for (const row of answer.rows) this.#stamp(plan, answer, row, 0, reading);
     return answer;
   }
 
-  #client(db: string, omit: Omitted | undefined): HostClient {
+  #client(db: string, omit: Omitted | undefined, reading: Reading): HostClient {
+    const declared = this.#declared;
     const asking = foreignClient(db, {
       ...this.#transport,
-      catalog: async (descriptor, spend) => (await this.#learn(db, descriptor, spend)).catalog,
-      // Only a declaration can disagree with a vocabulary; a catalog read from one is that document.
-      agree: this.#declared !== undefined,
-      vocabulary: async () => this.#learned.get(db)!.doc,
+      catalog: async (descriptor, spend) => {
+        const doc = await this.#learn(db, descriptor, spend);
+        let met = reading.met.get(db);
+        if (met?.doc !== doc) reading.met.set(db, (met = { doc, catalog: this.#catalogOf(db, doc, reading) }));
+        return { catalog: met.catalog, vocabulary: doc };
+      },
+      // Only a declaration can disagree with a vocabulary. A type read from one is that document.
+      agree: declared === undefined ? false : (type) => declared.objectNamed(type) !== undefined,
       cache: this.#cache,
       now: this.#now,
       omit,
@@ -360,45 +441,127 @@ export class Reader {
       metersRequests: true,
       exec: async (plan, tasks, spend) => {
         // A list or a count is asked of the database that holds the object it hangs under, and that
-        // database may not expose the edge. That is the caller's mistake and not a database being
-        // unreachable, so it is raised before `omit` could take it for one — and by name, where the
-        // client underneath has only this reader's number for it.
-        const before = this.#unexposed(db, tasks);
+        // database may not expose the edge. That is the caller's mistake, so it is raised here,
+        // before a request is spent on it — and by name, where the client underneath has only this
+        // read's number for the edge.
+        const before = this.#unexposed(db, tasks, reading);
         if (before) throw before;
         try {
           return await asking.exec(plan, tasks, spend);
         } catch (e) {
-          throw (e instanceof NotFollowed && this.#unexposed(db, tasks)) || e;
+          throw (e instanceof NotFollowed && this.#unexposed(db, tasks, reading)) || e;
         }
       },
     };
   }
 
-  #unexposed(db: string, tasks: readonly Miss[]): NoSuchEdge | undefined {
-    const learned = this.#learned.get(db);
-    if (learned === undefined) return undefined;
+  #unexposed(db: string, tasks: readonly Miss[], reading: Reading): NoSuchEdge | undefined {
+    const met = reading.met.get(db);
+    if (met === undefined) return undefined;
     for (const task of tasks) {
-      if (task.kind === "object" || learned.catalog.edge(task.atype) !== undefined) continue;
-      return new NoSuchEdge(db, this.#edges.named(task.atype) ?? `#${task.atype}`, Object.keys(learned.doc.edges));
+      if (task.kind === "object" || met.catalog.edge(task.atype) !== undefined) continue;
+      return new NoSuchEdge(db, reading.edges.named(task.atype) ?? `#${task.atype}`, Object.keys(met.doc.edges));
     }
     return undefined;
   }
 
   /** Writes each row's type beside it. The engine's rows do not carry one, because a query built
    *  from a catalog knows what it asked for; a reader that started from a reference does not. */
-  #stamp(plan: Plan, answer: Answer, value: Json, frame: number): void {
+  #stamp(plan: Plan, answer: Answer, value: Json, frame: number, reading: Reading): void {
     if (value === null || typeof value !== "object" || Array.isArray(value)) return;
     const held = answer.graph.objects.get(value.id as Id);
-    if (held) value.$type = this.#types.named(held.otype) ?? null;
+    if (held) value.$type = reading.types.named(held.otype) ?? null;
     for (const child of plan.frames[frame]!.children) {
       const below = value[child.alias];
-      if (Array.isArray(below)) for (const item of below) this.#stamp(plan, answer, item, child.frame);
+      if (Array.isArray(below)) for (const item of below) this.#stamp(plan, answer, item, child.frame, reading);
     }
   }
 
-  /** What a request would cost one database, asked of it. See `Database.price`. */
-  priceAt(database: string, ids: Id[], request: Request = {}): Promise<Cost> {
-    return askPrice(database, { ids, ...request }, this.#transport);
+  /**
+   * What a request would cost one database, asked of it. See `Database.price`.
+   *
+   * `exposed` is that database's edges, where the caller holds its vocabulary: with it, what is
+   * priced is the part of the request a read would send there (`shareOf`). Without it the request
+   * is priced whole, and a hop into an edge the database does not expose is refused.
+   */
+  async priceAt(database: string, ids: Id[], request: Request = {}, exposed?: VocabularyDoc["edges"]): Promise<Cost> {
+    wellFormed(request);
+    return askPrice(database, { ids, ...shareOf(request, exposed) }, this.#transport);
+  }
+
+  /**
+   * Refuses what could only be refused once a database had said what an object is.
+   *
+   * Two things, and both would otherwise come back looking like an answer:
+   *
+   * - **A filter over a field the type does not have, or a value the field could not hold.** A
+   *   reader applies filters itself — they are not sent, for the reason `subtree` gives — so no
+   *   database ever checked one, and a field that was misspelled matched nothing: an empty page,
+   *   which is what a list with no such rows looks like. `POST {db}/read` refuses the same request
+   *   by the vocabulary. This refuses it by the type of each object the filter was asked of, which
+   *   is the same check made where the type is known.
+   * - **A name that is also a field.** A row holds its payload, its relationships and its counts in
+   *   one object, so a hop called `title` took the place of the object's own `title`, silently.
+   *   `checkAliases` refuses a name a row always carries; this is the one it could not have known.
+   *
+   * Asked of each type once per frame, and of nothing where no rows of the frame arrived: with no
+   * object to be wrong about, an empty page is the true answer.
+   */
+  #late(asked: Asked, answer: Answer, reading: Reading): void {
+    const { plan } = asked;
+    // A reader's ids are all references, and each was parsed on its way in.
+    const holder = (id: Ref): string => id.slice(0, id.indexOf("#"));
+    const typeOf = (obj: Obj): ObjectType | undefined => reading.met.get(holder(obj.id))?.catalog.object(obj.otype);
+    const settled = new Set<string>();
+    const first = (what: string, frame: number, obj: Obj): ObjectType | undefined => {
+      const key = `${what}:${frame}:${obj.otype}:${holder(obj.id)}`;
+      if (settled.has(key)) return undefined;
+      settled.add(key);
+      return typeOf(obj);
+    };
+
+    const named = (frame: number, obj: Obj): void => {
+      if (asked.names[frame]!.length === 0) return;
+      const type = first("names", frame, obj);
+      if (type === undefined) return;
+      for (const { name, at, what } of asked.names[frame]!) {
+        if (!Object.hasOwn(type.fields, name)) continue;
+        throw new Refused(at, `"${name}" is a field of ${type.name}, and one answer cannot hold both under it: give ${what} another name with \`as\``);
+      }
+    };
+    const filtered = (frame: number, obj: Obj): void => {
+      const type = first("where", frame, obj);
+      if (type === undefined) return;
+      for (const { cmp, at } of asked.where[frame]!) checkValue(at, cmp.field, cmp.value, type.name, { fields: () => type.fields });
+    };
+    /** Every object a hop's filter could have been asked of: the whole list it was read from, not
+     *  only the rows that passed, since a filter that is wrong passes none. */
+    const reached = (parent: Obj, source: Source): (Obj | null | undefined)[] => {
+      if (source.kind === "field") {
+        const id = parent.data[source.field];
+        return typeof id === "string" ? [answer.graph.objects.get(id)] : [];
+      }
+      if (source.kind !== "edge") return [];
+      const list = answer.graph.lists.get(listKey(parent.id, source.atype));
+      if (list === undefined) return [];
+      const rows = list.pages ? [...list.pages.values()].flatMap((page) => page.rows) : list.rows;
+      return rows.map((edge) => answer.graph.objects.get(targetOf(edge)));
+    };
+
+    const visit = (row: Json, frame: number): void => {
+      if (row === null || typeof row !== "object" || Array.isArray(row)) return;
+      const held = answer.graph.objects.get(row.id as Id);
+      if (!held) return;
+      named(frame, held);
+      for (const child of plan.frames[frame]!.children) {
+        if (asked.where[child.frame]!.length > 0) {
+          for (const target of reached(held, plan.frames[child.frame]!.source)) if (target) filtered(child.frame, target);
+        }
+        const below = row[child.alias];
+        if (Array.isArray(below)) for (const item of below) visit(item, child.frame);
+      }
+    };
+    for (const row of answer.rows) visit(row, 0);
   }
 
   // ---- reading by name
@@ -415,8 +578,11 @@ export class Reader {
   async read(refs: Ref | readonly Ref[], request: Request = {}, opts: ReadOptions = {}): Promise<Row[]> {
     const roots = typeof refs === "string" ? [refs] : [...refs];
     if (roots.length === 0) throw new Refused("ids", "a read enters from at least one reference");
-    const plan = this.#planOf(request);
-    const answer = await this.answer(plan, roots, opts);
+    const reading = this.#begin();
+    const asked = this.#planOf(request, reading);
+    const { plan } = asked;
+    const answer = await this.#gather(plan, roots, opts, reading);
+    this.#late(asked, answer, reading);
     const page = (value: Json, frame: number): Row => {
       // The type goes beside the id, which is where a reader looks for what a thing is.
       const row = {} as Row;
@@ -446,59 +612,48 @@ export class Reader {
   }
 
   /**
-   * A request as a plan, in this reader's numbers.
+   * A request as a plan, in this read's numbers.
    *
-   * Checked here for what can be checked without a vocabulary: members the protocol does not
-   * define, and names that would collide in the answer (`spec/protocol.md` §5.1.1). Whether an edge
-   * exists is the question only the database it is asked of can answer, and it does.
+   * Checked here for what can be checked without a vocabulary (`wellFormed`). Whether an edge exists
+   * is the question only the database it is asked of can answer, and it does; what a filter's field
+   * holds, and whether a name is one an object already has, are `#late`'s, which is why each frame's
+   * names and filters are kept beside the plan with their places in the request.
    */
-  #planOf(request: Request): Plan {
-    if (request === null || typeof request !== "object" || Array.isArray(request)) throw new Refused("query", "expected an object");
-    onlyKnown(request, REQUEST_MEMBERS, "query", "; the references to enter from are the first argument");
-    checkAliases(request, PROTOCOL_ALIASING, Infinity);
-
-    const frames: Frame[] = [];
-    const emit = (source: Source, node: Partial<Hop> & Request, at: string): number => {
-      const index = frames.length;
-      const root = source.kind === "ids";
-      if (!root) {
-        onlyKnown(node, HOP_MEMBERS, at);
-        if (node.limit !== undefined && node.limit < 1) throw new Refused(`${at}.limit`, "limit must be at least 1");
-        if (node.after !== undefined && typeof node.after !== "string") throw new Refused(`${at}.after`, "expected a cursor");
-      }
-      frames.push({
-        source,
-        limit: root ? undefined : (node.limit ?? DEFAULT_HOP_LIMIT),
-        after: root || node.after === undefined ? undefined : cursorOf(node.after, `${at}.after`),
-        children: [],
-        counts: [],
-      });
-      const children = (node.hops ?? []).map((hop, i) => ({
-        alias: PROTOCOL_ALIASING.hop(hop),
-        frame: emit(this.#sourceOf(hop.edge), hop, `${at === "" ? "" : `${at}.`}hops[${i}]`),
-      }));
-      const counts = (node.counts ?? []).map((c, i) => ({
-        alias: PROTOCOL_ALIASING.count(c),
-        atype: this.#counted(c, `${at === "" ? "" : `${at}.`}counts[${i}]`),
-      }));
-      frames[index] = { ...frames[index]!, children, counts, where: condOf(node.where, at) };
-      return index;
-    };
-    emit({ kind: "ids" }, request, "");
-    return { frames };
+  #planOf(request: Request, reading: Reading): Asked {
+    wellFormed(request);
+    const names: Asked["names"] = [];
+    const where: Asked["where"] = [];
+    const plan = compile(
+      request,
+      {
+        source: (hop) => this.#sourceOf(hop.edge, reading),
+        counted: (count, at) => this.#counted(count, at, reading),
+        cursor: cursorOf,
+      },
+      PROTOCOL_ALIASING,
+      (frame, node, at) => {
+        const under = at === "" ? "" : `${at}.`;
+        names[frame] = [
+          ...(node.hops ?? []).map((hop, i) => ({ name: PROTOCOL_ALIASING.hop(hop), at: `${under}hops[${i}]`, what: `the "${hop.edge}" hop` })),
+          ...(node.counts ?? []).map((c, i) => ({ name: PROTOCOL_ALIASING.count(c), at: `${under}counts[${i}]`, what: `the "${countEdge(c)}" count` })),
+        ];
+        where[frame] = (node.where ?? []).map((cmp, i) => ({ cmp, at: `${at}.where[${i}]` }));
+      },
+    );
+    return { plan, names, where };
   }
 
-  #sourceOf(edge: string): Source {
+  #sourceOf(edge: string, reading: Reading): Source {
     const field = this.#declared?.edgeNamed(edge)?.field;
-    return field !== undefined ? { kind: "field", field } : { kind: "edge", atype: this.#edges.of(edge) };
+    return field !== undefined ? { kind: "field", field } : { kind: "edge", atype: reading.edges.of(edge) };
   }
 
-  #counted(count: CountSpec, at: string): number {
+  #counted(count: CountSpec, at: string, reading: Reading): number {
     const edge = countEdge(count);
     if (this.#declared?.edgeNamed(edge)?.field !== undefined) {
       throw new Refused(at, `edge "${edge}" has no count: it follows an id in a payload and stores nothing`);
     }
-    return this.#edges.of(edge);
+    return reading.edges.of(edge);
   }
 }
 
@@ -529,17 +684,41 @@ function cursorOf(after: string, at: string): Cursor {
   return cursor;
 }
 
-function condOf(where: Cmp[] | undefined, at: string): Cond | undefined {
-  const cmps = (where ?? []).map((w, i): Cond => {
-    const path = `${at}.where[${i}]`;
-    if (w === null || typeof w !== "object" || Array.isArray(w)) throw new Refused(path, "expected an object");
-    onlyKnown(w, CMP_MEMBERS, path);
-    if (typeof w.field !== "string" || !w.field || !("value" in w)) throw new Refused(path, "a comparison requires a field and value");
-    if (!OPS.includes(w.op)) throw new Refused(path, `operator must be one of ${OPS.join(" ")}`);
-    return { cmp: w.op, on: "obj", field: w.field, value: w.value };
-  });
-  if (cmps.length === 0) return undefined;
-  return cmps.length === 1 ? cmps[0] : { and: cmps };
+/**
+ * The part of a request a read would ask of one database, which is what that database can price.
+ *
+ * A read does not send a database the request as written, and neither does a price of one:
+ *
+ * - **Below the first hop, what the database does not expose is left out.** A hop under another
+ *   hop may hang under objects that are another database's, and that database answers for it
+ *   (`subtree` in `protocol/client.ts`). A hop directly under the ids stays: those are this
+ *   database's own objects, and its refusal is the answer.
+ * - **Filters are left out.** A reader applies them itself, and a filter may be over a field only
+ *   the database a hop lands in exposes. They cost nothing either way: a price is the product of
+ *   the limits down each path.
+ * - **A cursor goes as the token it wraps**, which is the database's own and the only kind it takes.
+ */
+function shareOf(request: Request, exposed: VocabularyDoc["edges"] | undefined): Request {
+  const sent = (edge: string, depth: number): boolean => depth < 2 || exposed === undefined || Object.hasOwn(exposed, edge);
+  const level = (node: Request, depth: number, at: string): Request => {
+    const counts = (node.counts ?? []).filter((count) => sent(countEdge(count), depth));
+    const hops = (node.hops ?? []).flatMap((hop, i) => {
+      if (!sent(hop.edge, depth)) return [];
+      const path = `${at}hops[${i}]`;
+      const token = hop.after === undefined ? undefined : cursorOf(hop.after, `${path}.after`).token;
+      return [
+        {
+          edge: hop.edge,
+          ...(hop.as !== undefined ? { as: hop.as } : {}),
+          ...(hop.limit !== undefined ? { limit: hop.limit } : {}),
+          ...(token !== undefined ? { after: token } : {}),
+          ...level(hop, depth + 1, `${path}.`),
+        },
+      ];
+    });
+    return { ...(counts.length > 0 ? { counts } : {}), ...(hops.length > 0 ? { hops } : {}) };
+  };
+  return level(request, 1, "");
 }
 
 /** One database, as a reader met it. A place to start from: its ids are the only ones this reader
@@ -596,8 +775,15 @@ export class Database {
   /**
    * What a request would cost this database, with nothing read.
    *
-   * Priced as written and as if all of it were asked here, so it is exact for a request that stays
-   * in this database and an upper bound on this database's share of one that leaves it.
+   * It is the part of the request a read would send here that is priced (`shareOf`), so the price
+   * is exact for a request that stays in this database, and is this database's share of one that
+   * goes on into another. Priced as written instead, such a request was refused — this database
+   * has no edge by the next one's name — and those are the requests a reader is for.
+   *
+   * A hop directly under the ids that this database does not expose is still refused, by name: a
+   * read of it would be. And nothing is fitted to the database's limits. A limit or a depth over
+   * what it advertises is refused here as it is on the wire, where a read asks for what the
+   * database will take and comes back for the rest.
    */
   price(ids: Id | Ref | readonly (Id | Ref)[], request: Request = {}): Promise<Cost> {
     const own = (typeof ids === "string" ? [ids] : [...ids]).map((id) => {
@@ -605,7 +791,7 @@ export class Database {
       if (db !== null && db !== this.database) throw new TypeError(`${id} is not in ${this.database}, so this database cannot price it`);
       return bare;
     });
-    return this.reader.priceAt(this.database, own, request);
+    return this.reader.priceAt(this.database, own, request, this.edges);
   }
 }
 

@@ -24,7 +24,7 @@ Figures marked **measured** were read off a real artifact and say how.
 
 ## Where this stands
 
-Built, with typecheck clean and **660 of 660 tests passing under both storage formats**
+Built, with typecheck clean and **675 of 675 tests passing under both storage formats**
 (`npm run test:formats`), **48 of 48** conformance checks against the published fixture
 (`npm run conformance:fixture`) and **35 of 35** without one (`npm run conformance:node`):
 

@@ -138,8 +138,15 @@ export interface ForeignOptions {
    * vocabulary and so cannot name one before it has asked. It is called inside `exec`, after the
    * descriptor is checked and pinned, so a vocabulary that cannot be fetched fails — or is omitted —
    * exactly as an object that cannot be fetched does.
+   *
+   * It hands back the vocabulary with the catalog, because the two are one reading of one database
+   * and this client needs the document too: for what the responder exposes below a hop, and for
+   * `agree`. They once arrived by two routes, the second trusting the first to have run and nothing
+   * to have been learned in between, which is a pair that can be from two different documents.
    */
-  catalog: Catalog | ((descriptor: Descriptor, spend?: () => AbortSignal) => Promise<Catalog>);
+  catalog:
+    | Catalog
+    | ((descriptor: Descriptor, spend?: () => AbortSignal) => Promise<{ catalog: Catalog; vocabulary: VocabularyDoc }>);
   /** Injected, so a test can hand in the handler itself and two databases can talk in one process
    *  over the same code a deployment runs. */
   fetch?: typeof fetch;
@@ -193,11 +200,14 @@ export interface ForeignOptions {
    * A globally unique name says nothing about whether the reader knows the shape behind it, so a
    * reader has to be able to decline a type it does not understand. Absent, names are taken on
    * trust, which is where step 4 left it.
+   *
+   * Or which types to check, for a caller whose catalog is only partly its own declaration. A type
+   * read from the responder's vocabulary IS that document and cannot disagree with it — but it can
+   * fail to survive the trip through a field spec, where a description this reader has no name for
+   * becomes `json`, and compared with the original that looked like a disagreement and declined a
+   * type nobody had declared anything about.
    */
-  agree?: boolean;
-  /** The responder's vocabulary, where whoever built this client already holds it. `agree` reads it
-   *  from here rather than asking for the same document a second time. */
-  vocabulary?: (spend?: () => AbortSignal) => Promise<VocabularyDoc>;
+  agree?: boolean | ((type: string) => boolean);
 }
 
 /** The limits a responder's descriptor states, as the asking half uses them. */
@@ -206,6 +216,16 @@ type Advertised = Partial<Descriptor["limits"]>;
 /** How long a vocabulary is read from before it is asked for again. The descriptor's catalog version
  *  catches a schema that changed; this catches a projection that did, which no version states. */
 export const VOCABULARY_TTL_MS = 5 * 60_000;
+
+/** Whether a vocabulary read earlier may still be read from: the descriptor reports the catalog
+ *  version it was read under, and it is not yet old. One rule, for the two places that keep one. */
+export function vocabularyHeld<T extends { version: number; at: number }>(
+  held: T | undefined,
+  descriptor: Descriptor,
+  now: number,
+): held is T {
+  return held !== undefined && held.version === descriptor.catalog && now - held.at < VOCABULARY_TTL_MS;
+}
 
 /** Whether a request carries a hop or a count under a hop, which is where `subtree` needs to know
  *  what the responder exposes. */
@@ -309,7 +329,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
   }
 
   let learned: { version: number; at: number; doc: VocabularyDoc } | undefined;
-  let agreed: { doc: VocabularyDoc; names: ReadonlySet<string> } | undefined;
+  let agreed: { doc: VocabularyDoc; catalog: Catalog; names: ReadonlySet<string> } | undefined;
 
   /**
    * The responder's vocabulary, asked for once and kept.
@@ -319,11 +339,8 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
    * it reports.
    */
   async function vocabularyOf(descriptor: Descriptor, spend?: () => AbortSignal): Promise<VocabularyDoc> {
-    if (opts.vocabulary !== undefined) return opts.vocabulary(spend);
     const now = opts.now?.() ?? Date.now();
-    if (learned !== undefined && learned.version === descriptor.catalog && now - learned.at < VOCABULARY_TTL_MS) {
-      return learned.doc;
-    }
+    if (vocabularyHeld(learned, descriptor, now)) return learned.doc;
     const doc = await discoverVocabulary(db, opts, spend);
     learned = { version: descriptor.catalog, at: now, doc };
     return doc;
@@ -335,7 +352,13 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
       const gathered: Gathered = { objects: new Map(), lists: [], counts: new Map() };
       try {
         const descriptor = await discoverPinned(db, opts, spend);
-        const catalog = typeof opts.catalog === "function" ? await opts.catalog(descriptor, spend) : opts.catalog;
+        const read =
+          typeof opts.catalog === "function" ? await opts.catalog(descriptor, spend) : { catalog: opts.catalog, vocabulary: undefined };
+        const catalog = read.catalog;
+        // The document the catalog was read from, where it was read from one, and otherwise asked
+        // for when something first needs it.
+        const vocabulary = (): Promise<VocabularyDoc> =>
+          read.vocabulary !== undefined ? Promise.resolve(read.vocabulary) : vocabularyOf(descriptor, spend);
         const advertised = descriptor.limits;
         const max = advertised.maxIds;
         let batches = group(tasks, plan, catalog, max, advertised);
@@ -343,10 +366,10 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
           // Only now is the vocabulary worth a request: `subtree` says why a hop under another hop
           // is the one place it decides anything. A read that goes one level into a database — most
           // of them — never asks for it.
-          const exposed = new Set(Object.keys((await vocabularyOf(descriptor, spend)).edges));
+          const exposed = new Set(Object.keys((await vocabulary()).edges));
           batches = group(tasks, plan, catalog, max, advertised, exposed);
         }
-        for (const batch of batches) await send(batch, plan, gathered, descriptor, catalog, spend);
+        for (const batch of batches) await send(batch, plan, gathered, descriptor, catalog, vocabulary, spend);
       } catch (e) {
         // `omit` covers a database that could not be reached. A repudiated one was reached and
         // answered — with a key that is not the one it proved before — and omitting that would turn
@@ -403,6 +426,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
     into: Gathered,
     descriptor: Descriptor,
     catalog: Catalog,
+    vocabulary: () => Promise<VocabularyDoc>,
     spend?: () => AbortSignal,
   ): Promise<void> {
     // Keyed by the request, which is canonical because this side built it. Two frames asking the
@@ -416,7 +440,7 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
       headers: { "content-type": "application/json", ...await signature(url, payload, descriptor) },
     }, spend);
     const decoded = decodeRead(body, catalog);
-    const declined = new Set([...decoded.declined, ...(await disagreeing(catalog, descriptor, spend))]);
+    const declined = new Set([...decoded.declined, ...(await disagreeing(catalog, vocabulary))]);
     // The responder numbers the frames of the plan IT compiled, which are not this plan's numbers.
     // `shape` is how the two are joined: this side chose the aliases, so walking `shape` from the
     // root with those aliases gives the responder's frame for each of this plan's.
@@ -534,10 +558,14 @@ export function foreignClient(database: string, opts: ForeignOptions): HostClien
 
   /** Type names the two catalogs do not mean the same thing by, worked out once per vocabulary.
    *  `disagreements` is the comparison and says why it is the one that matters. */
-  async function disagreeing(catalog: Catalog, descriptor: Descriptor, spend?: () => AbortSignal): Promise<ReadonlySet<string>> {
-    if (!opts.agree) return new Set();
-    const doc = await vocabularyOf(descriptor, spend);
-    if (agreed?.doc !== doc) agreed = { doc, names: disagreements(catalog.objectTypes(), doc) };
+  async function disagreeing(catalog: Catalog, vocabulary: () => Promise<VocabularyDoc>): Promise<ReadonlySet<string>> {
+    const check = opts.agree;
+    if (!check) return new Set();
+    const doc = await vocabulary();
+    if (agreed?.doc !== doc || agreed.catalog !== catalog) {
+      const declared = typeof check === "function" ? catalog.objectTypes().filter((t) => check(t.name)) : catalog.objectTypes();
+      agreed = { doc, catalog, names: disagreements(declared, doc) };
+    }
     return agreed.names;
   }
 
@@ -933,13 +961,18 @@ export function disagreements(
   declared: readonly { name: string; fields: Record<string, FieldSpec> }[],
   doc: Pick<VocabularyDoc, "types">,
 ): Set<string> {
+  // Own properties only. These are a stranger's document keyed by names from a declaration, and
+  // `constructor` is a member of every object: read plainly, a type or a field of that name is
+  // found in a vocabulary that never mentioned it.
+  const own = <T>(record: Record<string, T> | undefined, name: string): T | undefined =>
+    record !== undefined && Object.hasOwn(record, name) ? record[name] : undefined;
   const out = new Set<string>();
   for (const type of declared) {
-    const theirs = doc.types?.[type.name];
+    const theirs = own(doc.types, type.name);
     if (theirs === undefined) continue; // not exposed at all: nothing of it will arrive
     for (const [field, spec] of Object.entries(type.fields)) {
       const mine = describe(spec);
-      const match = theirs.fields?.[field];
+      const match = own(theirs.fields, field);
       if (mine.optional && match === undefined) continue;
       if (match === undefined || match.type !== mine.type || (!mine.optional && match.optional)) {
         out.add(type.name);
