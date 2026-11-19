@@ -392,7 +392,7 @@ the key, the directory records which in `meta` where absent means 1, and a host 
 what it is told disagrees with the shape of its own `assocs`. A vshard move is the migration: a
 format 1 snapshot installs into a format 2 host with every alias 0, which is what this document's
 *nothing else in the host schema changes* was already describing without naming it as a migration
-path. It waits on the chunked snapshot design.md owes.
+path. The copy is chunked, so it carries a vshard of any size (`design.md`, *vshards*).
 
 The measured 1.019x holds against the shipped statements: `scripts/id-width.mjs` now imports them
 from `src/host/schema.ts` rather than restating them, so the reading is of the real shape.

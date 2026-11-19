@@ -3,6 +3,8 @@
 // generated worker types, and writing out what is actually used says what the layer depends on.
 
 import { Directory } from "../../directory/directory.ts";
+import { DEFAULT_CHUNK } from "../../host/host.ts";
+import type { ChunkBudget } from "../../host/host.ts";
 import type { DoStorage } from "../../host/sql.ts";
 
 export interface Stub {
@@ -98,6 +100,9 @@ export interface Env {
    *  created with: the count is read once, when the directory first opens, and changing it afterwards
    *  moves nothing. Left unset it is INITIAL_VSHARDS. */
   HLEKK_VSHARDS?: string;
+  /** Rows per chunk of a move's copy. Lowered so a demo's small vshards still cross in many chunks;
+   *  left unset it is DEFAULT_CHUNK, which is sized for a request on a deployed host. */
+  HLEKK_CHUNK_ROWS?: string;
 }
 
 export const databaseOf = (env: Env): string => env.HLEKK_DATABASE ?? "demo";
@@ -112,6 +117,15 @@ export function vshardsOf(env: Env): number | undefined {
     throw new RangeError(`HLEKK_VSHARDS must be an integer in 1..${Directory.maxVshards}, got ${env.HLEKK_VSHARDS}`);
   }
   return n;
+}
+
+/** What one chunk of a move's copy may carry. Only the row bound is configurable: it is the one a
+ *  test wants lowered, and the byte bound is a property of the platform's request limits. */
+export function chunkOf(env: Env): ChunkBudget {
+  if (env.HLEKK_CHUNK_ROWS === undefined) return DEFAULT_CHUNK;
+  const rows = Number(env.HLEKK_CHUNK_ROWS);
+  if (!Number.isInteger(rows) || rows < 1) throw new RangeError(`HLEKK_CHUNK_ROWS must be a positive integer, got ${env.HLEKK_CHUNK_ROWS}`);
+  return { ...DEFAULT_CHUNK, rows };
 }
 
 /** The directory is one DO per database. */

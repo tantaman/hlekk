@@ -3,9 +3,14 @@ import { describe, it } from "node:test";
 
 import { Catalog, plan } from "../catalog/catalog.ts";
 import { LocalCluster } from "../client/local.ts";
+import type { LocalOptions } from "../client/local.ts";
+import type { ChunkBudget } from "../host/host.ts";
 import { vshardOf } from "../host/ids.ts";
+import { nodeSql } from "../host/sql.node.ts";
+import type { Sql } from "../host/sql.ts";
 import type { Plan } from "../query/types.ts";
 import { MoveFailed, Mover } from "./move.ts";
+import type { MoveHosts } from "./move.ts";
 
 const LOCK = plan({
   issues: {
@@ -41,8 +46,8 @@ const PAGE: Plan = {
 };
 
 /** A database holding one issue with three comments, all colocated in vshard 5. */
-async function seeded() {
-  const c = new LocalCluster();
+async function seeded(opts: LocalOptions = {}) {
+  const c = new LocalCluster(opts);
   c.directory.applyLock(LOCK);
   c.spreadCatalog();
   await c.publish();
@@ -184,7 +189,7 @@ describe("a move interrupted", () => {
   });
 
   it("is safe to resume whichever step crashed", async () => {
-    for (const step of ["fence", "snapshot", "install", "retire", "purge"] as const) {
+    for (const step of ["fence", "snapshot", "install", "discard", "retire", "purge"] as const) {
       const { c, db, issue } = await seeded();
       const before = await page(db, issue);
 
@@ -246,5 +251,156 @@ describe("a move under write load", () => {
     assert.equal(out[0].commentCount, 3 + bodies.length, "every write survived the move");
     const got = new Set(out[0].comments.map((x) => x.body));
     for (const body of bodies) assert.ok(got.has(body), `${body} survived`);
+  });
+});
+
+// ---- a copy in chunks
+
+/** A row a chunk, so the vshard in `seeded` crosses in many of them. */
+const ROW: ChunkBudget = { rows: 1, bytes: Infinity };
+
+/** The cluster's own move hosts, counting copies and falling over after `failAfter` of them. */
+function counting(hosts: MoveHosts, failAfter = Infinity) {
+  const seen = { copies: 0 };
+  const wrapped: MoveHosts = {
+    ...hosts,
+    copy: async (...args) => {
+      if (seen.copies >= failAfter) throw new Error("the copy fell over");
+      const next = await hosts.copy(...args);
+      seen.copies++;
+      return next;
+    },
+  };
+  return { wrapped, seen };
+}
+
+/** How many chunks a whole copy of vshard 5 takes at a row a chunk. */
+async function chunksInVshard5(): Promise<number> {
+  const { c } = await seeded();
+  const { wrapped, seen } = counting(c.mover.hosts);
+  const mover = new Mover(c.directory, wrapped, 8, ROW);
+  mover.begin(5n, 1);
+  await mover.run(5n);
+  return seen.copies;
+}
+
+describe("a move in chunks", () => {
+  it("carries a vshard a row at a time, data, counts and sequence", async () => {
+    const { c, db, issue } = await seeded();
+    const before = await page(db, issue);
+    const seq = c.host(0).vshards().find((v) => v.vshard === 5)!.next_seq;
+    const { wrapped, seen } = counting(c.mover.hosts);
+    const mover = new Mover(c.directory, wrapped, 8, ROW);
+
+    mover.begin(5n, 1);
+    assert.equal(await mover.run(5n), "done");
+
+    assert.ok(seen.copies >= 10, `a vshard of a dozen rows took ${seen.copies} chunks`);
+    assert.equal(c.holderOf(5n), 1);
+    assert.deepEqual(await page(db, issue), before);
+    assert.equal(c.host(1).vshards().find((v) => v.vshard === 5)!.next_seq, seq);
+    assert.equal(c.host(0).stateOf(5n), "absent", "purged, a row a call");
+  });
+
+  it("resumes a copy that fell over from its cursor, not from the top", async () => {
+    const total = await chunksInVshard5();
+    const { c, db, issue } = await seeded();
+    const before = await page(db, issue);
+
+    const first = counting(c.mover.hosts, 4);
+    const dying = new Mover(c.directory, first.wrapped, 8, ROW);
+    dying.begin(5n, 1);
+    await assert.rejects(() => dying.run(5n), MoveFailed);
+
+    const move = c.mover.pending(5n)!;
+    assert.equal(move.state, "copy");
+    assert.match(move.cursor ?? "", /"table"/, "the cursor was recorded");
+    assert.equal(c.holderOf(5n), 0, "the route did not flip");
+    assert.equal(c.host(0).stateOf(5n), "fenced");
+    assert.equal(c.host(1).stateOf(5n), "absent", "four chunks in, the target serves none of it");
+
+    const second = counting(c.mover.hosts);
+    assert.equal(await new Mover(c.directory, second.wrapped, 8, ROW).run(5n), "done");
+    assert.equal(second.seen.copies, total - 4, "exactly the chunks the first run did not finish");
+    assert.deepEqual(await page(db, issue), before);
+  });
+
+  it("starts a copy from the top on an empty target, so nothing an abandoned copy left comes back", async () => {
+    const { c, db, issue, comments } = await seeded();
+    const dying = new Mover(c.directory, counting(c.mover.hosts, 3).wrapped, 8, ROW);
+    dying.begin(5n, 1);
+    await assert.rejects(() => dying.run(5n), MoveFailed);
+
+    // Abandoned by hand: the record dropped and the source unfenced. The first comment was among
+    // the rows the copy had already staged on host 1, and it is deleted after.
+    c.directory.sql.run("DELETE FROM moves WHERE vshard = 5");
+    c.host(0).setState("5", "owned");
+    await db.delete(comments[0]);
+
+    c.mover.begin(5n, 1);
+    assert.equal(await new Mover(c.directory, c.mover.hosts, 8, ROW).run(5n), "done");
+    assert.equal(c.holderOf(5n), 1);
+    assert.equal(await c.host(1).store().object(comments[0]), null, "the deleted comment stayed deleted");
+    const out = await page(db, issue);
+    assert.equal(out[0].commentCount, 2);
+    assert.deepEqual(out[0].comments.map((x) => x.body).sort(), ["c2", "c3"]);
+  });
+
+  it("fences again and copies from the top when the source is found taking writes", async () => {
+    const { c, db, issue } = await seeded();
+    const dying = new Mover(c.directory, counting(c.mover.hosts, 2).wrapped, 8, ROW);
+    dying.begin(5n, 1);
+    await assert.rejects(() => dying.run(5n), MoveFailed);
+
+    // Something unfenced the source mid-copy, and a write landed on it.
+    c.host(0).setState("5", "owned");
+    assert.equal(await db.update(issue, { title: "written mid-copy" }), 2);
+
+    assert.equal(await new Mover(c.directory, c.mover.hosts, 8, ROW).run(5n), "done");
+    assert.equal(c.holderOf(5n), 1);
+    assert.equal((await page(db, issue))[0].title, "written mid-copy", "the write is on the new owner");
+  });
+
+  it("fails loudly rather than copying in a loop when the source will not stay fenced", async () => {
+    const { c } = await seeded();
+    const leaky: MoveHosts = { ...c.mover.hosts, fence: async () => {} };
+    const mover = new Mover(c.directory, leaky, 8, ROW);
+    mover.begin(5n, 1);
+    await assert.rejects(() => mover.run(5n), /not fenced/);
+    assert.equal(c.holderOf(5n), 0);
+  });
+
+  it("is not unfenced by a restart in the middle of it", async () => {
+    const files = new Map<string, Sql>();
+    const storage = (name: string) => files.get(name) ?? files.set(name, nodeSql()).get(name)!;
+    const { c, db, issue } = await seeded({ storage });
+    const before = await page(db, issue);
+    const dying = new Mover(c.directory, counting(c.mover.hosts, 3).wrapped, 8, ROW);
+    dying.begin(5n, 1);
+    await assert.rejects(() => dying.run(5n), MoveFailed);
+
+    // The process restarts over the same storage.
+    const reopened = new LocalCluster({ storage });
+    assert.equal(reopened.host(0).stateOf(5n), "fenced", "reopening adopted nothing that was mid-move");
+    await reopened.publish();
+    assert.equal(await new Mover(reopened.directory, reopened.mover.hosts, 8, ROW).run(5n), "done");
+    assert.deepEqual(await page(reopened.client(), issue), before);
+  });
+
+  it("resumes a move a directory recorded before copies were chunked", async () => {
+    const { c, db, issue } = await seeded();
+    const before = await page(db, issue);
+    c.directory.sql.run("DROP TABLE moves");
+    c.directory.sql.run(
+      "CREATE TABLE moves (vshard INTEGER PRIMARY KEY, from_host INTEGER NOT NULL, to_host INTEGER NOT NULL," +
+        " epoch INTEGER NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)",
+    );
+    c.directory.sql.run("INSERT INTO moves (vshard, from_host, to_host, epoch, state) VALUES (5, 0, 1, 1, 'copy')");
+    await c.mover.hosts.fence(0, "5");
+
+    const mover = new Mover(c.directory, c.mover.hosts, 8, ROW);
+    assert.equal(mover.pending(5n)?.cursor, null, "the column was added, empty");
+    assert.equal(await mover.run(5n), "done");
+    assert.deepEqual(await page(db, issue), before);
   });
 });

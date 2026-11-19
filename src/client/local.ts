@@ -14,7 +14,7 @@ import type { MoveHosts } from "../directory/move.ts";
 import type { Shed, Thresholds } from "../directory/placement.ts";
 import { Host } from "../host/host.ts";
 import { Deliverer } from "../host/outbox.ts";
-import type { ExecReply, Reply, Routed, Snapshot } from "../host/host.ts";
+import type { ChunkBudget, ExecReply, Reply, Routed } from "../host/host.ts";
 import { nodeSql } from "../host/sql.node.ts";
 import type { Sql } from "../host/sql.ts";
 import type { StorageFormat } from "../host/schema.ts";
@@ -72,7 +72,14 @@ export interface LocalOptions {
   /** A vshard's soft byte cap, lowered in tests so growth and rebalancing are reachable. */
   cap?: number;
   thresholds?: Thresholds;
+  /** What one chunk of a move's copy may carry. Lowered in tests so that a vshard of tens of rows
+   *  still crosses in many chunks and the cursor is exercised. */
+  chunk?: ChunkBudget;
 }
+
+/** Every point at which a move calls a host, for `failAt`. The copy is two of them, the read on the
+ *  source and the install on the target, so a test can stop it on either side of a chunk. */
+export type MoveFault = "ensure" | "fence" | "snapshot" | "install" | "discard" | "retire" | "purge";
 
 /**
  * The storage format the whole suite runs under, from the environment.
@@ -122,7 +129,7 @@ export class LocalCluster {
     for (const h of this.directory.hostIndexes()) this.host(h);
     this.adoptAll();
     this.transport = this.#transport();
-    this.mover = new Mover(this.directory, this.#moveHosts());
+    this.mover = new Mover(this.directory, this.#moveHosts(), undefined, opts.chunk);
     this.allocator = new Allocator(this.directory, {
       cap: opts.cap,
       random: this.runtime.random,
@@ -150,7 +157,7 @@ export class LocalCluster {
   }
 
   /** Move operations a chaos test has made fail, by name. */
-  readonly failing = new Set<keyof MoveHosts>();
+  readonly failing = new Set<MoveFault>();
 
   /** Knocks a host over, so the move driving it fails partway and has to resume. */
   kill(host: number): void {
@@ -162,7 +169,7 @@ export class LocalCluster {
   }
 
   /** Fails one step of the move protocol, wherever it runs, so a test can crash at a chosen point. */
-  failAt(...steps: (keyof MoveHosts)[]): void {
+  failAt(...steps: MoveFault[]): void {
     for (const s of steps) this.failing.add(s);
   }
 
@@ -171,7 +178,7 @@ export class LocalCluster {
     this.down.clear();
   }
 
-  #live(host: number, step: keyof MoveHosts): Host {
+  #live(host: number, step: MoveFault): Host {
     if (this.failing.has(step)) throw new Error(`${step} is failing`);
     if (this.down.has(host)) throw new Error(`host ${host} is down`);
     return this.host(host);
@@ -187,17 +194,19 @@ export class LocalCluster {
       async fence(host: number, vshard: string): Promise<void> {
         c.#live(host, "fence").setState(vshard, "fenced");
       },
-      async snapshot(host: number, vshard: string): Promise<Snapshot> {
-        return c.#live(host, "snapshot").snapshot(vshard);
+      async copy(from, to, vshard, cursor, epoch, budget) {
+        const chunk = c.#live(from, "snapshot").chunk(vshard, cursor, budget);
+        c.#live(to, "install").install(chunk, epoch);
+        return chunk.next;
       },
-      async install(host: number, snapshot: Snapshot, epoch: number): Promise<void> {
-        c.#live(host, "install").install(snapshot, epoch);
+      async discard(host, vshard, epoch, rows) {
+        return c.#live(host, "discard").discard(vshard, epoch, rows);
       },
       async retire(host: number, vshard: string): Promise<void> {
         c.#live(host, "retire").setState(vshard, "moved");
       },
-      async purge(host: number, vshard: string): Promise<void> {
-        c.#live(host, "purge").purge(vshard);
+      async purge(host, vshard, rows) {
+        return c.#live(host, "purge").purge(vshard, rows);
       },
     };
   }
@@ -224,7 +233,10 @@ export class LocalCluster {
       const host = this.host(index);
       for (const v of this.directory.vshardsOn(index)) {
         const route = this.directory.resolve(v)!;
-        if (!host.holds(v)) host.adopt(v.toString(), route.epoch);
+        // Only a vshard the host has no row for. A fenced one is mid-move, and adopting it would
+        // unfence it: on a restart that let writes land on a source the copy had already started
+        // reading, and they would not reach the target.
+        if (host.stateOf(v) === "absent") host.adopt(v.toString(), route.epoch);
       }
     }
   }

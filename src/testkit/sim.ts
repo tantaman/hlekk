@@ -12,8 +12,8 @@
 
 import { Hlekk, VersionConflict } from "../client/client.ts";
 import { LocalCluster } from "../client/local.ts";
+import type { MoveFault } from "../client/local.ts";
 import type { Thresholds } from "../directory/placement.ts";
-import type { MoveHosts } from "../directory/move.ts";
 import { Deliverer } from "../host/outbox.ts";
 import type { Fields, Id, Json } from "../query/types.ts";
 import { deterministic, seeded } from "../runtime/runtime.ts";
@@ -114,6 +114,9 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
     cap: opts.cap ?? 1_000_000,
     thresholds: opts.thresholds ?? { bytes: 4_000, requests: 2_000 },
     runtime,
+    // A few rows a chunk, so every move the schedule makes crosses many chunk boundaries, and a
+    // crashed one resumes from a cursor partway through a table rather than from the top.
+    chunk: { rows: 3, bytes: 1_024 },
   });
   c.directory.applyLock(shape.lock);
   if ((opts.hosts ?? 3) > 1) c.scatter(opts.hosts ?? 3);
@@ -308,7 +311,7 @@ export async function simulate(opts: SimOptions): Promise<Simulated> {
       const from = c.directory.resolve(v)!.host;
       // Every step that is a call to a host. Flip is not one: it is a directory write, with nothing
       // to fail.
-      c.failAt(r.pick(["ensure", "fence", "snapshot", "install", "retire", "purge"] as (keyof MoveHosts)[]));
+      c.failAt(r.pick(["ensure", "fence", "snapshot", "install", "discard", "retire", "purge"] as MoveFault[]));
       await attempt(async () => {
         c.mover.begin(v, from + 1);
         await c.mover.run(v);

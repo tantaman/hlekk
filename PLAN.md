@@ -24,7 +24,7 @@ Figures marked **measured** were read off a real artifact and say how.
 
 ## Where this stands
 
-Built, with typecheck clean and **675 of 675 tests passing under both storage formats**
+Built, with typecheck clean and **702 of 702 tests passing under both storage formats**
 (`npm run test:formats`), **48 of 48** conformance checks against the published fixture
 (`npm run conformance:fixture`) and **35 of 35** without one (`npm run conformance:node`):
 
@@ -246,8 +246,11 @@ steps above, so that nothing reads as finished that is not.
       the confirm leaves an object no index entry points at, and nothing collects it
       ([`docs/wikimedia-demo.md`](docs/wikimedia-demo.md)). A defect in the engine, and step 8 puts it
       behind HTTP.
-- [ ] The chunked snapshot. Carried from `design.md`, and the only route from storage format 1 to
-      format 2.
+- [x] The chunked snapshot. A move copies a vshard a chunk at a time and resumes from a recorded
+      cursor, so it is bounded by the vshard cap rather than by one request. It is also the route
+      from storage format 1 to format 2 — a format 1 vshard's chunks install into a format 2 host
+      with every alias 0, which `src/host/copy.test.ts` pins — though no deployed database has been
+      migrated that way yet.
 - [ ] How long a retired key's grace window is. `pruneKeys` takes one and nothing chooses it; a
       caller pinned on a pruned key is repudiated on next contact, which is the cost of the window
       being finite.

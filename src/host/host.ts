@@ -231,6 +231,67 @@ export interface Snapshot {
   index: { idx: number; key: string; id: Id | null; state: string; at: number }[];
 }
 
+/** The tables a vshard's copy walks, in the order it walks them. */
+export const COPY_TABLES = ["objects", "assocs", "counts", "outbox", "index"] as const;
+export type CopyTable = (typeof COPY_TABLES)[number];
+
+/** One column of a primary key, as it crosses the wire: ids as decimal strings, never as numbers. */
+export type KeyPart = string | number;
+
+/** Where a chunked copy has got to: a table, and the primary key of the last row taken from it, or
+ *  null at the table's start. Plain JSON, so the directory can record it and any transport can carry
+ *  it, and opaque to everything but the `Host.chunk` that wrote it. */
+export interface CopyCursor {
+  table: CopyTable;
+  after: KeyPart[] | null;
+}
+
+export const COPY_START: CopyCursor = { table: "objects", after: null };
+
+/** How much one chunk may carry. Both bounds apply. */
+export interface ChunkBudget {
+  rows: number;
+  /** Payload bytes plus a per-row allowance for keys, as `stats` estimates them. */
+  bytes: number;
+}
+
+/** Sized for one request on a Durable Object: a few megabytes of JSON across one RPC and one
+ *  transaction of ten thousand inserts, far inside 128 MB of isolate and 30 s of CPU. A 9 GB vshard
+ *  is a little over two thousand of these. */
+export const DEFAULT_CHUNK: ChunkBudget = { rows: 10_000, bytes: 4 * 1024 * 1024 };
+
+const UNBOUNDED: ChunkBudget = { rows: Infinity, bytes: Infinity };
+
+/** Rows read per statement while a chunk fills. Small enough that the rows read past a full chunk
+ *  are cheap, large enough that statement overhead is not the cost. */
+const PAGE_ROWS = 512;
+
+/** One slice of a vshard's copy: the rows from `from` up to `next`, and the vshard's row as the source
+ *  held it. `next` is null on the last chunk, which is the one that hands ownership over. */
+export interface Chunk extends Snapshot {
+  from: CopyCursor;
+  next: CopyCursor | null;
+}
+
+interface CopyRow {
+  key: KeyPart[];
+  size: number;
+  put(chunk: Chunk): void;
+}
+
+/** A chunk asked for while the vshard still takes writes. Rows read in several requests from a
+ *  vshard that is not fenced would be torn — a write between two chunks lands in one and not the
+ *  other — so this is refused rather than served. The mover answers it by fencing again and copying
+ *  from the top. */
+export class Unfenced extends Error {
+  readonly vshard: string;
+  constructor(vshard: string) {
+    super(`vshard ${vshard} is owned, not fenced: a copy of a vshard that still takes writes would be torn`);
+    this.name = "Unfenced";
+    this.vshard = vshard;
+  }
+}
+
 /** What a vshard costs this host, for the placement controller. Requests are counted since the last
  *  read, so the controller polling on a fixed interval reads a rate.
  *
@@ -609,81 +670,72 @@ export class Host {
   }
 
   // ---- moves
+  //
+  // A vshard is copied a chunk at a time. It is one contiguous key range in objects, assocs and
+  // assoc_counts, and one `vshard` prefix in outbox and index_entries, so a cursor over each table's
+  // primary key paginates it with a seek rather than a scan. The copy is correct for three reasons,
+  // each enforced here rather than assumed:
+  //
+  //   - The source is fenced throughout. `chunk` refuses a vshard that still takes writes, since a
+  //     write landing between two chunks would be in one and not the other.
+  //   - Nothing on the target serves a half-copied vshard. Rows are staged with no `vshards` row,
+  //     so reads see UNKNOWN and the outbox does not deliver them; the row is written by the last
+  //     chunk, in that chunk's transaction, and only then is the vshard the target's.
+  //   - A chunk is idempotent. Every row is INSERT OR REPLACE, so a chunk sent twice after a lost
+  //     reply lands once, and a copy resumes from the last cursor the directory recorded.
+  //
+  // What staging cannot make safe is rows left over from an earlier, abandoned copy of the same
+  // vshard: if the source changed in between, a leftover the source has since deleted would come
+  // back. `discard` clears them, and the mover runs it before every copy that starts from the top.
 
-  /** Everything this vshard holds. Taken while the vshard is fenced, so the rows cannot change under
-   *  it; a snapshot of a vshard still taking writes would be torn.
-   *
-   *  THIS DOES NOT SCALE TO THE VSHARD CAP, and not merely as a slow pause. The whole vshard becomes
-   *  one JS object, crosses one RPC and is replayed by `install()` row at a time inside a single
-   *  transaction, against a 128 MB isolate and 30 s of CPU per request (300 s configured). So the
-   *  size this survives is measured in hundreds of megabytes, under the cap today and far under it at
-   *  9 GB. Past that the move does not take longer, it fails: `MoveFailed` at `copy`, retried, with
-   *  the vshard left fenced — reads served, writes refused — for as long as it keeps failing.
-   *
-   *  The fix is to chunk it, and it is owed at any cap. A vshard is one contiguous key range in
-   *  objects, assocs and assoc_counts, so a cursor paginates it; `install` is already INSERT OR
-   *  REPLACE, so a chunk is idempotent and a crashed copy re-copies; and the `vshards` row flip is
-   *  already the last step, so a half-installed vshard is invisible. The fence holds across all of
-   *  it, so nothing about the correctness argument changes — only that the pause becomes a sequence
-   *  of transactions rather than one. Nothing exercises this yet because the harnesses move tens of
-   *  rows. */
+  /** A whole vshard in one read. One synchronous call, so it is consistent whatever the vshard's
+   *  state; a move uses `chunk` instead, because a whole vshard does not fit in one request. */
   snapshot(vshard: string): Snapshot {
     const v = BigInt(vshard);
-    const [lo, hi] = vshardRange(v);
-    const row = this.sql.all<VshardRow>("SELECT epoch, state, next_seq FROM vshards WHERE vshard = ?", Number(v))[0];
+    const row = this.#vshardRow(v);
     if (!row) throw new NotOwned({ vshard, state: "absent", epoch: -1 });
-    return {
-      vshard,
-      epoch: row.epoch,
-      nextSeq: row.next_seq,
-      objects: this.sql
-        .all<{ id: Uint8Array; otype: number; version: number; data: string }>(
-          "SELECT id, otype, version, data FROM objects WHERE id BETWEEN ? AND ?",
-          lo,
-          hi,
-        )
-        .map((r) => ({ ...r, id: fromKey(r.id) })),
-      // Format 1 has no `db` column, so its rows snapshot as alias 0 — which is what makes a format 1
-      // snapshot installable into a format 2 host, and so makes a vshard move the migration between
-      // the two (`docs/global-ids.md`).
-      assocs: this.sql
-        .all<{ id1: Uint8Array; atype: number; db?: number; id2: Uint8Array; time: number; data: string | null }>(
-          this.#format === 2
-            ? "SELECT id1, atype, db, id2, time, data FROM assocs WHERE id1 BETWEEN ? AND ?"
-            : "SELECT id1, atype, id2, time, data FROM assocs WHERE id1 BETWEEN ? AND ?",
-          lo,
-          hi,
-        )
-        .map((r) => ({ ...r, db: r.db ?? 0, id1: fromKey(r.id1), id2: fromKey(r.id2) })),
-      counts: this.sql
-        .all<{ id1: Uint8Array; atype: number; n: number }>(
-          "SELECT id1, atype, n FROM assoc_counts WHERE id1 BETWEEN ? AND ?",
-          lo,
-          hi,
-        )
-        .map((r) => ({ ...r, id1: fromKey(r.id1) })),
-      // Outbox rows belong to their source vshard and move with it.
-      outbox: this.sql
-        .all<{ seq: number; target_vshard: number; op: string }>(
-          "SELECT seq, target_vshard, op FROM outbox WHERE vshard = ? ORDER BY seq",
-          Number(v),
-        )
-        .map((r) => ({ seq: r.seq, target: r.target_vshard, op: r.op })),
-      // Index entries live in an index vshard, so they travel when it moves.
-      index: this.sql
-        .all<{ idx: number; key: string; id: Uint8Array | null; state: string; at: number }>(
-          "SELECT idx, key, id, state, at FROM index_entries WHERE vshard = ?",
-          Number(v),
-        )
-        .map((r) => ({ idx: r.idx, key: r.key, id: r.id === null ? null : fromKey(r.id), state: r.state, at: r.at })),
-    };
+    const c = this.#read(v, row, COPY_START, UNBOUNDED);
+    return { vshard: c.vshard, epoch: c.epoch, nextSeq: c.nextSeq, objects: c.objects, assocs: c.assocs, counts: c.counts, outbox: c.outbox, index: c.index };
   }
 
-  /** Takes ownership of a snapshotted vshard at the next epoch, in one transaction. Idempotent, so a
-   *  move that crashed after copying can simply copy again. */
-  install(snap: Snapshot, epoch: number): void {
+  /** One slice of a fenced vshard, starting at `from` and bounded by `budget`: at most `budget.rows`
+   *  rows and `budget.bytes` of payload, except that a chunk always carries at least one row, so a row
+   *  larger than the byte bound still moves, alone. `next` is where the following chunk starts, or
+   *  null when this is the last.
+   *
+   *  Refuses a vshard that is not fenced. It names `Unfenced` when the vshard is owned, which the
+   *  mover answers by fencing again and copying from the top, and `NotOwned` otherwise. */
+  chunk(vshard: string, from: CopyCursor = COPY_START, budget: ChunkBudget = DEFAULT_CHUNK): Chunk {
+    const v = BigInt(vshard);
+    const row = this.#vshardRow(v);
+    if (!row) throw new NotOwned({ vshard, state: "absent", epoch: -1 });
+    if (row.state === "owned") throw new Unfenced(vshard);
+    if (row.state !== "fenced") throw new NotOwned({ vshard, state: row.state, epoch: row.epoch });
+    if (!COPY_TABLES.includes(from.table)) throw new RangeError(`no copy table ${JSON.stringify(from.table)}`);
+    return this.#read(v, row, from, budget);
+  }
+
+  /** Installs one chunk of a vshard, or a whole snapshot, at `epoch`. Each call is one transaction.
+   *
+   *  Rows land staged: nothing serves them until the last chunk (`next` null, or absent on a whole
+   *  snapshot) writes the `vshards` row, which takes ownership in the same transaction as the last
+   *  rows. Idempotent, so a chunk re-sent after a lost reply, or a copy resumed from a recorded
+   *  cursor, lands each row once.
+   *
+   *  Refuses a vshard this host already holds in any other way than as this copy's own result —
+   *  owned at exactly `epoch` — because a copy writing into a vshard a host serves would merge two
+   *  vshards' rows with nothing to say which were whose. */
+  install(snap: Snapshot & { next?: CopyCursor | null }, epoch: number): void {
     const v = BigInt(snap.vshard);
+    const last = snap.next === undefined || snap.next === null;
     this.sql.txn(() => {
+      const held = this.#vshardRow(v);
+      if (held && !(held.state === "owned" && held.epoch === epoch)) {
+        throw new Error(
+          `vshard ${snap.vshard} is ${held.state} at epoch ${held.epoch} on this host, so a copy installing it at` +
+            ` epoch ${epoch} would write into rows this host already holds`,
+        );
+      }
       for (const o of snap.objects) {
         this.sql.run("INSERT OR REPLACE INTO objects (id, otype, version, data) VALUES (?, ?, ?, ?)", toKey(o.id), o.otype, o.version, o.data);
       }
@@ -742,7 +794,10 @@ export class Host {
           e.at,
         );
       }
-      // next_seq comes with it, or the new owner would hand out ids the old one already used.
+      if (!last) return;
+      // next_seq comes with it, or the new owner would hand out ids the old one already used. It is
+      // the last chunk's figure, read from the source after every other row: the source is fenced, so
+      // it cannot have moved, but this is the reading that would see it if it had.
       this.sql.run(
         "INSERT INTO vshards (vshard, epoch, state, next_seq) VALUES (?, ?, 'owned', ?)" +
           " ON CONFLICT (vshard) DO UPDATE SET epoch = excluded.epoch, state = 'owned', next_seq = excluded.next_seq",
@@ -753,18 +808,218 @@ export class Host {
     });
   }
 
-  /** Drops a retired vshard's rows, after the grace period that lets stale readers find out. */
-  purge(vshard: string): void {
+  /** Clears what an earlier copy of this vshard left on this host, before a copy that starts from the
+   *  top. Deletes at most `limit` rows and returns true once none are left.
+   *
+   *  Refuses a vshard this host holds unless it is this copy's own finished result, owned at exactly
+   *  `epoch`: that is a copy the mover rewound before its route flipped, and nothing routes to it.
+   *  Its `vshards` row goes first, in the first call, so a half-cleared vshard is never served. */
+  discard(vshard: string, epoch: number, limit = Infinity): boolean {
     const v = BigInt(vshard);
-    const [lo, hi] = vshardRange(v);
-    this.sql.txn(() => {
-      this.sql.run("DELETE FROM objects WHERE id BETWEEN ? AND ?", lo, hi);
-      this.sql.run("DELETE FROM assocs WHERE id1 BETWEEN ? AND ?", lo, hi);
-      this.sql.run("DELETE FROM assoc_counts WHERE id1 BETWEEN ? AND ?", lo, hi);
-      this.sql.run("DELETE FROM outbox WHERE vshard = ?", Number(v));
-      this.sql.run("DELETE FROM index_entries WHERE vshard = ?", Number(v));
-      this.sql.run("DELETE FROM vshards WHERE vshard = ?", Number(v));
+    return this.sql.txn(() => {
+      const held = this.#vshardRow(v);
+      if (held) {
+        if (!(held.state === "owned" && held.epoch === epoch)) {
+          throw new Error(
+            `vshard ${vshard} is ${held.state} at epoch ${held.epoch} on this host, and a copy at epoch ${epoch}` +
+              " clears only what a copy left behind, never a vshard a host holds",
+          );
+        }
+        this.sql.run("DELETE FROM vshards WHERE vshard = ?", Number(v));
+      }
+      return this.#drop(v, limit);
     });
+  }
+
+  /** Drops a retired vshard's rows, after the grace period that lets stale readers find out. Deletes
+   *  at most `limit` rows per call and returns true once the vshard is gone. The `vshards` row goes
+   *  last, so until then the vshard reads as moved rather than as something partly deleted. */
+  purge(vshard: string, limit = Infinity): boolean {
+    const v = BigInt(vshard);
+    return this.sql.txn(() => {
+      const done = this.#drop(v, limit);
+      if (done) this.sql.run("DELETE FROM vshards WHERE vshard = ?", Number(v));
+      return done;
+    });
+  }
+
+  /** What a host has recorded about a vshard, if anything. */
+  stateOf(vshard: bigint): State | "absent" {
+    return this.#state(vshard);
+  }
+
+  /** Deletes up to `limit` of a vshard's rows across every table, inside the caller's transaction.
+   *  True when none are left. Each delete is bounded through a subquery, since `DELETE … LIMIT` is a
+   *  compile-time option SQLite builds do not all have. */
+  #drop(v: bigint, limit: number): boolean {
+    const [lo, hi] = vshardRange(v);
+    const n = Number(v);
+    const tables: [string, string, Param[]][] = [
+      ["objects", "id FROM objects WHERE id BETWEEN ? AND ?", [lo, hi]],
+      ["assocs", `${this.#format === 2 ? "id1, atype, db, id2" : "id1, atype, id2"} FROM assocs WHERE id1 BETWEEN ? AND ?`, [lo, hi]],
+      ["assoc_counts", "id1, atype FROM assoc_counts WHERE id1 BETWEEN ? AND ?", [lo, hi]],
+      ["outbox", "vshard, seq FROM outbox WHERE vshard = ?", [n]],
+      ["index_entries", "vshard, idx, key FROM index_entries WHERE vshard = ?", [n]],
+    ];
+    let left = limit;
+    for (const [table, keys, params] of tables) {
+      if (left <= 0) break;
+      const bound = Number.isFinite(left) ? left : -1; // a negative LIMIT is no limit
+      const taken = this.sql.all<{ n: number }>(`SELECT COUNT(*) AS n FROM (SELECT ${keys} LIMIT ?)`, ...params, bound)[0]?.n ?? 0;
+      if (taken === 0) continue;
+      const columns = keys.slice(0, keys.indexOf(" FROM "));
+      this.sql.run(`DELETE FROM ${table} WHERE (${columns}) IN (SELECT ${keys} LIMIT ?)`, ...params, bound);
+      left -= taken;
+    }
+    if (left > 0) return true;
+    return !tables.some(
+      ([, keys, params]) => (this.sql.all<{ n: number }>(`SELECT COUNT(*) AS n FROM (SELECT ${keys} LIMIT 1)`, ...params)[0]?.n ?? 0) > 0,
+    );
+  }
+
+  #vshardRow(v: bigint): VshardRow | undefined {
+    return this.sql.all<VshardRow>("SELECT vshard, epoch, state, next_seq FROM vshards WHERE vshard = ?", Number(v))[0];
+  }
+
+  /** Reads rows of one vshard from `from` until `budget` is spent or the vshard is exhausted. */
+  #read(v: bigint, row: VshardRow, from: CopyCursor, budget: ChunkBudget): Chunk {
+    const chunk: Chunk = {
+      vshard: v.toString(),
+      epoch: row.epoch,
+      nextSeq: row.next_seq,
+      from,
+      next: null,
+      objects: [],
+      assocs: [],
+      counts: [],
+      outbox: [],
+      index: [],
+    };
+    let rows = 0;
+    let bytes = 0;
+    for (let t = COPY_TABLES.indexOf(from.table); t < COPY_TABLES.length; t++) {
+      const table = COPY_TABLES[t];
+      let after = table === from.table ? from.after : null;
+      for (;;) {
+        const want = Math.min(PAGE_ROWS, Math.max(1, budget.rows - rows));
+        const page = this.#page(table, v, after, want);
+        for (const r of page) {
+          // At least one row per chunk; past that, a row joins only if it fits both bounds.
+          if (rows > 0 && (rows + 1 > budget.rows || bytes + r.size > budget.bytes)) {
+            chunk.next = { table, after };
+            return chunk;
+          }
+          r.put(chunk);
+          rows++;
+          bytes += r.size;
+          after = r.key;
+        }
+        if (page.length < want) break; // this table is done
+        if (rows >= budget.rows) {
+          chunk.next = { table, after };
+          return chunk;
+        }
+      }
+    }
+    // Read after every other row. The source is fenced, so this cannot have moved since the first
+    // chunk; reading it last is what would show it if it had.
+    const now = this.#vshardRow(v);
+    if (now) chunk.nextSeq = now.next_seq;
+    return chunk;
+  }
+
+  /** One page of one table, after a key or from its start. Every query seeks on the primary key: the
+   *  row-value comparison is what lets SQLite start at the cursor, where a BETWEEN on the leading
+   *  column alone would rescan from the vshard's start on every page and make a high-degree object
+   *  quadratic to copy. */
+  #page(table: CopyTable, v: bigint, after: KeyPart[] | null, n: number): CopyRow[] {
+    const [lo, hi] = vshardRange(v);
+    const id = (k: KeyPart) => toKey(String(k));
+    switch (table) {
+      case "objects": {
+        const rows = this.sql.all<{ id: Uint8Array; otype: number; version: number; data: string; size: number }>(
+          "SELECT id, otype, version, data, LENGTH(CAST(data AS BLOB)) AS size FROM objects" +
+            (after ? " WHERE id > ? AND id <= ?" : " WHERE id BETWEEN ? AND ?") +
+            " ORDER BY id LIMIT ?",
+          after ? id(after[0]) : lo,
+          hi,
+          n,
+        );
+        return rows.map((r) => {
+          const o = { id: fromKey(r.id), otype: r.otype, version: r.version, data: r.data };
+          return { key: [o.id], size: ROW_COST.object + r.size, put: (c: Chunk) => void c.objects.push(o) };
+        });
+      }
+      case "assocs": {
+        // Format 1 has no `db` column, so its rows read as alias 0 — which is what makes a format 1
+        // vshard installable into a format 2 host, and so makes a move the migration between the two.
+        const two = this.#format === 2;
+        const cols = two ? "id1, atype, db, id2" : "id1, atype, id2";
+        const marks = two ? "?, ?, ?, ?" : "?, ?, ?";
+        const params: Param[] = after
+          ? two
+            ? [id(after[0]), Number(after[1]), Number(after[2]), id(after[3]), hi, n]
+            : [id(after[0]), Number(after[1]), id(after[2]), hi, n]
+          : [lo, hi, n];
+        const rows = this.sql.all<{
+          id1: Uint8Array;
+          atype: number;
+          db?: number;
+          id2: Uint8Array;
+          time: number;
+          data: string | null;
+          size: number;
+        }>(
+          `SELECT ${cols}, time, data, COALESCE(LENGTH(CAST(data AS BLOB)), 0) AS size FROM assocs` +
+            (after ? ` WHERE (${cols}) > (${marks}) AND id1 <= ?` : " WHERE id1 BETWEEN ? AND ?") +
+            ` ORDER BY ${cols} LIMIT ?`,
+          ...params,
+        );
+        return rows.map((r) => {
+          const a = { id1: fromKey(r.id1), atype: r.atype, db: r.db ?? 0, id2: fromKey(r.id2), time: r.time, data: r.data };
+          const key = two ? [a.id1, a.atype, a.db, a.id2] : [a.id1, a.atype, a.id2];
+          return { key, size: ROW_COST.assoc + r.size, put: (c: Chunk) => void c.assocs.push(a) };
+        });
+      }
+      case "counts": {
+        const rows = this.sql.all<{ id1: Uint8Array; atype: number; n: number }>(
+          "SELECT id1, atype, n FROM assoc_counts" +
+            (after ? " WHERE (id1, atype) > (?, ?) AND id1 <= ?" : " WHERE id1 BETWEEN ? AND ?") +
+            " ORDER BY id1, atype LIMIT ?",
+          ...(after ? [id(after[0]), Number(after[1]), hi, n] : [lo, hi, n]),
+        );
+        return rows.map((r) => {
+          const k = { id1: fromKey(r.id1), atype: r.atype, n: r.n };
+          return { key: [k.id1, k.atype], size: ROW_COST.count, put: (c: Chunk) => void c.counts.push(k) };
+        });
+      }
+      case "outbox": {
+        // Outbox rows belong to their source vshard and move with it, in sequence order.
+        const rows = this.sql.all<{ seq: number; target_vshard: number; op: string; size: number }>(
+          "SELECT seq, target_vshard, op, LENGTH(CAST(op AS BLOB)) AS size FROM outbox WHERE vshard = ?" +
+            (after ? " AND seq > ?" : "") +
+            " ORDER BY seq LIMIT ?",
+          ...(after ? [Number(v), Number(after[0]), n] : [Number(v), n]),
+        );
+        return rows.map((r) => {
+          const o = { seq: r.seq, target: r.target_vshard, op: r.op };
+          return { key: [o.seq], size: ROW_COST.outbox + r.size, put: (c: Chunk) => void c.outbox.push(o) };
+        });
+      }
+      case "index": {
+        // Index entries live in an index vshard, so they travel when it moves.
+        const rows = this.sql.all<{ idx: number; key: string; id: Uint8Array | null; state: string; at: number }>(
+          "SELECT idx, key, id, state, at FROM index_entries WHERE vshard = ?" +
+            (after ? " AND (idx, key) > (?, ?)" : "") +
+            " ORDER BY idx, key LIMIT ?",
+          ...(after ? [Number(v), Number(after[0]), String(after[1]), n] : [Number(v), n]),
+        );
+        return rows.map((r) => {
+          const e = { idx: r.idx, key: r.key, id: r.id === null ? null : fromKey(r.id), state: r.state, at: r.at };
+          return { key: [e.idx, e.key], size: ROW_COST.index + e.key.length, put: (c: Chunk) => void c.index.push(e) };
+        });
+      }
+    }
   }
 
   // ---- global unique index
@@ -862,7 +1117,10 @@ export class Host {
   /** Rows waiting for delivery, oldest first per source vshard. */
   pending(limit = 64): OutboxRow[] {
     const rows = this.sql.all<{ vshard: number; seq: number; target_vshard: number; op: string }>(
-      "SELECT vshard, seq, target_vshard, op FROM outbox ORDER BY vshard, seq LIMIT ?",
+      // A copy's staged rows have no `vshards` row yet, and are not this host's to deliver: delivering
+      // a staged op from an abandoned copy would replay it after the source had moved on.
+      "SELECT vshard, seq, target_vshard, op FROM outbox WHERE vshard IN (SELECT vshard FROM vshards)" +
+        " ORDER BY vshard, seq LIMIT ?",
       limit,
     );
     return rows.map((r) => ({ ...r, op: JSON.parse(r.op) as OutboxOp }));

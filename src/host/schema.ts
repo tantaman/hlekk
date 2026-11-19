@@ -21,8 +21,8 @@
 //     b-tree. So a format 1 host cannot be given format 2's statements cheaply.
 //
 // Hence: two formats, each with its own statements, and a vshard move is the migration — a format 1
-// snapshot installs into a format 2 host with every alias 0 (`docs/global-ids.md`). That waits on
-// the chunked snapshot design.md owes.
+// vshard's chunks install into a format 2 host with every alias 0 (`docs/global-ids.md`), at any
+// vshard size, since the copy is chunked.
 //
 // **The format is a recorded fact, not an inference.** The directory holds it in `meta`, where absent
 // means 1, and a host detects its own from the shape of its `assocs` and refuses to open when the two

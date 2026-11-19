@@ -91,6 +91,12 @@ with it. The shape of the fix is recorded on `Host.snapshot` and in
 idempotent; and the `vshards` row flip is already the last step, so a half-installed vshard is
 invisible.
 
+**Since built, for moves** (`Host.chunk`, `Host.install`, and the cursor the mover records). A chunk
+whose `next` is set lands staged and unserved on a host that does not hold the vshard; the one whose
+`next` is null writes the `vshards` row with its `next_seq`. Into a vshard the host already owns at
+the chunk's epoch, which is what a laid-out database is, each chunk lands as an ordinary idempotent
+write. So the primitive this section asks for exists. The loaders in `scripts/` do not use it yet.
+
 Four constraints the loader has to respect:
 
 - **The loader mints ids, not the allocator.** Edges reference their targets, so ids have to exist

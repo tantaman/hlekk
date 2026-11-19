@@ -26,6 +26,9 @@
     // were ever deployed. It is not -- `npm run app` drives it on local workerd, where 40,960 is
     // the right number -- but the margin is 56 bytes on one platform and negative on the other,
     // which is too thin to leave unsaid.
-    "HLEKK_SHED_BYTES": "45000"
+    "HLEKK_SHED_BYTES": "45000",
+    // Two rows a chunk, so every move the harness makes crosses in many chunks over real DO-to-DO
+    // calls: the target pulling each one from the source, and the directory recording each cursor.
+    "HLEKK_CHUNK_ROWS": "2"
   }
 }

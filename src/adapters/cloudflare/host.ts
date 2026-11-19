@@ -14,14 +14,15 @@ import { applyTo } from "../../client/transport.ts";
 import type { Mutation } from "../../client/transport.ts";
 import { Deliverer } from "../../host/outbox.ts";
 import { Host } from "../../host/host.ts";
-import type { Snapshot } from "../../host/host.ts";
+import type { Chunk, ChunkBudget, CopyCursor } from "../../host/host.ts";
 import type { StorageFormat } from "../../host/schema.ts";
 import { vshardRange } from "../../host/ids.ts";
 import { doSql } from "../../host/sql.ts";
 import type { Sql } from "../../host/sql.ts";
 import type { Miss, Plan } from "../../query/types.ts";
+import { hostStub } from "./bindings.ts";
 import type { Ctx, Env } from "./bindings.ts";
-import { routedFromWire, serve } from "./rpc.ts";
+import { call, routedFromWire, serve } from "./rpc.ts";
 import { cloudflareTransport } from "./transport.ts";
 
 /** The DO layer's own row, for what a host needs across an eviction and the host schema has no place
@@ -108,7 +109,8 @@ export class HlekkHostDO {
               host.setFormat(format);
             });
           }
-          for (const e of entries) if (!host.holds(BigInt(e.vshard))) host.adopt(e.vshard, e.epoch);
+          // Only a vshard this host has no row for: adopting a fenced one would unfence it mid-move.
+          for (const e of entries) if (host.stateOf(BigInt(e.vshard)) === "absent") host.adopt(e.vshard, e.epoch);
           return host.vshards().length;
         },
 
@@ -126,15 +128,22 @@ export class HlekkHostDO {
         // ---- the move protocol, each step one call
 
         fence: (vshard: string) => host.setState(vshard, "fenced"),
-        snapshot: (vshard: string) => host.snapshot(vshard),
-        install: (snapshot: Snapshot, epoch: number) => {
-          host.install(snapshot, epoch);
-          // Outbox rows move with their source vshard, so a vshard that arrives holding undelivered
-          // work has to be drained by whoever holds it now.
-          return this.#wake();
+        /** One chunk of a fenced vshard, read for the host that is copying it. */
+        chunk: (vshard: string, cursor: CopyCursor, budget: ChunkBudget) => host.chunk(vshard, cursor, budgetFromWire(budget)),
+
+        /** One chunk of a copy onto this host: pulled from the source, installed here, and where the
+         *  next one starts handed back to the directory. The rows cross one hop, host to host. */
+        pull: async (source: number, vshard: string, cursor: CopyCursor, epoch: number, budget: ChunkBudget) => {
+          const chunk = await call<Chunk>(hostStub(this.#env, source), "chunk", vshard, cursor, budget);
+          host.install(chunk, epoch);
+          // The last chunk hands the vshard over, outbox rows and all, and a vshard that arrives
+          // holding undelivered work has to be drained by whoever holds it now.
+          if (chunk.next === null) await this.#wake();
+          return chunk.next;
         },
+        discard: (vshard: string, epoch: number, rows: number | null) => host.discard(vshard, epoch, rows ?? Infinity),
         retire: (vshard: string) => host.setState(vshard, "moved"),
-        purge: (vshard: string) => host.purge(vshard),
+        purge: (vshard: string, rows: number | null) => host.purge(vshard, rows ?? Infinity),
 
         // ---- what the placement controller, the global index and an operator ask for
 
@@ -233,3 +242,10 @@ export class HlekkHostDO {
     if ((await this.#ctx.storage.getAlarm()) === null) await this.#ctx.storage.setAlarm(Date.now() + 1);
   }
 }
+
+/** A budget as JSON carried it. `Infinity` crosses as `null` — `JSON.stringify` has no other
+ *  spelling for it — and a null bound compared as a number would be 0 and send one row per chunk. */
+const budgetFromWire = (b: ChunkBudget | null): ChunkBudget => ({
+  rows: b?.rows ?? Infinity,
+  bytes: b?.bytes ?? Infinity,
+});

@@ -16,9 +16,9 @@ import { Mover } from "../../directory/move.ts";
 import type { MoveHosts } from "../../directory/move.ts";
 import { Placement } from "../../directory/placement.ts";
 import type { Thresholds } from "../../directory/placement.ts";
-import type { Snapshot, VshardStats } from "../../host/host.ts";
+import type { CopyCursor, VshardStats } from "../../host/host.ts";
 import { doSql } from "../../host/sql.ts";
-import { databaseOf, hostStub, vshardsOf } from "./bindings.ts";
+import { chunkOf, databaseOf, hostStub, vshardsOf } from "./bindings.ts";
 import type { Ctx, Env } from "./bindings.ts";
 import { call, routesToWire, serve } from "./rpc.ts";
 
@@ -72,7 +72,7 @@ export class HlekkDirectoryDO {
         // to by, which is the state every database deployed before the protocol existed is in.
         uri: this.#env.HLEKK_DATABASE_URI,
       });
-      const mover = new Mover(directory, this.#moveHosts());
+      const mover = new Mover(directory, this.#moveHosts(), undefined, chunkOf(this.#env));
       const allocator = new Allocator(directory, {
         open: (vshard, host, epoch) => this.#opened.push({ vshard, host, epoch }),
       });
@@ -104,16 +104,17 @@ export class HlekkDirectoryDO {
       fence: async (host, vshard) => {
         await call(hostStub(env, host), "fence", vshard);
       },
-      snapshot: (host, vshard) => call<Snapshot>(hostStub(env, host), "snapshot", vshard),
-      install: async (host, snapshot, epoch) => {
-        await call(hostStub(env, host), "install", snapshot, epoch);
-      },
+      // The target is told where to pull from and pulls the chunk from the source itself, so the
+      // directory sends and receives a cursor and never the rows: a chunk is megabytes of JSON, and
+      // relayed through here it would be parsed and re-serialized once per chunk, which over a full
+      // vshard is more CPU than one directory invocation is allowed.
+      copy: (from, to, vshard, cursor, epoch, budget) =>
+        call<CopyCursor | null>(hostStub(env, to), "pull", from, vshard, cursor, epoch, budget),
+      discard: (host, vshard, epoch, rows) => call<boolean>(hostStub(env, host), "discard", vshard, epoch, rows),
       retire: async (host, vshard) => {
         await call(hostStub(env, host), "retire", vshard);
       },
-      purge: async (host, vshard) => {
-        await call(hostStub(env, host), "purge", vshard);
-      },
+      purge: (host, vshard, rows) => call<boolean>(hostStub(env, host), "purge", vshard, rows),
     };
   }
 

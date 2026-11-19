@@ -33,10 +33,9 @@ export const USAGE_DDL: readonly string[] = [
  *  Cloudflare's 10 GB this is 9 GB in those terms and not in GiB.
  *
  *  The move pause this implies is accepted: a 9 GB stop-the-world copy is a long one, and the route
- *  out of it is the base of the database in R2 (`paged-storage.md`), not a smaller cap. What is NOT
- *  merely slow is the copy itself — `snapshot()` materializes a whole vshard as one JS object and
- *  `install()` replays it in a single transaction, which no 9 GB vshard survives. See the note on
- *  `Host.snapshot`. */
+ *  out of it is the base of the database in R2 (`paged-storage.md`), not a smaller cap. The copy
+ *  itself is chunked and resumable, so a vshard at the cap can be moved at all; see the note at the
+ *  top of `Host`'s moves section. */
 export const VSHARD_CAP = vshardCap();
 
 export interface AllocatorOptions {

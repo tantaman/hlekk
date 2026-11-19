@@ -391,8 +391,8 @@ CREATE TABLE outbox (vshard INTEGER, seq INTEGER, target_vshard INTEGER, op TEXT
 
 <ol>
   <li><strong>Fence.</strong> The source host marks the vshard <code>fenced</code>. It refuses writes and keeps serving reads.</li>
-  <li><strong>Copy.</strong> The target host pulls the vshard's key range from each table, with its outbox rows and its <code>vshards</code> row.</li>
-  <li><strong>Install.</strong> The target marks the vshard <code>owned</code> at epoch + 1.</li>
+  <li><strong>Copy.</strong> The target host pulls the vshard's key range from each table, a chunk at a time, straight from the source. The directory records a cursor after each chunk.</li>
+  <li><strong>Install.</strong> The last chunk marks the vshard <code>owned</code> at epoch + 1. Until then the target serves none of it.</li>
   <li><strong>Flip.</strong> The directory compare-and-sets the route to the target at epoch + 1.</li>
   <li><strong>Retire.</strong> The source marks the vshard <code>moved</code>, answers <code>moved</code> from then on, and deletes the rows after a grace period.</li>
 </ol>
@@ -401,7 +401,7 @@ CREATE TABLE outbox (vshard INTEGER, seq INTEGER, target_vshard INTEGER, op TEXT
 
 <p>A placement controller in the directory watches each host's bytes and request rate. When a host crosses a threshold, the controller sheds a contiguous run of its vshards, so each move adds only one entry to the map. New objects go to an active set of vshards. A vshard leaves that set at half its cap and saves the other half for objects created alongside ones already in it. When the active set runs out, the allocator opens the next batch of vshards together (64 by default) and spreads them across hosts, so new writes don't all land on one host.</p>
 
-<p>Blobasaur's approach is simpler and works today at its scale. Hlekk's has more moving parts and a known ceiling. The copy is stop-the-world for its vshard, and today the snapshot is built as one in-memory object and installed in a single transaction. On a Durable Object that limits a move to a few hundred megabytes, well short of the 9&nbsp;GB cap. A larger move fails and leaves the vshard fenced. Chunking the snapshot is on the list of work still owed.</p>
+<p>Blobasaur's approach is simpler and works today at its scale. Hlekk's has more moving parts. The copy is still stop-the-world for its vshard, but it goes a few megabytes at a time, so no single request has to hold a whole vshard, and a copy that dies resumes from the last recorded cursor. What hasn't been measured is a multi-gigabyte move on a deployed host, so how long a 9&nbsp;GB pause really lasts is still an open number.</p>
 
 <p>Blobasaur already has hlekk's answer, one level up. Redis Cluster's slots can move between nodes without rehashing a single key, because a slot is a fixed unit behind a table. Blobasaur hasn't built live slot moves yet, but the protocol allows them. The offline step comes from the level inside a node, where a consistent hash maps keys to N files. If a node's files held slot ranges instead, changing how many files a node has would be just another slot move.</p>
 
