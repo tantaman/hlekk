@@ -4,7 +4,7 @@
 // Node process should take `reader()` from `hlekk/adapters/node` instead, which adds the check that
 // keeps a stranger's reference from reaching a private network.
 
-export { Database, NoSuchEdge, Reader, connect, memoryPins } from "./reader.ts";
+export { Database, NoSuchEdge, Reader, VOCABULARIES_KEPT, connect, memoryPins } from "./reader.ts";
 export type { Page, ReadOptions, ReaderOptions, Row } from "./reader.ts";
 export { HopBuilder, ReadBuilder } from "./query.ts";
 export type { Shaped } from "./query.ts";

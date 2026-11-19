@@ -110,6 +110,19 @@ async function world(opts: Partial<Parameters<typeof federate>[0]> = {}, readerO
 
 const page = (row: Row, name: string): Page => row[name] as Page;
 
+/** A federation in which one database states its vocabulary as edited: a stranger's document,
+ *  saying something this implementation's own never would. */
+const stating =
+  (uri: string, edit: (doc: { types: Record<string, { fields: Record<string, { type: string }> }>; edges: Record<string, unknown> }) => void) =>
+  (inner: typeof fetch): typeof fetch =>
+  async (input, init) => {
+    const res = await inner(input, init);
+    if (String(input) !== `${uri}/vocabulary`) return res;
+    const doc = (await res.json()) as Parameters<typeof edit>[0];
+    edit(doc);
+    return new Response(JSON.stringify(doc), { status: 200, headers: { "content-type": "application/json" } });
+  };
+
 /** note -> cites -> about -> release, which is every database in the world. */
 const CHAIN = {
   hops: [
@@ -295,6 +308,25 @@ describe("meeting one database", () => {
     assert.throws(() => notes.price(w.incident), /is not in/);
   });
 
+  it("prices its own share of a request that goes on into another database", async () => {
+    // The chain leaves notes by `notes.about` and goes on over an edge only ops has. Priced as
+    // written it was refused, notes having no edge of that name — so the one kind of request a
+    // reader is for could be priced nowhere. What a read would send notes is the chain up to
+    // where it leaves, and that is what notes prices.
+    const w = await world();
+    const notes = await w.reader.database(NOTES);
+    const share = { hops: [{ edge: "notes.cites", as: "cites", hops: [{ edge: "notes.about", as: "about" }] }] };
+    assert.deepEqual(await notes.price(w.second, CHAIN), { frames: 3, nodes: 1 + 25 + 25 * 25 });
+    assert.deepEqual(await notes.price(w.second, CHAIN), await notes.price(w.second, share));
+    // A filter is the reader's to apply, and may be over a field only the next database exposes.
+    const filtered = { hops: [{ edge: "notes.about", where: [{ field: "ticket", op: "=" as const, value: "INC-217" }] }] };
+    assert.deepEqual(await notes.price(w.first, filtered), { frames: 2, nodes: 26 });
+    // A hop directly under the ids is this database's to answer, and it still says it cannot.
+    await assert.rejects(notes.price(w.second, { hops: [{ edge: "ops.deployed_release" }] }), /no edge "ops\.deployed_release"/);
+    // And a request is checked before it is priced, as it is before it is read.
+    await assert.rejects(notes.price(w.second, { hops: [{ edge: "notes.cites", limitt: 2 }] } as never), Refused);
+  });
+
   it("refuses a URI that is not canonical rather than repairing it", async () => {
     const w = await world();
     await assert.rejects(w.reader.database(OPS + "/"), /canonical|trailing/i);
@@ -368,6 +400,11 @@ describe("a list is a page", () => {
     const res = await post({ ids: [bare], hops: [{ edge: "packages.supersedes", limit: 2, after: ours }] });
     assert.equal(res.status, 400);
     assert.equal(((await res.json()) as { at: string }).at, "hops[0]");
+
+    // Pricing is the one place a reader's cursor does go to a database, and it goes as the token
+    // it wraps, which is that database's own.
+    const packages = await w.reader.database(PACKAGES);
+    assert.deepEqual(await packages.price(root, { hops: [{ edge: "packages.supersedes", limit: 2, after: ours }] }), { frames: 2, nodes: 3 });
   });
 
   it("filters on the far side's fields", async () => {
@@ -376,6 +413,45 @@ describe("a list is a page", () => {
       hops: [{ edge: "packages.supersedes", as: "odd", where: [{ field: "change", op: "=", value: "odd" }] }],
     });
     assert.deepEqual(page(row, "odd").items.map((r) => r.tag), ["3.9.5", "3.9.3", "3.9.1"]);
+  });
+
+  it("refuses a filter over a field the type does not have, or a value the field could not hold", async () => {
+    // A reader applies filters itself, so no database ever sees one to refuse it. A field that
+    // was misspelled matched nothing, and came back as an empty page: what a list with no such
+    // rows looks like. The wire refuses the same request by the vocabulary.
+    const { w, root } = await many();
+    const older = (cmp: object) =>
+      w.reader
+        .read(root, { hops: [{ edge: "packages.supersedes", as: "older", where: [cmp] }] } as never)
+        .then((rows) => page(rows[0]!, "older").items.length, (e: Error) => e);
+
+    const misspelled = (await older({ field: "chnage", op: "=", value: "odd" })) as Refused;
+    assert.ok(misspelled instanceof Refused, String(misspelled));
+    assert.equal(misspelled.at, "hops[0].where[0]");
+    assert.match(misspelled.message, /no field "chnage" on packages\.release; it has tag, change/);
+
+    const mistyped = (await older({ field: "tag", op: "=", value: 3 })) as Refused;
+    assert.ok(mistyped instanceof Refused, String(mistyped));
+    assert.equal(mistyped.at, "hops[0].where[0]");
+    assert.match(mistyped.message, /"tag" is string, but the value is number/);
+
+    // A filter that is right and matches nothing is an empty page, which is what it means.
+    assert.equal(await older({ field: "change", op: "=", value: "neither" }), 0);
+    // And the chained form is the same request, so it is the same refusal.
+    await assert.rejects(w.reader.from(root).related("older", "packages.supersedes", (h) => h.where("chnage", "=", "odd")).run(), Refused);
+  });
+
+  it("checks a filter against the database the hop landed in, including what that database keeps to itself", async () => {
+    // `notes.about` leaves notes, and the incidents it reaches are described by ops. `internal`
+    // is a field ops has and does not expose: a filter over it is a question about a field nobody
+    // may read, and the answer is a refusal rather than a page that says no incident matched.
+    const w = await world();
+    const about = (cmp: object) =>
+      w.reader.read(w.first, { hops: [{ edge: "notes.about", as: "about", where: [cmp] }] } as never).then((rows) => page(rows[0]!, "about").items.length, (e: Error) => e);
+    assert.equal(await about({ field: "ticket", op: "=", value: "INC-217" }), 1);
+    const hidden = (await about({ field: "internal", op: "=", value: "not yours" })) as Refused;
+    assert.ok(hidden instanceof Refused, String(hidden));
+    assert.match(hidden.message, /no field "internal" on ops\.incident; it has ticket, severity/);
   });
 });
 
@@ -395,6 +471,33 @@ describe("what a reader refuses, and how", () => {
     assert.equal(limitt.at, "hops[0]");
     const ids = (await w.reader.read(w.second, { ids: ["1"] } as never).then(() => null, (e: Error) => e)) as Refused;
     assert.match(ids.message, /first argument/);
+    // In a count as in a hop: the wire refuses this one, and a reader's own copy of the check did not.
+    const count = (await w.reader
+      .read(w.second, { counts: [{ as: "n", edge: "notes.cites", extra: 1 }] } as never)
+      .then(() => null, (e: Error) => e)) as Refused;
+    assert.ok(count instanceof Refused, String(count));
+    assert.equal(count.at, "counts[0]");
+  });
+
+  it("refuses a name that is also a field of the object, which it would otherwise replace", async () => {
+    // A row holds its payload, its relationships and its counts in one object. A hop called
+    // `title` took the place of the note's own title, and nothing said so.
+    const w = await world();
+    const refused = async (request: object): Promise<Refused> => {
+      const err = await w.reader.read(w.second, request as never).then(() => null, (e: Error) => e);
+      assert.ok(err instanceof Refused, String(err));
+      return err;
+    };
+    const hop = await refused({ hops: [{ edge: "notes.cites", as: "title" }] });
+    assert.equal(hop.at, "hops[0]");
+    assert.match(hop.message, /"title" is a field of notes\.note/);
+    assert.equal((await refused({ counts: [{ as: "body", edge: "notes.cites" }] })).at, "counts[0]");
+    // One level down it is the type the hop landed on that decides, in the database that holds it.
+    const below = await refused({ hops: [{ edge: "notes.cites", hops: [{ edge: "notes.about", as: "about", hops: [{ edge: "ops.deployed_release", as: "ticket" }] }] }] });
+    assert.equal(below.at, "hops[0].hops[0].hops[0]");
+    assert.match(below.message, /ops\.incident/);
+    // A name no object has is the caller's to choose.
+    assert.equal((await w.reader.read(w.second, { hops: [{ edge: "notes.cites", as: "ticket" }] })).length, 1);
   });
 
   it("refuses two names that would land on one, which a responder could no longer see", async () => {
@@ -509,6 +612,35 @@ describe("what a database proved about itself", () => {
   });
 });
 
+describe("a vocabulary is a stranger's document", () => {
+  it("is kept for as many databases as the reader was told, and asked for again once forgotten", async () => {
+    const w = await world({}, { vocabularies: 1 });
+    const [ops, packages] = [w.f.member(OPS), w.f.member(PACKAGES)];
+    await w.reader.read(w.release);
+    await w.reader.read(w.release);
+    assert.equal(packages.served.vocabulary, 1, "kept between reads");
+    await w.reader.read(w.incident);
+    await w.reader.read(w.release);
+    assert.deepEqual([ops.served.vocabulary, packages.served.vocabulary], [1, 2], "ops took its place, and it was asked for again");
+  });
+
+  it("is read whatever its names are, including ones every object already has", async () => {
+    // To `in`, an object has a `constructor` before anything is put in it, and assigning under
+    // `__proto__` sets its prototype. Both are names a schema may state.
+    const w = await world({
+      wrap: stating(PACKAGES, (doc) => {
+        doc.edges["packages.made_by"] = { from: "packages.release", to: "constructor", counted: true, foreign: true };
+        Object.defineProperty(doc.types, "__proto__", { value: { fields: {} }, enumerable: true });
+      }),
+    });
+    const packages = await w.reader.database(PACKAGES);
+    assert.deepEqual(packages.edgesFrom("packages.release").sort(), ["packages.made_by", "packages.supersedes"]);
+    assert.equal(Object.hasOwn(packages.types, "__proto__"), true, "the document did say it");
+    const [release] = await w.reader.read(w.release, { hops: [{ edge: "packages.supersedes", as: "older" }] });
+    assert.deepEqual(page(release, "older").items.map((r) => r.id), [w.older]);
+  });
+});
+
 describe("a schema that changes under a reader", () => {
   it("is read by the new vocabulary once the descriptor says there is one", async () => {
     const w = await world();
@@ -607,6 +739,19 @@ describe("a caller with a lock of its own", () => {
     };
     assert.deepEqual(spelled(read), own);
     assert.equal(own[0]!.cites[0]!.about[0]!.id, w.incident, "and the answer did cross a database");
+  });
+
+  it("reads a type it did not declare by the publisher's description, whatever words that uses", async () => {
+    // `tag` is described as something this reader has no name for, so it is carried as JSON. With
+    // a lock in hand the reader also compares declarations with vocabularies, and it compared
+    // this type's with itself: `json` against the original word, a disagreement nobody had, and
+    // every release was declined. A lock that says nothing about a type has nothing to disagree.
+    const mine = planLock({ ops: { objects: { "ops.incident": { fields: { ticket: "string" } } } } });
+    const wrap = stating(PACKAGES, (doc) => void (doc.types["packages.release"]!.fields.tag!.type = "semver"));
+    const w = await world({ wrap }, { lock: mine });
+    const [release] = await w.reader.read(w.release);
+    assert.deepEqual([release?.$type, release?.tag], ["packages.release", "3.7.2"]);
+    assert.equal((await new Reader({ fetch: w.f.fetch }).read(w.release)).length, 1, "as a reader with no lock always did");
   });
 
   it("declines a type the responder cannot fill, rather than guess at its fields", async () => {
