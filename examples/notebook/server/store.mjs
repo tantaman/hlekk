@@ -18,7 +18,9 @@ const domain = (edgeNames) => ({
 });
 // Retain the original atypes in notebooks created before incremental sync.
 const originalLock = plan(domain(names));
-const lock = plan(domain([...names, ...parts.map(marker)]), originalLock);
+const syncNames = [...names, ...parts.map(marker)];
+const syncLock = plan(domain(syncNames), originalLock);
+const activityLock = plan(domain([...syncNames, "activity"]), syncLock);
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 export function fail(message, status = 400) {
   throw Object.assign(new Error(message), { status });
@@ -74,9 +76,11 @@ const frame = (source, children = []) => ({ source, children, counts: [], limit:
 export async function openNotebook(dir) {
   const store = await open({ dir, lock: originalLock, identity: false });
   const { db, cluster } = store;
-  if (store.catalog.version < lock.version) {
-    cluster.directory.applyLock(lock);
-    cluster.spreadCatalog();
+  for (const migration of [syncLock, activityLock]) {
+    if (cluster.directory.catalog().version < migration.version) {
+      cluster.directory.applyLock(migration);
+      cluster.spreadCatalog();
+    }
   }
   const catalog = cluster.directory.catalog();
   if (!cluster.directory.indexVshards().length) {
@@ -123,6 +127,7 @@ export async function openNotebook(dir) {
   async function markChanges(ops, sequence) {
     const touched = new Map();
     for (const op of ops) {
+      if (op.nodeKind === "activity") continue;
       let part, id;
       if (op.kind === "update" || op.name === "registry") {
         part = "value";
@@ -130,7 +135,7 @@ export async function openNotebook(dir) {
       } else if (parts.includes(op.name)) {
         part = op.name;
         id = op.from;
-      } else continue; // Named revisions have a separate, on-demand history endpoint.
+      } else continue; // Revision history and activity are fetched separately.
       const atypeId = atype(marker(part));
       touched.set(part + ":" + id, { atype: atypeId, id1: root, id2: id, time: -sequence });
     }
@@ -155,7 +160,34 @@ export async function openNotebook(dir) {
       await db.update(root, { kind: "workspace", value: { ...value, sequence, pending: null } });
     }
   }
-  async function transact(ops) {
+  async function activityRows(limit, after) {
+    const events = frame({ kind: "edge", atype: atype("activity") });
+    events.limit = limit;
+    if (after) events.after = after;
+    const [row] = await db.query(
+      { frames: [frame({ kind: "ids" }, [{ alias: "events", frame: 1 }]), events] },
+      [root],
+    );
+    return row.events;
+  }
+  async function transact(ops, event) {
+    if (event) {
+      const date = Date.now();
+      let id;
+      if (event.verb === "edited") {
+        const [last] = await activityRows(1);
+        if (
+          last?.value.verb === "edited" &&
+          last.value.target === event.target &&
+          date - last.value.date < 300_000
+        ) {
+          id = last.id;
+          ops.push(update(id, "activity", { ...event, date }));
+        }
+      }
+      id ??= await db.create(otype, { kind: "activity", value: { ...event, date } }, { with: root });
+      ops.push(add("activity", root, id, date));
+    }
     if (!ops.length) return;
     const value = await rootValue();
     await db.update(root, { kind: "workspace", value: { ...value, pending: ops } });
@@ -183,7 +215,7 @@ export async function openNotebook(dir) {
     ops.push(register(id), register(first), add("blocks", id, first));
     return id;
   }
-  async function save(doc, title, blocks, version) {
+  async function save(doc, title, blocks, version, verb = "edited", detail) {
     if (doc.kind !== "document") fail("Choose a document.");
     if (version !== doc.value.version)
       fail("This document changed in another tab. Copy your edits before reloading.", 409);
@@ -192,8 +224,12 @@ export async function openNotebook(dir) {
     const registered = await entries(root, "registry");
     const registeredIds = new Set(registered.map((n) => n.id));
     const docs = registered.filter((n) => n.kind === "document");
-    const docIds = new Set(docs.map((d) => d.id));
+    const docIds = new Set([doc.id, ...docs.map((d) => d.id)]);
     const byTitle = new Map(docs.map((d) => [d.value.title.toLowerCase(), d.id]));
+    if (verb === "captured") {
+      const base = title;
+      for (let n = 2; byTitle.has(title.toLowerCase()); n++) title = base + " (" + n + ")";
+    }
     if (byTitle.has(title.toLowerCase()) && byTitle.get(title.toLowerCase()) !== doc.id)
       fail("A document already has that title.", 409);
     byTitle.set(title.toLowerCase(), doc.id);
@@ -248,9 +284,10 @@ export async function openNotebook(dir) {
       await replace(ops, "links", id, [...targets]);
       await replace(ops, "embeds", id, value.target ? [value.target] : []);
     }
+    if (verb === "captured") ops.push(register(doc.id));
     await replace(ops, "blocks", doc.id, ids);
     ops.push(update(doc.id, "document", { ...doc.value, title, edited: Date.now(), version: version + 1 }));
-    await transact(ops);
+    await transact(ops, verb && { verb, target: doc.id, title, ...(detail ? { detail } : {}) });
     return doc.id;
   }
 
@@ -275,7 +312,7 @@ export async function openNotebook(dir) {
       const doc = await one(id);
       if (doc.value.version) continue;
       const blocks = seedBodies[key].map(([type, ...content], i) => ({ key: "seed-" + i, type, content }));
-      await save(doc, doc.value.title, blocks, 0);
+      await save(doc, doc.value.title, blocks, 0, null);
     }
     await db.update(root, {
       kind: "workspace",
@@ -283,6 +320,50 @@ export async function openNotebook(dir) {
     });
   }
   await initialize();
+
+  // Old notebooks retain the last document edit and named commits. Import only
+  // those known timestamps. Stable keys make an interrupted import repeatable.
+  if (!(await rootValue()).activityReady) {
+    for (const doc of (await entries(root, "registry")).filter((n) => n.kind === "document")) {
+      const events = [
+        [doc.id, { verb: doc.value.version ? "edited" : "createdDocument", date: doc.value.edited }],
+      ];
+      for (const revision of await entries(doc.id, "history")) {
+        events.push([
+          revision.id,
+          {
+            verb: "committed",
+            date: revision.value.date,
+            detail: revision.value.label,
+            title: revision.value.title,
+          },
+        ]);
+      }
+      for (const [key, event] of events) {
+        const id = await unique("activity:initial:" + key, "activity", {
+          target: doc.id,
+          title: doc.value.title,
+          ...event,
+        });
+        await db.assocAdd(atype("activity"), root, id, event.date);
+      }
+    }
+    await db.update(root, { kind: "workspace", value: { ...(await rootValue()), activityReady: true } });
+  }
+
+  async function activity(before) {
+    let after;
+    if (before) {
+      const match = /^(\d+):(\d+)$/.exec(before);
+      if (!match || !Number.isSafeInteger(Number(match[1])) || BigInt(match[2]) > 9223372036854775807n)
+        fail("Invalid activity cursor.");
+      after = { time: Number(match[1]), db: 0, id2: match[2] };
+    }
+    const rows = await activityRows(41, after);
+    const items = rows.slice(0, 40).map((row) => ({ id: row.id, ...row.value }));
+    const last = items.at(-1);
+    return { items, next: rows.length > items.length ? last.date + ":" + last.id : null };
+  }
 
   async function workspace() {
     const registry = await entries(root, "registry");
@@ -332,6 +413,24 @@ export async function openNotebook(dir) {
   }
   async function command(c) {
     if (!c || typeof c !== "object") fail("Invalid notebook action.");
+    if (c.action === "capture") {
+      if (typeof c.key !== "string" || !/^[a-f0-9-]{36}$/i.test(c.key)) fail("Invalid thought key.");
+      validateBlocks(c.blocks);
+      const first = c.blocks
+        .map((b) =>
+          b.content
+            .map((span) => (span.type === "wiki" ? span.attrs.label : span.text))
+            .join("")
+            .trim(),
+        )
+        .find(Boolean);
+      if (!first) fail("Write a thought before posting.");
+      const title = Array.from(first).slice(0, 72).join("");
+      const id = await unique("thought:" + c.key, "document", { ...docValue(title), capturedAt: Date.now() });
+      const doc = await one(id);
+      if (doc.value.version > 0) return id;
+      return save(doc, title, c.blocks, 0, "captured");
+    }
     if (c.action === "create") {
       const title = titleOf(c.title);
       if (!["document", "collection"].includes(c.kind)) fail("Unknown node type.");
@@ -350,15 +449,31 @@ export async function openNotebook(dir) {
         ops.push(register(id));
       }
       if (c.collection) ops.push(add("members", c.collection, id));
-      await transact(ops);
+      await transact(ops, {
+        verb: c.kind === "document" ? "createdDocument" : "createdCollection",
+        target: id,
+        title,
+      });
       return id;
     }
     if (c.action === "member") {
-      if ((await one(c.collection)).kind !== "collection") fail("Choose a collection.");
+      const group = await one(c.collection, ["members"]);
+      if (group.kind !== "collection") fail("Choose a collection.");
       const member = await one(c.id);
       if (!["document", "collection", "block", "url"].includes(member.kind) || c.id === c.collection)
         fail("Choose another node.");
-      await transact([c.remove ? remove("members", c.collection, c.id) : add("members", c.collection, c.id)]);
+      const present = group.members.some((n) => n.id === c.id);
+      if (c.remove ? present : !present) {
+        await transact(
+          [c.remove ? remove("members", c.collection, c.id) : add("members", c.collection, c.id)],
+          {
+            verb: c.remove ? "removedMember" : "addedMember",
+            target: group.id,
+            title: group.value.title,
+            detail: member.value.title || "Block",
+          },
+        );
+      }
       return c.collection;
     }
     const doc = await one(c.id);
@@ -374,14 +489,19 @@ export async function openNotebook(dir) {
         { kind: "revision", value: { label, date: Date.now(), title: doc.value.title, blocks } },
         { with: doc.id },
       );
-      await transact([add("history", doc.id, revision, Date.now())]);
+      await transact([add("history", doc.id, revision, Date.now())], {
+        verb: "committed",
+        target: doc.id,
+        title: doc.value.title,
+        detail: label,
+      });
       return revision;
     }
     if (c.action === "restore") {
       const revision = (await entries(doc.id, "history")).find((n) => n.id === c.revision);
       if (!revision) fail("Revision not found.", 404);
       const { title, blocks } = revision.value;
-      return save(doc, title, blocks, c.version);
+      return save(doc, title, blocks, c.version, "restored", revision.value.label);
     }
     fail("Unknown notebook action.");
   }
@@ -394,6 +514,7 @@ export async function openNotebook(dir) {
   }
   return {
     workspace: () => run(workspace),
+    activity: (before) => run(() => activity(before)),
     changes: (after) => run(() => changes(after)),
     command: (c, feedId) =>
       run(async () => {

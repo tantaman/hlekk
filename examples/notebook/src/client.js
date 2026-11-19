@@ -143,6 +143,9 @@ export class NotebookClient {
       return result.id;
     });
   }
+  activity(before) {
+    return request(before ? "activity?before=" + encodeURIComponent(before) : "activity");
+  }
   history(id) {
     return request("history/" + id);
   }

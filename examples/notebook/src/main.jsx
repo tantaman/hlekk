@@ -2,6 +2,10 @@ import React, { useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { createRootRoute, createRoute, createRouter, RouterProvider, Outlet } from "@tanstack/react-router";
 import {
+  Activity,
+  MessageSquareText,
+  PanelLeftClose,
+  PanelLeftOpen,
   BookOpen,
   Search,
   Plus,
@@ -29,6 +33,7 @@ import "@fontsource/spectral/latin-500.css";
 import "@fontsource/spectral/latin-600.css";
 import { parseCursor } from "../workspace.js";
 import { NotebookClient, allOf, nodeTitle, blockText, parentsOf } from "./client";
+import { ActivityFeed, Thoughts } from "./streams";
 import { Editor } from "./editor";
 import { Dialog } from "./dialog";
 import { Inspector, FullGraph } from "./graph";
@@ -71,7 +76,7 @@ function SectionLabel({ label, onClick }) {
     </div>
   );
 }
-function Sidebar({ verified, workspace, selected, view, nav, go, openDialog, mobile, close }) {
+function Sidebar({ collapsed, verified, workspace, selected, view, nav, go, openDialog, mobile, close }) {
   const { nodes, home } = workspace;
   const docs = allOf(nodes, "document").sort((a, b) =>
     a.id === home ? -1 : b.id === home ? 1 : b.edited - a.edited || a.title.localeCompare(b.title),
@@ -79,7 +84,10 @@ function Sidebar({ verified, workspace, selected, view, nav, go, openDialog, mob
   const collections = allOf(nodes, "collection").sort((a, b) => a.title.localeCompare(b.title));
   return (
     <>
-      <aside className={"sidebar" + (mobile ? " mobile-open" : "")}>
+      <aside
+        id="notebook-navigation"
+        className={"sidebar" + (mobile ? " mobile-open" : "") + (collapsed ? " collapsed" : "")}
+      >
         <div className="brand">
           <img src="/mark.svg" width="37" height="37" alt="" />
           <span>Folio</span>
@@ -96,6 +104,12 @@ function Sidebar({ verified, workspace, selected, view, nav, go, openDialog, mob
             <Search size={16} /> Search notebook <kbd>⌘ K</kbd>
           </button>
           <div className="nav-top">
+            <button className={view === "thoughts" ? "sel" : ""} onClick={() => nav({ view: "thoughts" })}>
+              <MessageSquareText /> Quick thoughts
+            </button>
+            <button className={view === "activity" ? "sel" : ""} onClick={() => nav({ view: "activity" })}>
+              <Activity /> Activity feed
+            </button>
             <button className={view === "documents" ? "sel" : ""} onClick={() => nav({ view: "documents" })}>
               <Files /> All documents
             </button>
@@ -341,6 +355,19 @@ function Notebook() {
   const state = useSyncExternalStore(client.listen, client.snapshot);
   const search = page.useSearch(),
     navigate = page.useNavigate();
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("folio:nav-collapsed") === "true";
+    } catch {
+      return false;
+    }
+  });
+  function toggleSidebar() {
+    setCollapsed(!collapsed);
+    try {
+      localStorage.setItem("folio:nav-collapsed", String(!collapsed));
+    } catch {}
+  }
   const [dialog, setDialog] = useState(null),
     [mobile, setMobile] = useState(false),
     [inspecting, setInspecting] = useState(() => window.innerWidth >= 1150),
@@ -414,6 +441,7 @@ function Notebook() {
   return (
     <div className="app">
       <Sidebar
+        collapsed={collapsed}
         workspace={w}
         verified={state.verified}
         selected={selected}
@@ -426,6 +454,16 @@ function Notebook() {
       />
       <div className="workarea">
         <header className="topbar">
+          <button
+            className="icon desktop-nav"
+            aria-expanded={!collapsed}
+            aria-controls="notebook-navigation"
+            aria-label={collapsed ? "Expand navigation" : "Collapse navigation"}
+            title={collapsed ? "Expand navigation" : "Collapse navigation"}
+            onClick={toggleSidebar}
+          >
+            {collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+          </button>
           <IconButton label="Open navigation" className="mobile-nav" onClick={() => setMobile(true)}>
             <Menu size={20} />
           </IconButton>
@@ -440,7 +478,10 @@ function Notebook() {
               </>
             )}
             <strong>
-              {doc?.title || collection?.title || (view === "graph" ? "Graph view" : "All documents")}
+              {doc?.title ||
+                collection?.title ||
+                ({ graph: "Graph view", activity: "Activity feed", thoughts: "Quick thoughts" }[view] ??
+                  "All documents")}
             </strong>
           </nav>
           <div className="top-actions">
@@ -476,7 +517,18 @@ function Notebook() {
           </div>
         )}
         <div className="panes">
-          {doc ? (
+          {view === "thoughts" ? (
+            <Thoughts
+              key={parseCursor(w.cursor)?.feedId ?? w.home}
+              client={client}
+              nodes={nodes}
+              go={go}
+              verified={state.verified}
+              notebookKey={parseCursor(w.cursor)?.feedId ?? w.home}
+            />
+          ) : view === "activity" ? (
+            <ActivityFeed client={client} cursor={w.cursor} go={go} />
+          ) : doc ? (
             <DocumentView
               key={[parseCursor(w.cursor)?.feedId ?? w.home, doc.id, state.verified, generation].join("/")}
               readOnly={!state.verified}

@@ -31,6 +31,8 @@ const server = createServer(async (req, res) => {
     const path = url.pathname;
     if (path.startsWith("/api/")) {
       if (req.method === "GET" && path === "/api/workspace") return send(res, await notebook.workspace());
+      if (req.method === "GET" && path === "/api/activity")
+        return send(res, await notebook.activity(url.searchParams.get("before")));
       if (req.method === "GET" && path === "/api/changes")
         return send(res, await notebook.changes(url.searchParams.get("after")));
       if (req.method === "GET" && /^\/api\/history\/\d+$/.test(path))

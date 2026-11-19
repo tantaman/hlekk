@@ -1,5 +1,5 @@
 import React, { useLayoutEffect, useRef, useState } from "react";
-import { Schema } from "prosemirror-model";
+import { DOMSerializer, Schema } from "prosemirror-model";
 import { EditorState, Plugin, TextSelection } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
 import { baseKeymap, chainCommands, setBlockType, toggleMark, splitBlockAs } from "prosemirror-commands";
@@ -223,6 +223,18 @@ const makeDoc = (blocks) =>
       ),
     ),
   );
+export function BlockPreview({ blocks, graph }) {
+  const mount = useRef(null);
+  useLayoutEffect(() => {
+    const fragment = DOMSerializer.fromSchema(schema).serializeFragment(makeDoc(blocks).content);
+    const embeds = blocks.filter((b) => b.type === "embed");
+    fragment.querySelectorAll("aside.transclusion").forEach((el, i) => {
+      el.textContent = blockText(graph[embeds[i].target]) || "Empty block";
+    });
+    mount.current.replaceChildren(fragment);
+  }, [blocks, graph]);
+  return <div className="thought-body" ref={mount} />;
+}
 function Tool({ name, icon: Icon, onClick, active }) {
   return (
     <button
@@ -237,7 +249,7 @@ function Tool({ name, icon: Icon, onClick, active }) {
     </button>
   );
 }
-export function Editor({ initial, graph, onEdit, onLink, onDialog, jump, docId, readOnly }) {
+export function Editor({ initial, graph, onEdit, onLink, onDialog, jump, docId, readOnly, compose = false }) {
   const mount = useRef(null),
     view = useRef(null),
     latest = useRef({});
@@ -250,7 +262,7 @@ export function Editor({ initial, graph, onEdit, onLink, onDialog, jump, docId, 
       editable: () => !readOnly,
       attributes: {
         role: "textbox",
-        "aria-label": "Document blocks",
+        "aria-label": compose ? "Quick thought" : "Document blocks",
         "aria-multiline": "true",
         spellcheck: "true",
       },
@@ -296,12 +308,16 @@ export function Editor({ initial, graph, onEdit, onLink, onDialog, jump, docId, 
       },
     });
     view.current = editor;
+    if (compose && !readOnly) editor.focus();
     tick((n) => n + 1);
     return () => {
       editor.destroy();
       view.current = null;
     };
   }, []);
+  useLayoutEffect(() => {
+    view.current.setProps({ editable: () => !readOnly });
+  }, [readOnly]);
   useLayoutEffect(() => {
     mount.current.querySelectorAll("aside.transclusion").forEach((el) => {
       el.textContent = blockText(graph[el.dataset.target]) || "Empty block";
@@ -319,6 +335,7 @@ export function Editor({ initial, graph, onEdit, onLink, onDialog, jump, docId, 
       }
     });
   }, [jump]);
+  if (compose) return <div className="editor-mount thought-input" ref={mount} />;
   const editor = view.current,
     parent = editor?.state.selection.$from.parent;
   const run = (cmd) => {

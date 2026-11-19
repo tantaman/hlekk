@@ -25,6 +25,14 @@ To serve a production build locally, run `npm run build` followed by `npm start`
 - Use **Insert → Embed a block** to transclude an existing text block. **Collect this block** adds the selected block to a collection. Collections can also hold documents, URLs, and other collections.
 - Use **Commit** to name a revision. **History → Restore** replaces the draft with that revision’s title, block identities, order, formatting, and links. An embed retains its reference and continues to show the source block’s current contents.
 
+## Quick thoughts and activity
+
+Open **Quick thoughts**, write with the same Markdown shortcuts and wikilinks as the document editor, then press **Post thought** or ⌘/Ctrl+Enter. The first nonempty block supplies the title. **Open document** lets you rename, expand, collect, or commit the same document. The composer keeps unfinished text in the current browser tab.
+
+**Activity feed** shows recent posts, document edits, commits, restores, and collection changes. Select an entry to open its document or collection. Consecutive autosaves to the same document share one entry while they are less than five minutes apart. Upgrading an existing notebook imports each document’s last recorded edit and its named commits.
+
+The navigation toggle beside the breadcrumb collapses or expands the desktop sidebar. Folio remembers the preference in this browser.
+
 ## Hlekk model
 
 The catalog in [server/store.mjs](server/store.mjs) uses a common notebook node type with a kind and a structured payload. This allows a collection’s membership edge to target different kinds of node. Each text or embed block has a stable Hlekk ID.
@@ -36,6 +44,7 @@ The catalog in [server/store.mjs](server/store.mjs) uses a common notebook node 
 | `embeds` | Embed block | Source block |
 | `members` | Collection | Collected node |
 | `history` | Document | Named revision |
+| `activity` | Workspace | Timestamped activity entry |
 | `registry` | Workspace | Notebook content node |
 
 Removing a block from a document detaches the composition edge. A collection, embed, or restored revision can still use the block’s identity. A commit stores an immutable copy of the document’s block values on a revision node. Autosave updates the working nodes and reconciles their edges.

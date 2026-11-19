@@ -7,7 +7,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "dev": "node server/main.mjs --dev",
+    "dev": "node --watch server/main.mjs --dev",
     "build": "vite build",
     "start": "node server/main.mjs",
     "test": "node --test server/*.test.mjs"
