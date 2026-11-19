@@ -11,14 +11,32 @@ import type { Database, ReaderOptions } from "../../reader/reader.ts";
 import { privateAddressGuard } from "./guard.ts";
 import type { GuardOptions } from "./guard.ts";
 
-/** A reader that refuses a database URI resolving to a private address. `allowLoopback` is for
- *  databases on this machine, which is development and tests. */
-export function reader(opts: ReaderOptions & GuardOptions = {}): Reader {
+/** A reader's options, without the one this entry point exists to supply. */
+export type NodeReaderOptions = Omit<ReaderOptions, "guard"> & GuardOptions;
+
+/**
+ * A reader that refuses a database URI resolving to a private address. `allowLoopback` is for
+ * databases on this machine, which is development and tests.
+ *
+ * The guard is not an option here, and it is set last, so nothing passed beside it can take its
+ * place. It was once set first, under the caller's options: any `guard` key among them replaced
+ * it, an `undefined` one included — which is what a caller forwarding its own configuration
+ * passes — and the reader that came back checked nothing and said nothing. A caller with a
+ * different policy builds a `Reader` with it. One that hands a guard to this function is told so,
+ * rather than getting one of the two without knowing which.
+ */
+export function reader(opts: NodeReaderOptions = {}): Reader {
   const { allowLoopback, resolve, ...rest } = opts;
-  return new Reader({ guard: privateAddressGuard({ allowLoopback, resolve }), ...rest });
+  if ((rest as ReaderOptions).guard !== undefined) {
+    throw new TypeError(
+      "a Node reader's guard is the private-address check, and it is not replaced here:" +
+        " build a `Reader` with your own guard instead",
+    );
+  }
+  return new Reader({ ...rest, guard: privateAddressGuard({ allowLoopback, resolve }) });
 }
 
 /** Meets one database with a guarded reader made for it. */
-export function connect(uri: string, opts: ReaderOptions & GuardOptions = {}): Promise<Database> {
+export function connect(uri: string, opts: NodeReaderOptions = {}): Promise<Database> {
   return reader(opts).database(uri);
 }

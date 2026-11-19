@@ -69,6 +69,17 @@ describe("a reader on Node", () => {
     await assert.rejects(reader().read(`${wiki.server.database}#1`), PrivateAddress);
   });
 
+  it("keeps its guard whatever else it is handed", async () => {
+    const wiki = await serve(WIKI, "/wiki");
+    // What a caller forwarding its own configuration passes: the key, with nothing in it. That
+    // used to take the guard's place, and the reader went wherever it was pointed.
+    const forwarded = { guard: undefined } as never;
+    await assert.rejects(reader(forwarded).read(`${wiki.server.database}#1`), PrivateAddress);
+    await assert.rejects(connect(wiki.server.database, forwarded), PrivateAddress);
+    // And a guard of the caller's own is not quietly preferred, or quietly dropped.
+    assert.throws(() => reader({ guard: async () => {} } as never), /not replaced here/);
+  });
+
   it("checks every database a read reaches, not only the one it entered by", async () => {
     // The case that matters. The reader was pointed somewhere it may go; what it must refuse is
     // where an edge in that database's answer tells it to go next.

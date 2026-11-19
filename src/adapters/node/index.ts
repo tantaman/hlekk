@@ -10,5 +10,6 @@ export type { ListenOptions, NodeDatabase } from "./http.ts";
 export { PrivateAddress, isPublicAddress, privateAddressGuard } from "./guard.ts";
 export type { GuardOptions } from "./guard.ts";
 export { connect, reader } from "./reader.ts";
+export type { NodeReaderOptions } from "./reader.ts";
 export { main as serve, parse as parseArgs } from "./serve.ts";
 export type { Args } from "./serve.ts";
